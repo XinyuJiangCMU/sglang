@@ -35,3 +35,19 @@ python single_mode_test_standalone.py --host localhost --port 30000 --n-trials 1
 
 - `Unique samples: 1` → 确定性推理工作正常
 - `Unique samples: >1` → 存在非确定性，需排查
+
+## Miles True On-Policy 集成
+
+参见 [MILES_INTEGRATION.md](MILES_INTEGRATION.md)。在完成 NVIDIA 确定性验证后，可运行 Miles true_on_policy 示例，验证 `train/train_rollout_logprob_abs_diff = 0`。
+
+## AMD 确定性验证
+
+AMD 上 FlashInfer/FA3 不可用，使用 **Triton** backend：
+
+```bash
+./start_deterministic_server_amd.sh
+# 若使用 TP（多卡），需设置：
+SGLANG_USE_1STAGE_ALLREDUCE=1 ./start_deterministic_server_amd.sh
+```
+
+然后运行 `python single_mode_test_standalone.py` 验证输出一致性。
