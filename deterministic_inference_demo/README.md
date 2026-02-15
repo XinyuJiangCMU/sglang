@@ -8,30 +8,21 @@
 ./01_run_batch_invariant_ops.sh
 ```
 
-## 完整端到端测试（需下载 Qwen3-8B）
-
-```bash
-./02_run_deterministic_inference.sh
-```
-
 ## 手动分步运行
 
 1. 终端 1 启动服务器：
 
 ```bash
-cd /data/xinyu/top/sglang
-python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-8B \
-    --attention-backend flashinfer \
-    --enable-deterministic-inference \
-    --port 30000
+cd /data/xinyu/top/sglang/deterministic_inference_demo
+./start_deterministic_server.sh
+# 单卡: CUDA_VISIBLE_DEVICES=0 ./start_deterministic_server.sh
 ```
 
 2. 终端 2 运行测试：
 
 ```bash
 cd /data/xinyu/top/sglang/deterministic_inference_demo
-python run_deterministic_client.py --test-mode single --n-trials 20
+python single_mode_test_standalone.py --host localhost --port 30000 --n-trials 15
 ```
 
 ## 测试模式说明
