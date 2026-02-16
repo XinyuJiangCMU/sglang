@@ -8,7 +8,9 @@ Batch Invariant 误差来源详解
          GPU 在不同 batch size 下使用不同的归约顺序，导致不同结果。
 
 运行：python explain_batch_invariant_drift.py
-需要：CUDA GPU（在 CPU 上差异可能为 0，无法复现）
+需要：GPU (NVIDIA or AMD). CPU 上差异可能为 0。
+注意：Experiment 4 (batch-invariant mode) fails on AMD due to Triton compatibility
+      (tl.range flatten arg). Experiments 1-3 work on both.
 """
 import torch
 
@@ -120,6 +122,7 @@ print()
 
 # =============================================================================
 # 7. 用 Batch Invariant 模式验证
+# NOTE: Fails on AMD (Triton tl.range flatten compat). Works on NVIDIA.
 # =============================================================================
 print("【实验 4】开启 Batch Invariant 模式")
 print("-" * 70)
