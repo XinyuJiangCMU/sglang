@@ -401,7 +401,7 @@ def context_attention_fwd(
 
 
 # ------------------------------------------------------------------------------
-# Backward (for training): Flash-style, recompute P from LSE
+# Backward (for training): Flash-style, deterministic (key-block parallel)
 # ------------------------------------------------------------------------------
 
 @triton.jit
@@ -411,7 +411,8 @@ def _bwd_kernel(
     V,
     dO,
     LSE,
-    dQ,
+    Delta,
+    dQ_buffer,
     dK,
     dV,
     sm_scale,
@@ -427,8 +428,11 @@ def _bwd_kernel(
     stride_doh,
     stride_lse_s,
     stride_lse_h,
-    stride_dqbs,
-    stride_dqh,
+    stride_delta_s,
+    stride_delta_h,
+    stride_dqb_n,
+    stride_dqb_s,
+    stride_dqb_h,
     stride_dkbs,
     stride_dkh,
     stride_dvbs,
@@ -439,148 +443,143 @@ def _bwd_kernel(
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     Lk: tl.constexpr,
+    num_blocks_m: tl.constexpr,
 ):
     """
-    Backward kernel: each program (batch, head, block_m) computes dQ for one Q block
-    and accumulates dK, dV with atomic add.
+    Deterministic backward: each program (batch, head, start_n) owns one key block.
+    Loops over all query blocks (start_m), accumulates dK/dV in registers and stores once.
+    dQ contributions are written to dQ_buffer[start_n, ...]; caller sums over start_n.
+    No atomic operations -> bitwise reproducible.
     """
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
-    start_m = tl.program_id(2)
+    start_n = tl.program_id(2)
 
     cur_kv_head = cur_head // kv_group_num
 
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
     cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
 
-    block_start_loc = BLOCK_M * start_m
+    # This key block covers indices [start_n*BLOCK_N, (start_n+1)*BLOCK_N)
+    if start_n * BLOCK_N >= cur_batch_seq_len:
+        return
 
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m = tl.arange(0, BLOCK_M)
 
-    off_q = (
-        (cur_batch_in_all_start_index + offs_m[:, None]) * stride_qbs
-        + cur_head * stride_qh
+    # Load K, V block once for this key block
+    k_ptrs = (
+        K
+        + (cur_batch_in_all_start_index + start_n * BLOCK_N + offs_n[:, None]) * stride_kbs
+        + cur_kv_head * stride_kh
         + offs_d[None, :]
     )
-    off_do = (
-        (cur_batch_in_all_start_index + offs_m[:, None]) * stride_dobs
-        + cur_head * stride_doh
+    v_ptrs = (
+        V
+        + (cur_batch_in_all_start_index + start_n * BLOCK_N + offs_n[:, None]) * stride_vbs
+        + cur_kv_head * stride_vh
         + offs_d[None, :]
     )
-    off_lse = (cur_batch_in_all_start_index + offs_m) * stride_lse_s + cur_head * stride_lse_h
-
+    mask_n = (start_n * BLOCK_N + offs_n) < cur_batch_seq_len
     mask_d = offs_d < Lk
-    mask_m = offs_m < cur_batch_seq_len
+    kv_mask = mask_n[:, None] & mask_d[None, :]
+    k = tl.load(k_ptrs, mask=kv_mask, other=0.0)
+    v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
+    # k [BLOCK_N, D], v [BLOCK_N, D]; we need k^T for qk = q @ k^T
+    kT = tl.trans(k)
 
-    q = tl.load(Q + off_q, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-    do = tl.load(dO + off_do, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-    lse = tl.load(LSE + off_lse, mask=mask_m, other=-float("inf"))
+    # Accumulate dK, dV for this key block (single writer -> deterministic)
+    dk_block = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
+    dv_block = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
 
-    dq_acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    # Causal: query block start_m sees this key block iff (start_m+1)*BLOCK_M > start_n*BLOCK_N
+    lo_m = (start_n * BLOCK_N + BLOCK_M - 1) // BLOCK_M
 
-    k_ptrs = K + offs_n[None, :] * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None]
-    v_ptrs = V + offs_n[:, None] * stride_vbs + cur_kv_head * stride_vh + offs_d[None, :]
-
-    block_mask = tl.where(block_start_loc < cur_batch_seq_len, 1, 0)
-    end_n = (
-        cur_batch_seq_len
-        if not IS_CAUSAL
-        else tl.minimum((start_m + 1) * BLOCK_M, cur_batch_seq_len)
-    )
-
-    for start_n in range(0, block_mask * end_n, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-
-        k = tl.load(
-            k_ptrs + (cur_batch_in_all_start_index + start_n) * stride_kbs,
-            mask=((start_n + offs_n[None, :]) < cur_batch_seq_len) & (mask_d[:, None]),
-            other=0.0,
-        )
-        v = tl.load(
-            v_ptrs + (cur_batch_in_all_start_index + start_n) * stride_vbs,
-            mask=((start_n + offs_n[:, None]) < cur_batch_seq_len) & (mask_d[None, :]),
-            other=0.0,
-        )
-
-        # S = Q @ K^T * scale
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k)
-        qk *= sm_scale
-
+    for start_m in range(0, num_blocks_m):
+        start_m = tl.multiple_of(start_m, 1)
+        # Only process if this query block is valid and (when causal) can see this key block
+        do_block = start_m * BLOCK_M < cur_batch_seq_len
         if IS_CAUSAL:
-            qk += tl.where(
-                (start_n + offs_n[None, :] < cur_batch_seq_len)
-                & (offs_m[:, None] >= (start_n + offs_n[None, :])),
-                0,
-                float("-inf"),
+            do_block = do_block & (start_m >= lo_m)
+        if do_block:
+            offs_m_cur = start_m * BLOCK_M + offs_m
+            mask_m = offs_m_cur < cur_batch_seq_len
+
+            off_q = (
+                (cur_batch_in_all_start_index + offs_m_cur[:, None]) * stride_qbs
+                + cur_head * stride_qh
+                + offs_d[None, :]
             )
-        else:
-            qk += tl.where(
-                (start_n + offs_n[None, :]) < cur_batch_seq_len, 0, float("-inf")
+            off_do = (
+                (cur_batch_in_all_start_index + offs_m_cur[:, None]) * stride_dobs
+                + cur_head * stride_doh
+                + offs_d[None, :]
             )
+            off_lse = (cur_batch_in_all_start_index + offs_m_cur) * stride_lse_s + cur_head * stride_lse_h
+            off_delta = (cur_batch_in_all_start_index + offs_m_cur) * stride_delta_s + cur_head * stride_delta_h
 
-        # P = exp(S - LSE), causal mask already in S (-inf -> 0)
-        # Zero out p for invalid rows (mask_m) to avoid inf*0=NaN when do=0 but lse=-inf
-        p = tl.exp(qk - lse[:, None])
-        p = tl.where(qk == float("-inf"), 0.0, p)
-        p = tl.where(mask_m[:, None], p, 0.0)
+            q = tl.load(Q + off_q, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+            do = tl.load(dO + off_do, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+            lse = tl.load(LSE + off_lse, mask=mask_m, other=-float("inf"))
+            delta_i = tl.load(Delta + off_delta, mask=mask_m, other=0.0)
 
-        # dP = dO @ V^T  (do [BLOCK_M, D] @ v^T [D, BLOCK_N] -> [BLOCK_M, BLOCK_N])
-        dp = tl.dot(do, tl.trans(v), allow_tf32=False)
-        # dS = P * (dP - rowsum(P * dP))
-        p_dp = p * dp
-        rowsum_p_dp = tl.sum(p_dp, 1)
-        ds = p * (dp - rowsum_p_dp[:, None])
+            # S = Q @ K^T * scale
+            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+            qk += tl.dot(q, kT)
+            qk *= sm_scale
 
-        # dQ += dS @ K * scale  (ds [BLOCK_M, BLOCK_N], k loaded as [D, N] -> use k^T)
-        dq_acc += tl.dot(ds, tl.trans(k), allow_tf32=False) * sm_scale
+            key_pos = start_n * BLOCK_N + offs_n[None, :]
+            if IS_CAUSAL:
+                qk += tl.where(
+                    (key_pos < cur_batch_seq_len) & (offs_m_cur[:, None] >= key_pos),
+                    0,
+                    float("-inf"),
+                )
+            else:
+                qk += tl.where(key_pos < cur_batch_seq_len, 0, float("-inf"))
 
-        # dK += dS^T @ Q * scale  [BLOCK_N, D]
-        dk_block = tl.dot(
-            tl.trans(ds), q, allow_tf32=False
-        ) * sm_scale
-        # dV += P^T @ dO  [BLOCK_N, D]
-        dv_block = tl.dot(tl.trans(p), do, allow_tf32=False)
+            # P = exp(S - LSE)
+            p = tl.exp(qk - lse[:, None])
+            p = tl.where(qk == float("-inf"), 0.0, p)
+            p = tl.where(mask_m[:, None], p, 0.0)
 
-        # Atomic add dK, dV (element-wise), only for valid key positions.
-        # Use tl.range (runtime loop) instead of tl.static_range to avoid 128*64 compile-time
-        # unrolling which causes very slow compilation. Extract scalar via mask+sum.
-        dk_block = dk_block.to(dK.dtype.element_ty)
-        dv_block = dv_block.to(dV.dtype.element_ty)
-        for nn in tl.range(BLOCK_N):
-            n_idx = start_n + nn
-            if n_idx < cur_batch_seq_len:
-                mask_n = (tl.arange(0, BLOCK_N) == nn)
-                for dd in tl.range(BLOCK_DMODEL):
-                    if dd < Lk:
-                        mask_dd = (tl.arange(0, BLOCK_DMODEL) == dd)
-                        dk_val = tl.sum(dk_block * mask_n[:, None] * mask_dd[None, :])
-                        dv_val = tl.sum(dv_block * mask_n[:, None] * mask_dd[None, :])
-                        dk_ptr = (
-                            dK
-                            + (cur_batch_in_all_start_index + n_idx) * stride_dkbs
-                            + cur_kv_head * stride_dkh
-                            + dd
-                        )
-                        dv_ptr = (
-                            dV
-                            + (cur_batch_in_all_start_index + n_idx) * stride_dvbs
-                            + cur_kv_head * stride_dvh
-                            + dd
-                        )
-                        tl.atomic_add(dk_ptr, dk_val)
-                        tl.atomic_add(dv_ptr, dv_val)
+            # dP = dO @ V^T, dS = P * (dP - Delta)
+            dp = tl.dot(do, tl.trans(v), allow_tf32=False)
+            ds = p * (dp - delta_i[:, None])
 
-    # Store dQ
-    off_dq = (
-        (cur_batch_in_all_start_index + offs_m[:, None]) * stride_dqbs
-        + cur_head * stride_dqh
+            # Accumulate dK, dV for this key block
+            dk_block += tl.dot(tl.trans(ds), q, allow_tf32=False) * sm_scale
+            dv_block += tl.dot(tl.trans(p), do, allow_tf32=False)
+
+            # dQ contribution from this (start_n, start_m): store to dQ_buffer
+            # ds [BLOCK_M, BLOCK_N], k [BLOCK_N, BLOCK_DMODEL] -> dq_block [BLOCK_M, BLOCK_DMODEL]
+            dq_block = tl.dot(ds, k, allow_tf32=False) * sm_scale
+            dqb_base = (
+                dQ_buffer
+                + start_n * stride_dqb_n
+                + (cur_batch_in_all_start_index + start_m * BLOCK_M) * stride_dqb_s
+                + cur_head * stride_dqb_h
+            )
+            dqb_ptrs = dqb_base + offs_m_cur[:, None] * stride_dqb_s + offs_d[None, :]
+            tl.store(dqb_ptrs, dq_block.to(dQ_buffer.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
+
+    # Store dK, dV for this key block (vectorized, no atomic)
+    dk_ptrs = (
+        dK
+        + (cur_batch_in_all_start_index + start_n * BLOCK_N + offs_n[:, None]) * stride_dkbs
+        + cur_kv_head * stride_dkh
         + offs_d[None, :]
     )
-    dq_acc = dq_acc.to(dQ.dtype.element_ty)
-    tl.store(dQ + off_dq, dq_acc, mask=mask_m[:, None] & mask_d[None, :])
+    dv_ptrs = (
+        dV
+        + (cur_batch_in_all_start_index + start_n * BLOCK_N + offs_n[:, None]) * stride_dvbs
+        + cur_kv_head * stride_dvh
+        + offs_d[None, :]
+    )
+    mask_nd = (start_n * BLOCK_N + offs_n < cur_batch_seq_len)[:, None] & (offs_d < Lk)[None, :]
+    tl.store(dk_ptrs, dk_block.to(dK.dtype.element_ty), mask=mask_nd)
+    tl.store(dv_ptrs, dv_block.to(dV.dtype.element_ty), mask=mask_nd)
 
 
 def context_attention_bwd(
@@ -614,11 +613,27 @@ def context_attention_bwd(
     batch, head = b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
 
-    dq = torch.empty_like(q)
     dk = torch.zeros_like(k)
     dv = torch.zeros_like(v)
 
-    grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
+    # Delta = (O * dO).sum(dim=-1) = rowsum(P * dP) over all keys; same layout as LSE [total_tokens, head]
+    delta = (O.float() * dO.float()).sum(dim=-1)
+    if not delta.is_contiguous():
+        delta = delta.contiguous()
+
+    num_blocks_m = triton.cdiv(max_input_len, BLOCK)
+    num_blocks_n = triton.cdiv(max_input_len, BLOCK)
+    total_tokens = q.shape[0]
+    # dQ buffer: (num_blocks_n, total_tokens, head, head_dim) for deterministic sum over blocks
+    dq_buffer = torch.zeros(
+        (num_blocks_n, total_tokens, head, Lk),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    if not dq_buffer.is_contiguous():
+        dq_buffer = dq_buffer.contiguous()
+
+    grid = (batch, head, num_blocks_n)
     num_warps = 4 if Lk <= 64 else 8
 
     _bwd_kernel[grid](
@@ -627,7 +642,8 @@ def context_attention_bwd(
         v,
         dO,
         LSE,
-        dq,
+        delta,
+        dq_buffer,
         dk,
         dv,
         sm_scale,
@@ -643,8 +659,11 @@ def context_attention_bwd(
         dO.stride(1),
         LSE.stride(0),
         LSE.stride(1),
-        dq.stride(0),
-        dq.stride(1),
+        delta.stride(0),
+        delta.stride(1),
+        dq_buffer.stride(0),
+        dq_buffer.stride(1),
+        dq_buffer.stride(2),
         dk.stride(0),
         dk.stride(1),
         dv.stride(0),
@@ -654,10 +673,12 @@ def context_attention_bwd(
         BLOCK_DMODEL=triton.next_power_of_2(Lk),
         BLOCK_N=BLOCK,
         IS_CAUSAL=is_causal,
+        num_blocks_m=num_blocks_m,
         num_warps=num_warps,
         num_stages=1,
         Lk=Lk,
     )
+    dq = dq_buffer.sum(dim=0).to(q.dtype)
     return dq, dk, dv
 
 

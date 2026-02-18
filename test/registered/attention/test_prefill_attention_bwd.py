@@ -305,6 +305,29 @@ class TestPrefillVsReference(CustomTestCase):
                 msg=f"dq[{i},{j},{kk}]: numerical={numerical:.6e} analytical={analytical:.6e}",
             )
 
+    def test_backward_deterministic(self):
+        """Backward must be bitwise deterministic: same inputs -> identical dq/dk/dv every run."""
+        q, k, v, b_start_loc, b_seq_len, max_input_len = self._setup()
+        o = torch.empty_like(q)
+        o, lse = context_attention_fwd(
+            q, k, v, o, b_start_loc, b_seq_len, max_input_len,
+            is_causal=True, return_lse=True,
+        )
+        dO = torch.ones_like(o)
+
+        dq1, dk1, dv1 = context_attention_bwd(
+            dO, o, lse, q, k, v,
+            b_start_loc, b_seq_len, max_input_len, is_causal=True,
+        )
+        dq2, dk2, dv2 = context_attention_bwd(
+            dO, o, lse, q, k, v,
+            b_start_loc, b_seq_len, max_input_len, is_causal=True,
+        )
+
+        self.assertTrue(torch.equal(dq1, dq2), "dq must be bitwise identical across two backward runs")
+        self.assertTrue(torch.equal(dk1, dk2), "dk must be bitwise identical across two backward runs")
+        self.assertTrue(torch.equal(dv1, dv2), "dv must be bitwise identical across two backward runs")
+
 
 if __name__ == "__main__":
     if not _has_cuda_or_hip():
