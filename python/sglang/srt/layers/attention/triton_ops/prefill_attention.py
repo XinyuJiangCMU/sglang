@@ -522,8 +522,10 @@ def _bwd_kernel(
             )
 
         # P = exp(S - LSE), causal mask already in S (-inf -> 0)
+        # Zero out p for invalid rows (mask_m) to avoid inf*0=NaN when do=0 but lse=-inf
         p = tl.exp(qk - lse[:, None])
         p = tl.where(qk == float("-inf"), 0.0, p)
+        p = tl.where(mask_m[:, None], p, 0.0)
 
         # dP = dO @ V^T  (do [BLOCK_M, D] @ v^T [D, BLOCK_N] -> [BLOCK_M, BLOCK_N])
         dp = tl.dot(do, tl.trans(v), allow_tf32=False)
@@ -553,9 +555,9 @@ def _bwd_kernel(
                 mask_n = (tl.arange(0, BLOCK_N) == nn)
                 for dd in tl.range(BLOCK_DMODEL):
                     if dd < Lk:
-                        mask_d = (tl.arange(0, BLOCK_DMODEL) == dd)
-                        dk_val = tl.sum(dk_block * mask_n[:, None] * mask_d[None, :])
-                        dv_val = tl.sum(dv_block * mask_n[:, None] * mask_d[None, :])
+                        mask_dd = (tl.arange(0, BLOCK_DMODEL) == dd)
+                        dk_val = tl.sum(dk_block * mask_n[:, None] * mask_dd[None, :])
+                        dv_val = tl.sum(dv_block * mask_n[:, None] * mask_dd[None, :])
                         dk_ptr = (
                             dK
                             + (cur_batch_in_all_start_index + n_idx) * stride_dkbs
