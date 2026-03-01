@@ -83,15 +83,12 @@ class RMSNorm(MultiPlatformOp):
         eps: float = 1e-6,
         var_hidden_size: Optional[int] = None,
         cast_x_before_out_mul: bool = False,
-        fp32_residual: bool = False,
-        weight_dtype: Optional = None,
-        override_orig_dtype: Optional = None,
+        fp32_residual: bool = True,
     ) -> None:
         super().__init__()
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
-        self.override_orig_dtype = override_orig_dtype
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
+        self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
         self.variance_size_override = (
@@ -194,10 +191,22 @@ class RMSNorm(MultiPlatformOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not x.is_contiguous():
             x = x.contiguous()
-        orig_dtype = self.override_orig_dtype or x.dtype
+        orig_dtype = x.dtype
         post_residual_addition = kwargs.get("post_residual_addition")
+
+        if residual is not None and not self.fp32_residual:
+            x = (
+                x
+                + residual
+                + (
+                    post_residual_addition
+                    if post_residual_addition is not None
+                    else 0.0
+                )
+            )
+            residual = x.clone()
         x = x.to(torch.float32)
-        if residual is not None:
+        if residual is not None and self.fp32_residual:
             x = (
                 x
                 + residual.to(torch.float32)
@@ -207,10 +216,7 @@ class RMSNorm(MultiPlatformOp):
                     else 0.0
                 )
             )
-            if self.fp32_residual:
-                residual = x.clone()
-            else:
-                residual = x.to(orig_dtype)
+            residual = x.to(orig_dtype)
 
         hidden_size = x.shape[-1]
         if hidden_size != self.hidden_size:
