@@ -45,13 +45,14 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_cuda,
+    is_cuda_alike,
     is_npu,
     make_layers,
     set_weight_attrs,
 )
 
 logger = logging.getLogger(__name__)
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_npu = is_npu()
 
 
