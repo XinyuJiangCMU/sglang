@@ -112,7 +112,11 @@ class RMSNorm(MultiPlatformOp):
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
-        if _use_aiter:
+        # if _use_aiter:
+        #     self._forward_method = self.forward_aiter
+        if get_global_server_args().rl_on_policy_target is not None:
+            self._forward_method = self.forward_native
+        elif _use_aiter:
             self._forward_method = self.forward_aiter
 
     def forward_cuda(
