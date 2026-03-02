@@ -31,12 +31,29 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
+from sglang.srt.debug_utils.dumper import dumper
 
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+def _is_stream_capturing() -> bool:
+    try:
+        return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
+def _maybe_dump(name: str, value: torch.Tensor) -> None:
+    if _is_stream_capturing():
+        return
+    try:
+        dumper.dump(name, value)
+    except Exception:
+        # Debug dump should never break serving.
+        pass
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -60,6 +77,7 @@ class Qwen3Attention(nn.Module):
         attention_bias: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        num_hidden_layers: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -72,12 +90,8 @@ class Qwen3Attention(nn.Module):
         self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = num_kv_heads
         if self.total_num_kv_heads >= attn_tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
             assert self.total_num_kv_heads % attn_tp_size == 0
         else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
             assert attn_tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
         self.head_dim = head_dim or hidden_size // self.total_num_heads
@@ -87,6 +101,8 @@ class Qwen3Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
+        self.layer_id = layer_id
+        self.num_hidden_layers = num_hidden_layers
 
         norm_kwargs = (
             dict(
@@ -138,9 +154,24 @@ class Qwen3Attention(nn.Module):
         )
         self.alt_stream = alt_stream
 
+    def _is_last_layer(self) -> bool:
+        return (
+            self.num_hidden_layers is not None
+            and self.layer_id == self.num_hidden_layers - 1
+        )
+
     def forward_prepare_native(self, positions, hidden_states):
+        if self._is_last_layer():
+            _maybe_dump("attn_input_last_layer", hidden_states)
+
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        if self._is_last_layer():
+            _maybe_dump("q_pre_norm", q)
+            _maybe_dump("k_pre_norm", k)
+            _maybe_dump("v_pre_norm", v)
+
         q, k = apply_qk_norm(
             q=q,
             k=k,
@@ -149,7 +180,17 @@ class Qwen3Attention(nn.Module):
             head_dim=self.head_dim,
             alt_stream=self.alt_stream,
         )
+
+        if self._is_last_layer():
+            _maybe_dump("q_post_norm", q)
+            _maybe_dump("k_post_norm", k)
+
         q, k = self.rotary_emb(positions, q, k)
+
+        if self._is_last_layer():
+            _maybe_dump("q_post_rope", q)
+            _maybe_dump("k_post_rope", k)
+
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
@@ -201,7 +242,13 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch)
+        if self._is_last_layer():
+            _maybe_dump("attn_context_before_o_proj", attn_output)
+
         output, _ = self.o_proj(attn_output)
+        if self._is_last_layer():
+            _maybe_dump("attn_out_last_layer", output)
+
         return output
 
 
@@ -220,6 +267,8 @@ class Qwen3DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
+        self.layer_id = layer_id
+        self.num_hidden_layers = config.num_hidden_layers
         self.self_attn = Qwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -232,6 +281,7 @@ class Qwen3DecoderLayer(nn.Module):
             quant_config=quant_config,
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=config.attention_bias,
+            num_hidden_layers=config.num_hidden_layers,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
@@ -281,6 +331,11 @@ class Qwen3DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Layer-0 probes: before prepare_attn
+        if self.layer_id == 0:
+            _maybe_dump("layer0_attn_input_raw", hidden_states)
+            _maybe_dump("layer0_positions", positions)
+
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
@@ -288,6 +343,11 @@ class Qwen3DecoderLayer(nn.Module):
             forward_batch,
             post_residual_addition=post_residual_addition,
         )
+
+        # Layer-0 probes: after prepare_attn (input to self_attn)
+        if self.layer_id == 0:
+            _maybe_dump("layer0_attn_input_after_prepare", hidden_states)
+
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -367,6 +427,7 @@ class Qwen3ForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        self._lm_head_weight_dumped = False
         self.model = Qwen3Model(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
@@ -406,6 +467,18 @@ class Qwen3ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if self.pp_group.is_first_rank:
+            _maybe_dump("input_ids_for_compare", input_ids)
+            try:
+                if input_embeds is not None:
+                    _maybe_dump("embedding_output", input_embeds)
+                elif hasattr(self.model, "get_input_embedding"):
+                    _maybe_dump("embedding_output", self.model.get_input_embedding(input_ids))
+                elif hasattr(self.model, "embed_tokens"):
+                    _maybe_dump("embedding_output", self.model.embed_tokens(input_ids))
+            except Exception:
+                pass
+        
         hidden_states = self.model(
             input_ids,
             positions,
@@ -419,6 +492,11 @@ class Qwen3ForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
+            _maybe_dump("final_hidden_before_lm_head", hidden_states)
+            if (not self._lm_head_weight_dumped) and hasattr(self.lm_head, "weight"):
+                _maybe_dump("lm_head_weight", self.lm_head.weight)
+                self._lm_head_weight_dumped = True
+
             if not get_embedding:
                 return self.logits_processor(
                     input_ids,
@@ -443,11 +521,24 @@ class Qwen3ForCausalLM(nn.Module):
     ):
         start, end = split_interval
         # embed
+        # if start == 0:
+        #     if input_embeds is None:
+        #         forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+        #     else:
+        #         forward_batch.hidden_states = input_embeds
         if start == 0:
+            if self.pp_group.is_first_rank:
+                _maybe_dump("input_ids_for_compare", input_ids)
             if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+                if hasattr(self.model, "get_input_embedding"):
+                    forward_batch.hidden_states = self.model.get_input_embedding(input_ids)
+                else:
+                    forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
+            if self.pp_group.is_first_rank:
+                _maybe_dump("embedding_output", forward_batch.hidden_states)
+                
         # decoder layer
         for i in range(start, end):
             layer = self.model.layers[i]
