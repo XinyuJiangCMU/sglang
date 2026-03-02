@@ -14,12 +14,15 @@
 """Fused operators for normalization layers."""
 
 import logging
+import os
+from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
@@ -47,6 +50,82 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
+_dump_rmsnorm_stages = get_bool_env_var("SGLANG_DUMP_RMSNORM_STAGES")
+_rmsnorm_stage_dump_done = False
+_profile_rmsnorm_native = get_bool_env_var("SGLANG_PROFILE_RMSNORM_NATIVE")
+_rmsnorm_profile_done = False
+_rmsnorm_profile_dir = os.getenv("SGLANG_PROFILE_RMSNORM_DIR", "/tmp")
+
+
+def _is_stream_capturing() -> bool:
+    try:
+        return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
+def _maybe_dump_rmsnorm_stage(name: str, value: torch.Tensor) -> None:
+    if _is_stream_capturing():
+        return
+    try:
+        dumper.dump(name, value)
+    except Exception:
+        # Debug dump should never break serving behavior.
+        pass
+
+
+def _maybe_profile_rmsnorm_native(
+    *,
+    x_fp32: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    orig_dtype: torch.dtype,
+    cast_x_before_out_mul: bool,
+) -> None:
+    global _rmsnorm_profile_done
+    if (not _profile_rmsnorm_native) or _rmsnorm_profile_done:
+        return
+    if not torch.cuda.is_available():
+        return
+
+    try:
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if x_fp32.is_cuda:
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        # Shadow profiling run to avoid changing the functional output path.
+        x_shadow = x_fp32.detach().clone()
+        w_shadow = weight.detach().clone()
+
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            with_stack=True,
+        ) as prof:
+            variance = x_shadow.pow(2).mean(dim=-1, keepdim=True)
+            x_shadow = x_shadow * torch.rsqrt(variance + eps)
+            if cast_x_before_out_mul:
+                _ = w_shadow * x_shadow.to(orig_dtype)
+            else:
+                _ = (x_shadow * w_shadow).to(orig_dtype)
+
+        out_dir = Path(_rmsnorm_profile_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        device_tag = (
+            f"{x_fp32.device.type}{x_fp32.device.index if x_fp32.device.index is not None else 0}"
+        )
+        table_path = out_dir / f"sglang_rmsnorm_native_profile_{device_tag}.txt"
+        trace_path = out_dir / f"sglang_rmsnorm_native_profile_{device_tag}.json"
+        table = prof.key_averages(group_by_input_shape=True).table(
+            sort_by="self_cuda_time_total" if x_fp32.is_cuda else "self_cpu_time_total",
+            row_limit=200,
+        )
+        table_path.write_text(table, encoding="utf-8")
+        prof.export_chrome_trace(str(trace_path))
+        _rmsnorm_profile_done = True
+    except Exception:
+        # Profiling must never break serving.
+        pass
 
 if _is_cuda or _is_xpu:
     if _is_flashinfer_available:
@@ -217,10 +296,20 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        global _rmsnorm_stage_dump_done
+        should_dump_stages = (
+            _dump_rmsnorm_stages
+            and (not _rmsnorm_stage_dump_done)
+            and residual is None
+            and self.hidden_size == 4096
+        )
+
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = self.override_orig_dtype or x.dtype
         x = x.to(torch.float32)
+        if should_dump_stages:
+            _maybe_dump_rmsnorm_stage("rmsnorm_stage_x_fp32", x)
         if residual is not None:
             x = x + residual.to(torch.float32)
             if post_residual_addition is not None:
@@ -249,12 +338,27 @@ class RMSNorm(MultiPlatformOp):
             x_var = x[..., : self.variance_size_override]
 
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+        if should_dump_stages:
+            _maybe_dump_rmsnorm_stage("rmsnorm_stage_variance", variance)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
+        if should_dump_stages:
+            _maybe_dump_rmsnorm_stage("rmsnorm_stage_x_norm_fp32", x)
 
         if self.cast_x_before_out_mul:
             x = self.weight * x.to(orig_dtype)
         else:
             x = (x * self.weight).to(orig_dtype)
+        
+        if should_dump_stages:
+            _maybe_dump_rmsnorm_stage("rmsnorm_stage_x_out", x)
+            _rmsnorm_stage_dump_done = True
+        _maybe_profile_rmsnorm_native(
+            x_fp32=x,
+            weight=self.weight,
+            eps=self.variance_epsilon,
+            orig_dtype=orig_dtype,
+            cast_x_before_out_mul=self.cast_x_before_out_mul,
+        )
 
         if residual is None:
             return x
