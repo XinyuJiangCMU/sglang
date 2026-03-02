@@ -10,6 +10,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_dp_attention_enabled,
 )
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -34,6 +35,10 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+
+def _maybe_dump(name: str, value) -> None:
+    dumper.dump(name, value)
+
 
 
 class Sampler(nn.Module):
@@ -91,6 +96,7 @@ class Sampler(nn.Module):
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
+        _maybe_dump("next_token_logits_raw", logits)
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
@@ -172,6 +178,7 @@ class Sampler(nn.Module):
                     raise ValueError(
                         f"Invalid sampling backend: {get_global_server_args().sampling_backend}"
                     )
+            
 
             if return_logprob:
                 if get_global_server_args().rl_on_policy_target is not None:
@@ -186,8 +193,12 @@ class Sampler(nn.Module):
                 else:
                     logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
 
+        _maybe_dump("next_token_id", batch_next_token_ids)
+
+
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
+            _maybe_dump("next_token_logprobs_full", logprobs)
             if any(x > 0 for x in top_logprobs_nums):
                 (
                     logits_output.next_token_top_logprobs_val,
@@ -204,6 +215,7 @@ class Sampler(nn.Module):
                 torch.arange(len(batch_next_token_ids), device=sampling_info.device),
                 batch_next_token_ids,
             ]
+            _maybe_dump("next_token_logprob_selected", logits_output.next_token_logprobs)
 
         if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
