@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+logger = logging.getLogger(__name__)
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -114,6 +117,13 @@ class TritonAttnBackend(AttentionBackend):
         self.enable_deterministic = (
             model_runner.server_args.enable_deterministic_inference
         )
+        # Experimental switch:
+        # Force decode attention to run via unified q_len=1 path instead of
+        # the original decode kernels. Default is False to keep serving behavior.
+        self.force_unified_decode_attention = get_bool_env_var(
+            "SGLANG_TRITON_FORCE_UNIFIED_DECODE_ATTENTION", "false"
+        )
+        self._unified_decode_attention_warned = False
 
         # Configure deterministic inference settings
         if self.enable_deterministic:
@@ -1021,6 +1031,26 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
 
+        if self.force_unified_decode_attention:
+            if not self._unified_decode_attention_warned:
+                logger.warning(
+                    "Experimental decode mode enabled: "
+                    "SGLANG_TRITON_FORCE_UNIFIED_DECODE_ATTENTION=1. "
+                    "Bypassing decode_attention_fwd and using unified q_len=1 path."
+                )
+                self._unified_decode_attention_warned = True
+            self._forward_decode_unified_q1_experimental(
+                q,
+                o,
+                layer,
+                forward_batch,
+                kv_indptr,
+                kv_indices,
+                logits_soft_cap,
+                sinks,
+            )
+            return o
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -1100,6 +1130,89 @@ class TritonAttnBackend(AttentionBackend):
             xai_temperature_len=layer.xai_temperature_len,
         )
         return o
+
+    def _forward_decode_unified_q1_experimental(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        logits_soft_cap: float,
+        sinks: Optional[torch.Tensor],
+    ):
+        """
+        Experimental decode implementation via unified kernel q_len=1.
+
+        This path is intentionally narrow and only for parity experiments:
+        - MHA / GQA (requires q_heads % kv_heads == 0)
+        - no sliding window
+        - no sinks
+        """
+        if sinks is not None:
+            raise NotImplementedError(
+                "Unified decode experimental path does not support sinks."
+            )
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            raise NotImplementedError(
+                "Unified decode experimental path does not support sliding window."
+            )
+
+        q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        bs = q_view.shape[0]
+
+        if bs != forward_batch.batch_size:
+            raise NotImplementedError(
+                "Unified decode experimental path expects one decode query per sequence."
+            )
+
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        if q_view.shape[1] % k_buffer.shape[1] != 0:
+            raise NotImplementedError(
+                "Unified decode experimental path requires q_heads % kv_heads == 0 "
+                f"(got q_heads={q_view.shape[1]}, kv_heads={k_buffer.shape[1]})."
+            )
+
+        # Decode semantics: each sequence has exactly one query token.
+        # qo_indptr = [0,1,2,...,bs], max_len_extend = 1
+        qo_indptr = torch.arange(
+            0, bs + 1, dtype=torch.int32, device=self.device
+        )
+        kv_indptr_cur = kv_indptr[: bs + 1]
+        # prefix_len for each sequence = visible_kv_len - 1
+        prefix_lens = (
+            kv_indptr_cur[1:] - kv_indptr_cur[:-1] - 1
+        ).to(torch.int32)
+
+        if torch.any(prefix_lens < 0):
+            raise RuntimeError(
+                "Invalid decode metadata for unified q_len=1 path: prefix_lens < 0."
+            )
+
+        self.extend_attention_fwd_unified(
+            q_view,
+            o_view,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr_cur,
+            kv_indices,
+            prefix_lens,
+            1,
+            custom_mask=None,
+            mask_indptr=None,
+            sm_scale=layer.scaling,
+            logit_cap=logits_soft_cap,
+            is_causal=True,
+            sliding_window_size=-1,
+            sinks=None,
+            window_start_pos=None,
+            xai_temperature_len=layer.xai_temperature_len,
+        )
 
 
 class TritonMultiStepDraftBackend:
