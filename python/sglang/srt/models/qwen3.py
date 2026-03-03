@@ -191,12 +191,18 @@ class Qwen3Attention(nn.Module):
             alt_stream=self.alt_stream,
         )
 
+        if self._is_layer0():
+            _maybe_dump("layer0_q_post_norm", q)
+            _maybe_dump("layer0_k_post_norm", k)
         if self._is_last_layer():
             _maybe_dump("q_post_norm", q)
             _maybe_dump("k_post_norm", k)
 
         q, k = self.rotary_emb(positions, q, k)
 
+        if self._is_layer0():
+            _maybe_dump("layer0_q_post_rope", q)
+            _maybe_dump("layer0_k_post_rope", k)
         if self._is_last_layer():
             _maybe_dump("q_post_rope", q)
             _maybe_dump("k_post_rope", k)
@@ -374,13 +380,21 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
+        if self.layer_id == 0:
+            # This is the residual branch that will be added back after MLP.
+            _maybe_dump("layer0_residual", residual)
         hidden_states = self.mlp(hidden_states)
+        if self.layer_id == 0:
+            # This is the MLP branch output before the final residual add.
+            _maybe_dump("layer0_block_out_before_residual_add", hidden_states)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
         if self.layer_id == 0:
+            # postprocess_layer has already applied the final residual add.
+            _maybe_dump("layer0_block_out_after_residual_add", hidden_states)
             _maybe_dump("layer0_block_out", hidden_states)
         return hidden_states, residual
 
