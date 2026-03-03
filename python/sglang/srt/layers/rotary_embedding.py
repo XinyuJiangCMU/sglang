@@ -31,6 +31,7 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_debug_rope_dtype = get_bool_env_var("SGLANG_DEBUG_ROPE_DTYPE")
 
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
@@ -131,6 +132,17 @@ class RotaryEmbedding(CustomOp):
 
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
+
+        if _debug_rope_dtype:
+            print(
+                "[RoPE dtype] init "
+                f"is_cuda={_is_cuda} is_hip={_is_hip} rl_on_policy="
+                f"{get_global_server_args().rl_on_policy_target is not None} "
+                f"requested_dtype={dtype} cache_dtype={self.cos_sin_cache.dtype} "
+                f"cache_device={self.cos_sin_cache.device} head_size={self.head_size} "
+                f"rotary_dim={self.rotary_dim} base={self.base} "
+                f"max_position_embeddings={self.max_position_embeddings}"
+            )
 
         self._apply_rotary_emb_wrapped = _apply_rotary_emb
 
@@ -244,6 +256,14 @@ class RotaryEmbedding(CustomOp):
         cos_sin = self.cos_sin_cache.index_select(0, positions)
         cos, sin = cos_sin.chunk(2, dim=-1)
 
+        if _debug_rope_dtype:
+            print(
+                "[RoPE dtype] forward_native "
+                f"cache_dtype={self.cos_sin_cache.dtype} cache_device={self.cos_sin_cache.device} "
+                f"query_dtype={query.dtype} key_dtype={key.dtype} "
+                f"cos_dtype={cos.dtype} sin_dtype={sin.dtype} num_tokens={num_tokens}"
+            )
+
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
@@ -326,6 +346,12 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if _debug_rope_dtype:
+            print(
+                "[RoPE dtype] forward_cuda "
+                f"use_fallback={self.use_fallback_kernel} cache_dtype={self.cos_sin_cache.dtype} "
+                f"cache_device={self.cos_sin_cache.device} query_dtype={query.dtype} key_dtype={key.dtype}"
+            )
         if not self.use_fallback_kernel:
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
