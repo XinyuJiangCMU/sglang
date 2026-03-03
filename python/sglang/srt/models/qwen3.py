@@ -185,29 +185,9 @@ class Qwen3Attention(nn.Module):
             _maybe_dump("q_post_norm", q)
             _maybe_dump("k_post_norm", k)
 
-        if self._is_last_layer():
-            _maybe_dump("rope_q_in_atomic", q)
-            _maybe_dump("rope_k_in_atomic", k)
-            _maybe_dump("rope_positions_atomic", positions)
-            try:
-                cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
-                cos_half, sin_half = cos_sin.chunk(2, dim=-1)
-                if getattr(self.rotary_emb, "is_neox_style", True):
-                    cos_atomic = cos_half.repeat(1, 2)
-                    sin_atomic = sin_half.repeat(1, 2)
-                else:
-                    cos_atomic = cos_half.repeat_interleave(2, dim=-1)
-                    sin_atomic = sin_half.repeat_interleave(2, dim=-1)
-                _maybe_dump("rope_cos_atomic", cos_atomic)
-                _maybe_dump("rope_sin_atomic", sin_atomic)
-                print("[SG rope atomic] dumped cos/sin for one invocation")
-            except Exception:
-                pass
         q, k = self.rotary_emb(positions, q, k)
+
         if self._is_last_layer():
-            _maybe_dump("rope_q_out_atomic", q)
-            _maybe_dump("rope_k_out_atomic", k)
-            print("[SG rope atomic] dumped rope input/output for one invocation")
             _maybe_dump("q_post_rope", q)
             _maybe_dump("k_post_rope", k)
 
@@ -338,6 +318,7 @@ class Qwen3DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            layer_id=layer_id,
         )
 
     def forward(
