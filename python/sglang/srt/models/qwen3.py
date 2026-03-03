@@ -38,6 +38,8 @@ Qwen3Config = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+# _LAYER_PROBE_IDS = {0, 8, 16, 24, 32, 40}
+_LAYER_PROBE_IDS = {0}
 
 def _is_stream_capturing() -> bool:
     try:
@@ -166,6 +168,10 @@ class Qwen3Attention(nn.Module):
 
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.layer_id == 0:
+            _maybe_dump("layer0_q_pre_norm", q)
+            _maybe_dump("layer0_k_pre_norm", k)
+            _maybe_dump("layer0_v_pre_norm", v)
 
         if self._is_last_layer():
             _maybe_dump("q_pre_norm", q)
@@ -184,12 +190,18 @@ class Qwen3Attention(nn.Module):
         if self._is_last_layer():
             _maybe_dump("q_post_norm", q)
             _maybe_dump("k_post_norm", k)
+        if self.layer_id == 0:
+            _maybe_dump("layer0_q_post_norm", q)
+            _maybe_dump("layer0_k_post_norm", k)
 
         q, k = self.rotary_emb(positions, q, k)
 
         if self._is_last_layer():
             _maybe_dump("q_post_rope", q)
             _maybe_dump("k_post_rope", k)
+        if self.layer_id == 0:
+            _maybe_dump("layer0_q_post_rope", q)
+            _maybe_dump("layer0_k_post_rope", k)
 
         return q, k, v
 
@@ -241,10 +253,14 @@ class Qwen3Attention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         if self._is_last_layer():
             _maybe_dump("attn_context_before_o_proj", attn_output)
+        if self.layer_id == 0:
+            _maybe_dump("layer0_attn_context_before_o_proj", attn_output)
 
         output, _ = self.o_proj(attn_output)
         if self._is_last_layer():
             _maybe_dump("attn_out_last_layer", output)
+        if self.layer_id == 0:
+            _maybe_dump("layer0_attn_out_after_o_proj", output)
 
         return output
 
@@ -341,6 +357,8 @@ class Qwen3DecoderLayer(nn.Module):
         # Layer-0 probes: after prepare_attn (input to self_attn)
         if self.layer_id == 0:
             _maybe_dump("layer0_attn_input_after_prepare", hidden_states)
+        if self.layer_id in _LAYER_PROBE_IDS:
+            _maybe_dump(f"layer{self.layer_id}_attn_input_after_prepare", hidden_states)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -360,12 +378,27 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
+        if self.layer_id == 0:
+            if residual is not None:
+                _maybe_dump("layer0_after_attn_residual_add", residual)
+            _maybe_dump("layer0_post_attention_layernorm_output", hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self.layer_id == 0:
+            _maybe_dump("layer0_mlp_output", hidden_states)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+        if self.layer_id in _LAYER_PROBE_IDS:
+            _maybe_dump(
+                f"layer{self.layer_id}_hidden_component_after_postprocess",
+                hidden_states,
+            )
+            decoder_output_full = (
+                hidden_states + residual if residual is not None else hidden_states
+            )
+            _maybe_dump(f"layer{self.layer_id}_decoder_output_full", decoder_output_full)
         return hidden_states, residual
 
 
