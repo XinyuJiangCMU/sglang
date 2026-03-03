@@ -143,7 +143,6 @@ class Qwen3Attention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            dtype=torch.float32,
         )
         self.attn = RadixAttention(
             self.num_heads,
