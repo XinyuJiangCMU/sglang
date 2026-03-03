@@ -160,13 +160,22 @@ class Qwen3Attention(nn.Module):
             and self.layer_id == self.num_hidden_layers - 1
         )
 
+    def _is_layer0(self) -> bool:
+        return self.layer_id == 0
+
     def forward_prepare_native(self, positions, hidden_states):
+        if self._is_layer0():
+            _maybe_dump("layer0_hidden_in", hidden_states)
         if self._is_last_layer():
             _maybe_dump("attn_input_last_layer", hidden_states)
 
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
+        if self._is_layer0():
+            _maybe_dump("layer0_q_pre_norm", q)
+            _maybe_dump("layer0_k_pre_norm", k)
+            _maybe_dump("layer0_v_pre_norm", v)
         if self._is_last_layer():
             _maybe_dump("q_pre_norm", q)
             _maybe_dump("k_pre_norm", k)
@@ -239,10 +248,14 @@ class Qwen3Attention(nn.Module):
             k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch)
+        if self._is_layer0():
+            _maybe_dump("layer0_attn_context_before_o_proj", attn_output)
         if self._is_last_layer():
             _maybe_dump("attn_context_before_o_proj", attn_output)
 
         output, _ = self.o_proj(attn_output)
+        if self._is_layer0():
+            _maybe_dump("layer0_attn_out", output)
         if self._is_last_layer():
             _maybe_dump("attn_out_last_layer", output)
 
@@ -366,6 +379,8 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+        if self.layer_id == 0:
+            _maybe_dump("layer0_block_out", hidden_states)
         return hidden_states, residual
 
 
