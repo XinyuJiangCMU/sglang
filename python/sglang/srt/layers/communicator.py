@@ -48,6 +48,7 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -321,6 +322,7 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        layer_id: Optional[int] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -328,6 +330,7 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
+        self.layer_id = layer_id
 
         self._context = CommunicateContext.init_new()
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -468,6 +471,13 @@ class LayerCommunicator:
                         hidden_states, residual = self.input_layernorm(
                             hidden_states, residual
                         )
+        
+        if self.layer_id == 0:
+            try:
+                dumper.dump("layer0_attn_after_input_layernorm_only", hidden_states)
+            except Exception:
+                # Debug dump should never affect serving behavior.
+                pass
 
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
