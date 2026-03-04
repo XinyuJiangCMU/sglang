@@ -110,6 +110,7 @@ class Qwen3Attention(nn.Module):
             dict(
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
+                override_orig_dtype=torch.float32,
             )
             if get_global_server_args().rl_on_policy_target is not None
             else {}
