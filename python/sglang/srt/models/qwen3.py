@@ -165,9 +165,14 @@ class Qwen3Attention(nn.Module):
     def _is_layer0(self) -> bool:
         return self.layer_id == 0
 
+    def _is_layer1(self) -> bool:
+        return self.layer_id == 1
+
     def forward_prepare_native(self, positions, hidden_states):
         if self._is_layer0():
             _maybe_dump("layer0_hidden_in", hidden_states)
+        if self._is_layer1():
+            _maybe_dump("layer1_hidden_in", hidden_states)
         if self._is_last_layer():
             _maybe_dump("attn_input_last_layer", hidden_states)
 
@@ -178,6 +183,10 @@ class Qwen3Attention(nn.Module):
             _maybe_dump("layer0_q_pre_norm", q)
             _maybe_dump("layer0_k_pre_norm", k)
             _maybe_dump("layer0_v_pre_norm", v)
+        if self._is_layer1():
+            _maybe_dump("layer1_q_pre_norm", q)
+            _maybe_dump("layer1_k_pre_norm", k)
+            _maybe_dump("layer1_v_pre_norm", v)
         if self._is_last_layer():
             _maybe_dump("q_pre_norm", q)
             _maybe_dump("k_pre_norm", k)
@@ -195,6 +204,9 @@ class Qwen3Attention(nn.Module):
         if self._is_layer0():
             _maybe_dump("layer0_q_post_norm", q)
             _maybe_dump("layer0_k_post_norm", k)
+        if self._is_layer1():
+            _maybe_dump("layer1_q_post_norm", q)
+            _maybe_dump("layer1_k_post_norm", k)
         if self._is_last_layer():
             _maybe_dump("q_post_norm", q)
             _maybe_dump("k_post_norm", k)
@@ -204,6 +216,9 @@ class Qwen3Attention(nn.Module):
         if self._is_layer0():
             _maybe_dump("layer0_q_post_rope", q)
             _maybe_dump("layer0_k_post_rope", k)
+        if self._is_layer1():
+            _maybe_dump("layer1_q_post_rope", q)
+            _maybe_dump("layer1_k_post_rope", k)
         if self._is_last_layer():
             _maybe_dump("q_post_rope", q)
             _maybe_dump("k_post_rope", k)
@@ -261,12 +276,16 @@ class Qwen3Attention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         if self._is_layer0():
             _maybe_dump("layer0_attn_context_before_o_proj", attn_output)
+        if self._is_layer1():
+            _maybe_dump("layer1_attn_context_before_o_proj", attn_output)
         if self._is_last_layer():
             _maybe_dump("attn_context_before_o_proj", attn_output)
 
         output, _ = self.o_proj(attn_output)
         if self._is_layer0():
             _maybe_dump("layer0_attn_out", output)
+        if self._is_layer1():
+            _maybe_dump("layer1_attn_out", output)
         if self._is_last_layer():
             _maybe_dump("attn_out_last_layer", output)
 
@@ -357,6 +376,8 @@ class Qwen3DecoderLayer(nn.Module):
         if self.layer_id == 0:
             _maybe_dump("layer0_attn_input_raw", hidden_states)
             _maybe_dump("layer0_positions", positions)
+        if self.layer_id == 1:
+            _maybe_dump("layer1_attn_input_raw", hidden_states)
 
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -366,9 +387,11 @@ class Qwen3DecoderLayer(nn.Module):
             post_residual_addition=post_residual_addition,
         )
 
-        # Layer-0 probes: after prepare_attn (input to self_attn)
+        # After prepare_attn (input to self_attn)
         if self.layer_id == 0:
             _maybe_dump("layer0_attn_input_after_prepare", hidden_states)
+        if self.layer_id == 1:
+            _maybe_dump("layer1_attn_input_after_prepare", hidden_states)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -394,21 +417,28 @@ class Qwen3DecoderLayer(nn.Module):
             ),
         )
         if self.layer_id == 0:
-            # This is the residual branch that will be added back after MLP.
             _maybe_dump("layer0_residual", residual)
+        if self.layer_id == 1:
+            _maybe_dump("layer1_residual", residual)
         hidden_states = self.mlp(hidden_states)
         if self.layer_id == 0:
-            # This is the MLP branch output before the final residual add.
             _maybe_dump("layer0_block_out_before_residual_add", hidden_states)
+        if self.layer_id == 1:
+            _maybe_dump("layer1_block_out_before_residual_add", hidden_states)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
         if self.layer_id == 0:
-            # postprocess_layer has already applied the final residual add.
-            _maybe_dump("layer0_block_out_after_residual_add", hidden_states)
-            _maybe_dump("layer0_block_out", hidden_states)
+            # _trivial postprocess does NOT add residual; compute it explicitly for compare.
+            block_out = hidden_states + residual if residual is not None else hidden_states
+            _maybe_dump("layer0_block_out_after_residual_add", block_out)
+            _maybe_dump("layer0_block_out", block_out)
+        if self.layer_id == 1:
+            block_out = hidden_states + residual if residual is not None else hidden_states
+            _maybe_dump("layer1_block_out_after_residual_add", block_out)
+            _maybe_dump("layer1_block_out", block_out)
         return hidden_states, residual
 
 
