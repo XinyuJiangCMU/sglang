@@ -88,14 +88,18 @@ class Qwen3Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        norm_kwargs = (
-            dict(
-                weight_dtype=torch.float32,
-                cast_x_before_out_mul=True,
-            )
-            if get_global_server_args().rl_on_policy_target is not None
-            else {}
-        )
+        server_args = get_global_server_args()
+        if server_args.rl_on_policy_target is not None:
+            if server_args.attention_backend == "triton":
+                # Triton backend: match HF's bf16 weight dtype
+                norm_kwargs = dict(cast_x_before_out_mul=True)
+            else:
+                # FA3 backend: use fp32 weight
+                norm_kwargs = dict(
+                    weight_dtype=torch.float32, cast_x_before_out_mul=True
+                )
+        else:
+            norm_kwargs = {}
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
 

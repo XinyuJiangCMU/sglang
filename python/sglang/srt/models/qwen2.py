@@ -20,6 +20,7 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
@@ -91,8 +92,19 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        if get_global_server_args().rl_on_policy_target is not None:
+        server_args = get_global_server_args()
+        if server_args.rl_on_policy_target is not None:
             x = x.bfloat16()
+            if server_args.attention_backend == "triton":
+                # Split gate/up matmul to match HF's separate projections
+                # for numerical alignment with the triton attention backend.
+                weight = self.gate_up_proj.weight
+                half = weight.shape[0] // 2
+                gate = F.linear(x, weight[:half])
+                up = F.linear(x, weight[half:])
+                x = F.silu(gate) * up
+                x, _ = self.down_proj(x)
+                return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
@@ -228,9 +240,21 @@ class Qwen2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        server_args = get_global_server_args()
+        if (
+            server_args.rl_on_policy_target is not None
+            and server_args.attention_backend == "triton"
+        ):
+            layer_norm_kwargs = dict(
+                cast_x_before_out_mul=True, bf16_residual_add=True
+            )
+        else:
+            layer_norm_kwargs = {}
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, **layer_norm_kwargs
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, **layer_norm_kwargs
         )
 
     def forward(
@@ -273,18 +297,26 @@ class Qwen2Model(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
+        server_args = get_global_server_args()
+        _is_triton_on_policy = (
+            server_args.rl_on_policy_target is not None
+            and server_args.attention_backend == "triton"
+        )
         if self.pp_group.is_first_rank:
+            # Triton backend matches HF's bf16 embedding; FA3 needs fp32.
+            embed_dtype = (
+                torch.float32
+                if server_args.rl_on_policy_target is not None
+                and not _is_triton_on_policy
+                else None
+            )
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
-                params_dtype=(
-                    torch.float32
-                    if get_global_server_args().rl_on_policy_target is not None
-                    else None
-                ),
+                params_dtype=embed_dtype,
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -305,16 +337,20 @@ class Qwen2Model(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            norm_kwargs = (
-                dict(
-                    weight_dtype=torch.float32,
-                    cast_x_before_out_mul=True,
-                    override_orig_dtype=torch.float32,
-                    fp32_residual=True,
-                )
-                if get_global_server_args().rl_on_policy_target is not None
-                else {}
-            )
+            if server_args.rl_on_policy_target is not None:
+                if _is_triton_on_policy:
+                    norm_kwargs = dict(
+                        cast_x_before_out_mul=True, bf16_residual_add=True
+                    )
+                else:
+                    norm_kwargs = dict(
+                        weight_dtype=torch.float32,
+                        cast_x_before_out_mul=True,
+                        override_orig_dtype=torch.float32,
+                        fp32_residual=True,
+                    )
+            else:
+                norm_kwargs = {}
             self.norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
             )

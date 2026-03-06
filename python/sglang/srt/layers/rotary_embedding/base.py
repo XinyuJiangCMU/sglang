@@ -92,9 +92,12 @@ class RotaryEmbedding(MultiPlatformOp):
 
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
-            self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
-                apply_rotary_emb
-            )
+            # Disable torch.compile for triton backend to preserve numerical
+            # alignment with HF's native computation.
+            if get_global_server_args().attention_backend != "triton":
+                self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
+                    apply_rotary_emb
+                )
         self.position_cos, self.position_sin = None, None
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:

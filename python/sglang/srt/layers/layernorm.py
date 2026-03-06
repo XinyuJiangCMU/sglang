@@ -97,12 +97,14 @@ class RMSNorm(MultiPlatformOp):
         has_weight: bool = True,
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
+        bf16_residual_add: bool = False,
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
         self.override_orig_dtype = override_orig_dtype
+        self.bf16_residual_add = bf16_residual_add
         if self.has_weight:
             self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
         else:
@@ -114,6 +116,15 @@ class RMSNorm(MultiPlatformOp):
         )
         if _use_aiter:
             self._forward_method = self.forward_aiter
+
+        # Force forward_native for triton on-policy to match HF's native
+        # computation (bypasses fused kernels on all platforms including AMD).
+        server_args = get_global_server_args()
+        if (
+            server_args.rl_on_policy_target is not None
+            and server_args.attention_backend == "triton"
+        ):
+            self._forward_method = self.forward_native
 
     def forward_cuda(
         self,
@@ -220,15 +231,24 @@ class RMSNorm(MultiPlatformOp):
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = self.override_orig_dtype or x.dtype
-        x = x.to(torch.float32)
-        if residual is not None:
-            x = x + residual.to(torch.float32)
+        if residual is not None and self.bf16_residual_add:
+            # Match HF's residual add in original dtype (bf16) for numerical
+            # alignment with the triton attention backend.
+            x = x + residual
             if post_residual_addition is not None:
-                x = x + post_residual_addition.to(torch.float32)
-            if self.fp32_residual:
-                residual = x.clone()
-            else:
-                residual = x.to(orig_dtype)
+                x = x + post_residual_addition
+            residual = x.clone()
+            x = x.to(torch.float32)
+        else:
+            x = x.to(torch.float32)
+            if residual is not None:
+                x = x + residual.to(torch.float32)
+                if post_residual_addition is not None:
+                    x = x + post_residual_addition.to(torch.float32)
+                if self.fp32_residual:
+                    residual = x.clone()
+                else:
+                    residual = x.to(orig_dtype)
 
         hidden_size = x.shape[-1]
         if hidden_size != self.hidden_size:
