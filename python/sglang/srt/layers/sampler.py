@@ -115,9 +115,11 @@ class Sampler(nn.Module):
                 probs_without_temp_scaling = torch.softmax(logits, dim=-1)
 
             if get_global_server_args().rl_on_policy_target is not None:
-                logits_div_temperature = (
-                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
-                )
+                # Use fp32 log_softmax to match training-side computation exactly.
+                # The training side asserts logits.dtype == float32 and computes
+                # log_softmax in fp32.  Previous bf16 casts here introduced a
+                # systematic ~5e-4 drift in logprob_abs_diff.
+                logits_div_temperature = logits.div(sampling_info.temperatures)
                 logprobs_via_logsoftmax_kernel = torch.log_softmax(
                     logits_div_temperature, dim=-1
                 )
