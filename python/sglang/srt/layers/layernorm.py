@@ -345,7 +345,7 @@ class RMSNorm(MultiPlatformOp):
             _maybe_dump_rmsnorm_stage("rmsnorm_stage_x_norm_fp32", x)
 
         if self.cast_x_before_out_mul:
-            x = self.weight * x.to(orig_dtype)
+            x = self.weight.to(orig_dtype) * x.to(orig_dtype)
         else:
             x = (x * self.weight).to(orig_dtype)
         
