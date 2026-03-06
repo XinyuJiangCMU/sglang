@@ -168,6 +168,10 @@ class RMSNorm(CustomOp):
         override_orig_dtype: Optional = None,
     ) -> None:
         super().__init__()
+        # When rl_on_policy_target is set, match HF's RMSNorm behavior:
+        # cast x to orig_dtype BEFORE multiplying with weight (like HF does).
+        if get_global_server_args().rl_on_policy_target is not None and not cast_x_before_out_mul:
+            cast_x_before_out_mul = True
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
         self.override_orig_dtype = override_orig_dtype
@@ -310,7 +314,7 @@ class RMSNorm(CustomOp):
             _maybe_dump_rmsnorm_stage("rmsnorm_stage_x_norm_fp32", x)
 
         if self.cast_x_before_out_mul:
-            x = self.weight * x.to(orig_dtype)
+            x = self.weight.to(orig_dtype) * x.to(orig_dtype)
         else:
             x = (x * self.weight).to(orig_dtype)
         
