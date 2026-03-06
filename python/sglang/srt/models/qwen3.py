@@ -167,14 +167,23 @@ class Qwen3Attention(nn.Module):
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        is_layer1 = self.layer_id == 1
         if self.layer_id == 0:
             _maybe_dump("layer0_q_pre_norm", q)
             _maybe_dump("layer0_k_pre_norm", k)
             _maybe_dump("layer0_v_pre_norm", v)
+            _maybe_dump("layer0_q_norm_input_native", q)
+            _maybe_dump("layer0_k_norm_input_native", k)
+        if is_layer1:
+            _maybe_dump("layer1_q_pre_norm", q)
+            _maybe_dump("layer1_k_pre_norm", k)
+            _maybe_dump("layer1_v_pre_norm", v)
         if self._is_last_layer():
             _maybe_dump("q_pre_norm", q)
             _maybe_dump("k_pre_norm", k)
             _maybe_dump("v_pre_norm", v)
+            _maybe_dump("q_norm_input_native", q)
+            _maybe_dump("k_norm_input_native", k)
 
         q, k = apply_qk_norm(
             q=q,
@@ -188,15 +197,25 @@ class Qwen3Attention(nn.Module):
         if self.layer_id == 0:
             _maybe_dump("layer0_q_post_norm", q)
             _maybe_dump("layer0_k_post_norm", k)
+            _maybe_dump("layer0_q_post_norm_native", q)
+            _maybe_dump("layer0_k_post_norm_native", k)
+        if is_layer1:
+            _maybe_dump("layer1_q_post_norm", q)
+            _maybe_dump("layer1_k_post_norm", k)
         if self._is_last_layer():
             _maybe_dump("q_post_norm", q)
             _maybe_dump("k_post_norm", k)
+            _maybe_dump("q_post_norm_native", q)
+            _maybe_dump("k_post_norm_native", k)
 
         q, k = self.rotary_emb(positions, q, k)
 
         if self.layer_id == 0:
             _maybe_dump("layer0_q_post_rope", q)
             _maybe_dump("layer0_k_post_rope", k)
+        if is_layer1:
+            _maybe_dump("layer1_q_post_rope", q)
+            _maybe_dump("layer1_k_post_rope", k)
         if self._is_last_layer():
             _maybe_dump("q_post_rope", q)
             _maybe_dump("k_post_rope", k)
@@ -251,12 +270,18 @@ class Qwen3Attention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         if self.layer_id == 0:
             _maybe_dump("layer0_attn_context_before_o_proj", attn_output)
+        if self.layer_id == 1:
+            _maybe_dump("layer1_attn_context_before_o_proj", attn_output)
         if self._is_last_layer():
             _maybe_dump("attn_context_before_o_proj", attn_output)
 
         output, _ = self.o_proj(attn_output)
         if self.layer_id == 0:
             _maybe_dump("layer0_attn_out_after_o_proj", output)
+            _maybe_dump("layer0_attn_out", output)
+        if self.layer_id == 1:
+            _maybe_dump("layer1_attn_out_after_o_proj", output)
+            _maybe_dump("layer1_attn_out", output)
         if self._is_last_layer():
             _maybe_dump("attn_out_last_layer", output)
 
@@ -339,10 +364,30 @@ class Qwen3DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        is_layer0 = self.self_attn.layer_id == 0
+        is_layer1 = self.self_attn.layer_id == 1
+        is_last = self.self_attn._is_last_layer()
+
+        if is_layer0:
+            _maybe_dump("layer0_attn_input_raw", hidden_states)
+        if is_layer1:
+            _maybe_dump("layer1_attn_input_raw", hidden_states)
+
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
+        if is_layer0:
+            _maybe_dump("layer0_attn_after_input_layernorm_only", hidden_states)
+            _maybe_dump("layer0_attn_input_after_prepare", hidden_states)
+            _maybe_dump("layer0_hidden_in", hidden_states)
+        if is_layer1:
+            _maybe_dump("layer1_attn_after_input_layernorm_only", hidden_states)
+            _maybe_dump("layer1_attn_input_after_prepare", hidden_states)
+            _maybe_dump("layer1_hidden_in", hidden_states)
+        if is_last:
+            _maybe_dump("attn_input_last_layer", hidden_states)
+
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -361,12 +406,26 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
+        if is_layer0 and residual is not None:
+            _maybe_dump("layer0_residual", residual)
+        if is_layer1 and residual is not None:
+            _maybe_dump("layer1_residual", residual)
         hidden_states = self.mlp(hidden_states)
+        if is_layer0:
+            _maybe_dump("layer0_block_out_before_residual_add", hidden_states)
+        if is_layer1:
+            _maybe_dump("layer1_block_out_before_residual_add", hidden_states)
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+        if is_layer0:
+            _maybe_dump("layer0_block_out_after_residual_add", hidden_states)
+            _maybe_dump("layer0_block_out", hidden_states)
+        if is_layer1:
+            _maybe_dump("layer1_block_out_after_residual_add", hidden_states)
+            _maybe_dump("layer1_block_out", hidden_states)
         return hidden_states, residual
 
 
@@ -472,6 +531,7 @@ class Qwen3ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         if self.pp_group.is_first_rank:
             _maybe_dump("input_ids_for_compare", input_ids)
+            _maybe_dump("layer0_positions", positions)
             try:
                 if input_embeds is not None:
                     _maybe_dump("embedding_output", input_embeds)
