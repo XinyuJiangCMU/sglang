@@ -20,6 +20,7 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
@@ -91,7 +92,19 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
+        if get_global_server_args().rl_on_policy_target is not None:
+            # Split into separate gate and up matmuls to match HF's
+            # Qwen3MLP which does gate_proj(x) and up_proj(x) separately.
+            # A single merged matmul produces different floating-point
+            # results due to different accumulation order.
+            intermediate_size = self.gate_up_proj.output_size // 2
+            gate_weight = self.gate_up_proj.weight[:intermediate_size]
+            up_weight = self.gate_up_proj.weight[intermediate_size:]
+            gate = F.linear(x, gate_weight)
+            up = F.linear(x, up_weight)
+            gate_up = torch.cat([gate, up], dim=-1)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
