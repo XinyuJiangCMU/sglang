@@ -278,15 +278,29 @@ class RMSNorm(CustomOp):
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = self.override_orig_dtype or x.dtype
-        x = x.to(torch.float32)
+        if residual is not None:
+            if (
+                not self.fp32_residual
+                and get_global_server_args().rl_on_policy_target is not None
+            ):
+                # Match HF's behavior: add in orig_dtype (bf16) BEFORE
+                # converting to fp32 for norm. HF does residual + attn_out
+                # in bf16, then passes to layernorm. SGLang's default is
+                # to upcast both to fp32 before adding, which is more precise
+                # but produces different results.
+                x = x.to(orig_dtype) + residual.to(orig_dtype)
+                residual = x.clone()
+                x = x.to(torch.float32)
+            else:
+                x = x.to(torch.float32) + residual.to(torch.float32)
+                if self.fp32_residual:
+                    residual = x.clone()
+                else:
+                    residual = x.to(orig_dtype)
+        else:
+            x = x.to(torch.float32)
         if should_dump_stages:
             _maybe_dump_rmsnorm_stage("rmsnorm_stage_x_fp32", x)
-        if residual is not None:
-            x = x + residual.to(torch.float32)
-            if self.fp32_residual:
-                residual = x.clone()
-            else:
-                residual = x.to(orig_dtype)
 
         hidden_size = x.shape[-1]
         if hidden_size != self.hidden_size:

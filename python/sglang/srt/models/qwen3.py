@@ -380,6 +380,7 @@ class Qwen3DecoderLayer(nn.Module):
         )
         if self.layer_id == 0:
             _maybe_dump("layer0_residual", residual)
+            _maybe_dump("layer0_mlp_input", hidden_states)
         if self.layer_id == 1:
             _maybe_dump("layer1_residual", residual)
         hidden_states = self.mlp(hidden_states)
