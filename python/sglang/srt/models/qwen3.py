@@ -247,16 +247,22 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        norm_kwargs = (
-            dict(
-                weight_dtype=torch.float32,
-                cast_x_before_out_mul=True,
-                override_orig_dtype=torch.float32,
-                fp32_residual=True,
-            )
-            if get_global_server_args().rl_on_policy_target is not None
-            else {}
-        )
+        server_args = get_global_server_args()
+        if server_args.rl_on_policy_target is not None:
+            if server_args.attention_backend == "triton":
+                norm_kwargs = dict(
+                    cast_x_before_out_mul=True,
+                    bf16_residual_add=True,
+                )
+            else:
+                norm_kwargs = dict(
+                    weight_dtype=torch.float32,
+                    cast_x_before_out_mul=True,
+                    override_orig_dtype=torch.float32,
+                    fp32_residual=True,
+                )
+        else:
+            norm_kwargs = {}
         self.input_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
