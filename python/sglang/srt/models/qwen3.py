@@ -104,17 +104,8 @@ class Qwen3Attention(nn.Module):
         self.layer_id = layer_id
         self.num_hidden_layers = num_hidden_layers
 
-        norm_kwargs = (
-            dict(
-                weight_dtype=torch.float32,
-                cast_x_before_out_mul=True,
-                override_orig_dtype=torch.float32,
-            )
-            if get_global_server_args().rl_on_policy_target is not None
-            else {}
-        )
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -251,9 +242,6 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if get_global_server_args().rl_on_policy_target is not None:
-            hidden_states = hidden_states.bfloat16()
-
         if not _is_npu:
             q, k, v = self.forward_prepare_native(
                 positions=positions,
@@ -265,10 +253,6 @@ class Qwen3Attention(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-
-        if get_global_server_args().rl_on_policy_target is not None:
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch)
         if self._is_layer0():
@@ -330,21 +314,11 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        norm_kwargs = (
-            dict(
-                weight_dtype=torch.float32,
-                cast_x_before_out_mul=True,
-                override_orig_dtype=torch.float32,
-                fp32_residual=True,
-            )
-            if get_global_server_args().rl_on_policy_target is not None
-            else {}
-        )
         self.input_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            config.hidden_size, eps=config.rms_norm_eps
         )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            config.hidden_size, eps=config.rms_norm_eps
         )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
