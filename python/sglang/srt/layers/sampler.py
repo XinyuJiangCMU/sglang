@@ -173,7 +173,6 @@ class Sampler(nn.Module):
                     raise ValueError(
                         f"Invalid sampling backend: {get_global_server_args().sampling_backend}"
                     )
-            
 
             if return_logprob:
                 if get_global_server_args().rl_on_policy_target is not None:
@@ -187,7 +186,6 @@ class Sampler(nn.Module):
                     del probs_without_temp_scaling
                 else:
                     logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
-
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
