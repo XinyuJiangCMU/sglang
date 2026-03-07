@@ -98,6 +98,10 @@ class RMSNorm(MultiPlatformOp):
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
+        # When rl_on_policy_target is set, match HF's RMSNorm behavior:
+        # cast x to orig_dtype BEFORE multiplying with weight (like HF does).
+        if get_global_server_args().rl_on_policy_target is not None and not cast_x_before_out_mul:
+            cast_x_before_out_mul = True
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
         if self.has_weight:
@@ -109,7 +113,11 @@ class RMSNorm(MultiPlatformOp):
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
-        if _use_aiter:
+        # Force forward_native for on-policy to match HF's native
+        # computation (bypasses fused kernels on all platforms including AMD).
+        if get_global_server_args().rl_on_policy_target is not None:
+            self._forward_method = self.forward_native
+        elif _use_aiter:
             self._forward_method = self.forward_aiter
 
     def forward_cuda(
@@ -252,7 +260,7 @@ class RMSNorm(MultiPlatformOp):
         x = x * torch.rsqrt(variance + self.variance_epsilon)
 
         if self.cast_x_before_out_mul:
-            x = self.weight * x.to(orig_dtype)
+            x = self.weight.to(orig_dtype) * x.to(orig_dtype)
         else:
             x = (x * self.weight).to(orig_dtype)
 
