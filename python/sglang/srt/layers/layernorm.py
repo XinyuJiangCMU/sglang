@@ -111,10 +111,15 @@ class RMSNorm(MultiPlatformOp):
         )
         if _use_aiter:
             self._forward_method = self.forward_aiter
-        # For on-policy training: force forward_native so computation matches HF's
-        # RMSNorm exactly (weight * x.to(orig_dtype), i.e. cast_x_before_out_mul=True).
-        # This overrides aiter/vllm kernels which use different dtype ordering.
-        if get_global_server_args().rl_on_policy_target is not None:
+        # For triton-backend on-policy training: force forward_native so computation
+        # matches HF's RMSNorm exactly (weight * x.to(orig_dtype)).
+        # Only applied when attention_backend == "triton" to avoid interfering with
+        # FA3 or other backends that have their own TOP alignment paths.
+        _sargs = get_global_server_args()
+        if (
+            _sargs.rl_on_policy_target is not None
+            and _sargs.attention_backend == "triton"
+        ):
             self.cast_x_before_out_mul = True
             self._forward_method = self.forward_native
 
