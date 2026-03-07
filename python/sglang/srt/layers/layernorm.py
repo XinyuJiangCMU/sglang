@@ -111,6 +111,12 @@ class RMSNorm(MultiPlatformOp):
         )
         if _use_aiter:
             self._forward_method = self.forward_aiter
+        # For on-policy training: force forward_native so computation matches HF's
+        # RMSNorm exactly (weight * x.to(orig_dtype), i.e. cast_x_before_out_mul=True).
+        # This overrides aiter/vllm kernels which use different dtype ordering.
+        if get_global_server_args().rl_on_policy_target is not None:
+            self.cast_x_before_out_mul = True
+            self._forward_method = self.forward_native
 
     def forward_cuda(
         self,
