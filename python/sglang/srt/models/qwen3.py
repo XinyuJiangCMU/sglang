@@ -60,7 +60,6 @@ class Qwen3Attention(nn.Module):
         attention_bias: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        num_hidden_layers: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -84,8 +83,6 @@ class Qwen3Attention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
-        self.layer_id = layer_id
-        self.num_hidden_layers = num_hidden_layers
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -118,7 +115,6 @@ class Qwen3Attention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            # dtype=torch.float32,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -211,8 +207,6 @@ class Qwen3DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
-        self.layer_id = layer_id
-        self.num_hidden_layers = config.num_hidden_layers
         self.self_attn = Qwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -225,7 +219,6 @@ class Qwen3DecoderLayer(nn.Module):
             quant_config=quant_config,
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=config.attention_bias,
-            num_hidden_layers=config.num_hidden_layers,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
@@ -428,12 +421,6 @@ class Qwen3ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ):
         start, end = split_interval
-        # embed
-        # if start == 0:
-        #     if input_embeds is None:
-        #         forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-        #     else:
-        #         forward_batch.hidden_states = input_embeds
         if start == 0:
             if input_embeds is None:
                 if hasattr(self.model, "get_input_embedding"):
