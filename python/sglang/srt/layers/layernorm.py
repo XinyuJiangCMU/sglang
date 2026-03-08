@@ -100,6 +100,10 @@ class RMSNorm(MultiPlatformOp):
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
+        # When rl_on_policy_target is set, match HF's RMSNorm behavior:
+        # cast x to orig_dtype BEFORE multiplying with weight (like HF does).
+        if get_global_server_args().rl_on_policy_target is not None and not cast_x_before_out_mul:
+            cast_x_before_out_mul = True
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
         self.override_orig_dtype = override_orig_dtype
@@ -169,6 +173,17 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or get_global_server_args().rl_on_policy_target is not None
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
         if residual is not None:
             residual_out = torch.empty_like(x)
             output = torch.empty_like(x)
@@ -194,6 +209,18 @@ class RMSNorm(MultiPlatformOp):
         # Fallback to native implementation if vllm is not available
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
+
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or get_global_server_args().rl_on_policy_target is not None
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
 
         if not x.is_contiguous():
             # NOTE: Remove this if aiter kernel supports discontinuous input
@@ -225,32 +252,24 @@ class RMSNorm(MultiPlatformOp):
                 not self.fp32_residual
                 and get_global_server_args().rl_on_policy_target is not None
             ):
-                # Match HF's behavior: add in orig_dtype (bf16) BEFORE
-                # converting to fp32 for norm. HF does residual + attn_out
-                # in bf16, then passes to layernorm. SGLang's default is
-                # to upcast both to fp32 before adding, which is more precise
-                # but produces different results.
+                # Match HF's behavior: add residual in orig_dtype (bf16) BEFORE
+                # upcasting to fp32 for norm. HF adds residual + attn_out in
+                # bf16, then passes to layernorm. SGLang's default upcasts both
+                # to fp32 before adding, which is more precise but produces
+                # different results from the training side.
                 x = x.to(orig_dtype) + residual.to(orig_dtype)
                 residual = x.clone()
                 x = x.to(torch.float32)
             else:
                 x = x.to(torch.float32) + residual.to(torch.float32)
+                if post_residual_addition is not None:
+                    x = x + post_residual_addition.to(torch.float32)
                 if self.fp32_residual:
                     residual = x.clone()
                 else:
                     residual = x.to(orig_dtype)
         else:
             x = x.to(torch.float32)
-        if should_dump_stages:
-            _maybe_dump_rmsnorm_stage("rmsnorm_stage_x_fp32", x)
-        if residual is not None:
-            x = x + residual.to(torch.float32)
-            if post_residual_addition is not None:
-                x = x + post_residual_addition.to(torch.float32)
-            if self.fp32_residual:
-                residual = x.clone()
-            else:
-                residual = x.to(orig_dtype)
 
         hidden_size = x.shape[-1]
         if hidden_size != self.hidden_size:
@@ -274,7 +293,12 @@ class RMSNorm(MultiPlatformOp):
         x = x * torch.rsqrt(variance + self.variance_epsilon)
 
         if self.cast_x_before_out_mul:
-            x = self.weight.to(orig_dtype) * x.to(orig_dtype)
+            if get_global_server_args().rl_on_policy_target is not None:
+                # Match HF: cast weight to orig_dtype too (weight may be fp32
+                # if caller set weight_dtype=torch.float32, but HF uses bf16).
+                x = self.weight.to(orig_dtype) * x.to(orig_dtype)
+            else:
+                x = self.weight * x.to(orig_dtype)
         else:
             x = (x * self.weight).to(orig_dtype)
 
