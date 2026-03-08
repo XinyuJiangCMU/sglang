@@ -118,8 +118,6 @@ class RMSNorm(MultiPlatformOp):
         )
         if _use_aiter:
             self._forward_method = self.forward_aiter
-        if get_global_server_args().rl_on_policy_target is not None:
-            self._forward_method = self.forward_native
 
     def forward_cuda(
         self,
@@ -175,6 +173,17 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or get_global_server_args().rl_on_policy_target is not None
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
         if residual is not None:
             residual_out = torch.empty_like(x)
             output = torch.empty_like(x)
@@ -200,6 +209,18 @@ class RMSNorm(MultiPlatformOp):
         # Fallback to native implementation if vllm is not available
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
+
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or get_global_server_args().rl_on_policy_target is not None
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
 
         if not x.is_contiguous():
             # NOTE: Remove this if aiter kernel supports discontinuous input
