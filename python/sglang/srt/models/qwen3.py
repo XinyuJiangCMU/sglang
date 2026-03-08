@@ -242,7 +242,6 @@ class Qwen3DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            layer_id=layer_id,
         )
 
     def forward(
