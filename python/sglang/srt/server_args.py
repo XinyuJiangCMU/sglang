@@ -506,6 +506,12 @@ class ServerArgs:
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
 
+    # Speculative decoding (SSD - Speculative Speculative Decoding)
+    speculative_ssd_async: bool = False
+    speculative_ssd_fan_out: int = 3
+    speculative_ssd_fan_out_list: Optional[str] = None
+    speculative_ssd_fan_out_list_miss: Optional[str] = None
+
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
@@ -4529,6 +4535,31 @@ class ServerArgs:
             "--enable-multi-layer-eagle",
             action="store_true",
             help="Enable multi-layer Eagle speculative decoding.",
+        )
+
+        # SSD (Speculative Speculative Decoding)
+        parser.add_argument(
+            "--speculative-ssd-async",
+            action="store_true",
+            help="Enable async SSD mode with draft on separate GPU.",
+        )
+        parser.add_argument(
+            "--speculative-ssd-fan-out",
+            type=int,
+            default=ServerArgs.speculative_ssd_fan_out,
+            help="Default fan-out factor for SSD tree branching.",
+        )
+        parser.add_argument(
+            "--speculative-ssd-fan-out-list",
+            type=str,
+            default=None,
+            help="Comma-separated per-depth fan-out for cache hits (e.g. '3,3,3,3,3,3').",
+        )
+        parser.add_argument(
+            "--speculative-ssd-fan-out-list-miss",
+            type=str,
+            default=None,
+            help="Comma-separated per-depth fan-out for cache misses.",
         )
 
         # Expert parallelism

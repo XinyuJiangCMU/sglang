@@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    SSD = auto()  # Speculative Speculative Decoding (async tree-cache SD)
     NONE = auto()
 
     @classmethod
@@ -45,6 +46,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
+
+    def is_ssd(self) -> bool:
+        return self == SpeculativeAlgorithm.SSD
 
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
@@ -102,6 +106,16 @@ class SpeculativeAlgorithm(Enum):
 
             return NGRAMWorker
 
+        elif self.is_ssd():
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation yet."
+                )
+
+            from sglang.srt.speculative.ssd_worker import SSDWorker
+
+            return SSDWorker
+
         raise ValueError("Unreachable code path in create_worker.")
 
 
@@ -111,6 +125,8 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    SSD_DRAFT = auto()
+    SSD_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -126,6 +142,7 @@ class SpecInput(ABC):
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.NGRAM_VERIFY,
+            SpecInputType.SSD_VERIFY,
         }
 
     @abstractmethod
