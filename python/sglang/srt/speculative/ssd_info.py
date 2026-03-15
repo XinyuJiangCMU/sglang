@@ -42,8 +42,12 @@ class SSDVerifyInput(SpecInput):
     draft_logits: Optional[torch.Tensor] = None
     # Number of speculative steps (K)
     spec_steps: int = 0
-    # Whether any drafts came from cache hits
+    # Whether any drafts came from cache hits (async mode): [B]
     cache_hits: Optional[torch.Tensor] = None
+    # Recovery token IDs for tree cache keying (async mode): [B]
+    recovery_token_ids: Optional[torch.Tensor] = None
+    # Accepted length from previous step for cache key depth: [B]
+    last_accepted_lens: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.SSD_VERIFY)
