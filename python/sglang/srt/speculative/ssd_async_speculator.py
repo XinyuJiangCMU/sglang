@@ -20,6 +20,7 @@ from sglang.srt.speculative.ssd_nccl_utils import (
     CMD_EXIT,
     CMD_PREFILL,
     CMD_SPECULATE,
+    _pg_recv,
     send_cmd,
     send_int64,
     send_meta,
@@ -197,14 +198,12 @@ class SSDAsyncSpeculator:
 
         # Receive response: fused [cache_hits(B), tokens(B*K)] + logits
         fused_response = self._fused_response[: B + B * K]
-        dist.recv(
-            fused_response, src=self.draft_rank, group=self.async_pg
-        )
+        _pg_recv(self.async_pg, fused_response, self.draft_rank)
         cache_hits = fused_response[:B]
         spec_tokens = fused_response[B:].view(B, K)
 
         logits_q = self._logits_q[:B]
-        dist.recv(logits_q, src=self.draft_rank, group=self.async_pg)
+        _pg_recv(self.async_pg, logits_q, self.draft_rank)
 
         logger.debug(
             f"Spec response: B={B}, hits={cache_hits.sum().item()}/{B}"

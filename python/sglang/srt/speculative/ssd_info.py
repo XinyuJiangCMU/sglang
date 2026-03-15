@@ -16,16 +16,54 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 @dataclass
 class SSDDraftInput(SpecInput):
-    """Input passed to the draft model for speculation."""
+    """Input passed to the draft model for speculation.
+
+    In async mode, this replaces EagleDraftInput between decode steps.
+    It tracks the recovery token (verified_id) and accept lengths
+    needed for the next async speculate call.
+    """
 
     # Hidden states from target model (for potential EAGLE-style conditioning)
     hidden_states: Optional[torch.Tensor] = None
+    # Last accepted/verified token IDs per sequence: [B]
+    # Used in async mode to track recovery tokens between steps
+    verified_id: Optional[torch.Tensor] = None
+    # Last accepted lengths per sequence: [B]
+    # Used for tree cache key depth in async mode
+    last_accepted_lens: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.SSD_DRAFT)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return 1, 1
+
+    def filter_batch(self, new_indices, has_been_filtered: bool = True):
+        """Filter batch by keeping only entries at new_indices."""
+        if self.verified_id is not None:
+            if has_been_filtered:
+                self.verified_id = self.verified_id[: len(new_indices)]
+            else:
+                self.verified_id = self.verified_id[new_indices]
+        if self.last_accepted_lens is not None:
+            if has_been_filtered:
+                self.last_accepted_lens = self.last_accepted_lens[: len(new_indices)]
+            else:
+                self.last_accepted_lens = self.last_accepted_lens[new_indices]
+
+    def merge_batch(self, other: "SSDDraftInput"):
+        """Merge another SSDDraftInput into this one."""
+        if self.verified_id is None:
+            self.verified_id = other.verified_id
+            self.last_accepted_lens = other.last_accepted_lens
+            return
+        if other.verified_id is None:
+            return
+        self.verified_id = torch.cat([self.verified_id, other.verified_id])
+        if self.last_accepted_lens is not None and other.last_accepted_lens is not None:
+            self.last_accepted_lens = torch.cat(
+                [self.last_accepted_lens, other.last_accepted_lens]
+            )
 
 
 @dataclass

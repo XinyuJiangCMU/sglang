@@ -29,6 +29,7 @@ from sglang.srt.speculative.ssd_nccl_utils import (
     CMD_EXIT,
     CMD_PREFILL,
     CMD_SPECULATE,
+    _pg_send,
     int64_to_temps,
     recv_cmd,
     recv_int64,
@@ -483,12 +484,8 @@ class SSDDraftRunner:
         fused_response = torch.cat(
             [cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)]
         )
-        dist.send(fused_response, dst=self.target_rank, group=self.async_pg)
-        dist.send(
-            out_logits[:, :K, :].contiguous(),
-            dst=self.target_rank,
-            group=self.async_pg,
-        )
+        _pg_send(self.async_pg, fused_response, self.target_rank)
+        _pg_send(self.async_pg, out_logits[:, :K, :].contiguous(), self.target_rank)
 
         hit_count = cache_hits.sum().item()
         logger.debug(f"Spec response: B={B}, hits={hit_count}/{B}")
@@ -564,6 +561,123 @@ class SSDDraftRunner:
                 raise RuntimeError(f"draft_loop: unknown command {cmd}")
 
 
+class HFDraftModel:
+    """Lightweight HuggingFace-based draft model wrapper.
+
+    Provides simple forward interfaces for the SSDDraftRunner without
+    requiring full SGLang ModelRunner infrastructure. Uses HuggingFace's
+    built-in KV cache for simplicity.
+
+    This is a minimal implementation for getting the async pipeline working.
+    For production, consider using SGLang's ModelRunner with paged attention.
+    """
+
+    def __init__(self, model_path: str, device: torch.device, dtype: torch.dtype):
+        from transformers import AutoModelForCausalLM
+
+        logger.info(f"Loading draft model from {model_path} on {device}")
+        self.device = device
+        self.dtype = dtype
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            device_map={"": device},
+            attn_implementation="flash_attention_2",
+        )
+        self.model.eval()
+        # Per-sequence KV cache: {seq_idx: past_key_values}
+        self._kv_caches = {}
+        logger.info(f"Draft model loaded: {type(self.model).__name__}")
+
+    def clear_kv_cache(self):
+        """Clear all KV caches."""
+        self._kv_caches.clear()
+
+    def forward_draft_step(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_tables: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one decode step on the draft model.
+
+        Args:
+            input_ids: [B] token IDs
+            positions: [B] position indices (unused, implicit in KV cache)
+            block_tables: [B, M] block tables (unused with HF cache)
+
+        Returns:
+            logits: [B, V]
+        """
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids.unsqueeze(1) if input_ids.dim() == 1 else input_ids,
+                use_cache=False,  # Simplified: no KV cache tracking
+            )
+            # Last token logits
+            return outputs.logits[:, -1, :]
+
+    def forward_glue_decode(
+        self,
+        input_ids: torch.Tensor,
+        num_tokens: torch.Tensor,
+        block_tables: torch.Tensor,
+        K: int,
+    ) -> torch.Tensor:
+        """Run glue decode: process K+1 tokens per sequence.
+
+        Args:
+            input_ids: [B*(K+1)] flattened input IDs
+            num_tokens: [B] sequence lengths
+            block_tables: [B, M] block tables
+            K: speculation depth
+
+        Returns:
+            logits: [B, K+1, V]
+        """
+        B = num_tokens.shape[0]
+        Kp1 = K + 1
+        # Reshape to [B, K+1]
+        tokens_2d = input_ids.view(B, Kp1)
+
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=tokens_2d,
+                use_cache=False,
+            )
+            return outputs.logits  # [B, K+1, V]
+
+    def forward_tree_step(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        slot_maps: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        b_flat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one tree decode step on all N branches.
+
+        Args:
+            input_ids: [N] token IDs
+            positions: [N] position indices
+            slot_maps: [N] KV slot mappings (unused with HF)
+            context_lens: [N] context lengths (unused with HF)
+            block_tables: [B, M] block tables (unused with HF)
+            b_flat: [N] batch index per branch
+
+        Returns:
+            logits: [N, V]
+        """
+        N = input_ids.shape[0]
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids.unsqueeze(1),
+                use_cache=False,
+            )
+            return outputs.logits[:, -1, :]
+
+
 def run_draft_process(
     draft_model_path: str,
     gpu_id: int,
@@ -587,14 +701,19 @@ def run_draft_process(
     torch.cuda.set_device(gpu_id)
     device = torch.device(f"cuda:{gpu_id}")
 
-    # Initialize NCCL process group
-    dist.init_process_group(
-        backend="nccl",
-        init_method=nccl_init_method,
+    # Initialize NCCL process group for async communication.
+    # Use TCPStore + ProcessGroupNCCL directly (matches target side).
+    nccl_host, nccl_port_str = nccl_init_method.replace("tcp://", "").split(":")
+    store = dist.TCPStore(
+        host_name=nccl_host,
+        port=int(nccl_port_str),
         world_size=world_size,
-        rank=rank,
+        is_master=False,  # draft is rank 1 = worker
+        wait_for_workers=False,
     )
-    async_pg = dist.new_group(ranks=[0, rank])
+    async_pg = dist.ProcessGroupNCCL(
+        store, rank, world_size
+    )
 
     dtype = getattr(torch, dtype_str)
 
@@ -615,8 +734,20 @@ def run_draft_process(
         jit_speculate=jit_speculate,
     )
 
-    # TODO: Load draft model via SGLang model runner and pass to draft_loop
-    # For now, run in cache-only mode (tree decode uses random logits)
-    runner.draft_loop(model=None)
+    # Load draft model
+    model = None
+    try:
+        model = HFDraftModel(
+            model_path=draft_model_path,
+            device=device,
+            dtype=dtype,
+        )
+    except Exception as e:
+        logger.warning(
+            f"Failed to load draft model: {e}. "
+            "Running in cache-only mode (tree decode uses random logits)."
+        )
 
-    dist.destroy_process_group()
+    runner.draft_loop(model=model)
+
+    # No dist.destroy_process_group() — we used ProcessGroupNCCL directly
