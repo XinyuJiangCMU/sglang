@@ -1,8 +1,8 @@
 """SSD (Speculative Speculative Decoding) Worker.
 
-Phase 0: Skeleton that initializes draft + target models.
-Phase 1 will add sync draft/verify logic.
-Phase 3 will add async mode with tree cache.
+Phase 1: Sync SD — sequential draft + verify on same GPU.
+Inherits EAGLEWorker's draft/verify pipeline with topk=1 (linear speculation).
+Phase 3 will add async mode with NCCL + tree cache on separate GPU.
 """
 
 import logging
@@ -30,12 +30,12 @@ logger = logging.getLogger(__name__)
 class SSDWorker(EAGLEWorker):
     """Speculative Speculative Decoding worker.
 
-    Extends StandaloneWorker/EAGLEWorker pattern:
-    - Loads a full standalone draft model (e.g. Llama-1B)
+    Phase 1 (sync): Reuses EAGLEWorker's draft/verify pipeline with topk=1.
+    - Loads a full standalone draft model (e.g. Llama-1B) on same GPU as target
+    - Draft K tokens sequentially, target verifies in one forward pass
     - Draft and target share req_to_token_pool but have separate KV caches
-    - Phase 0: just initializes models (inherits from EAGLEWorker)
-    - Phase 1: will override forward_batch_generation with sync SD
-    - Phase 3: will add async mode with NCCL + tree cache
+
+    Phase 3 (async): Will add separate-GPU draft with NCCL + tree cache.
     """
 
     def __init__(
@@ -55,7 +55,7 @@ class SSDWorker(EAGLEWorker):
         self.ssd_async = server_args.speculative_ssd_async
         self.ssd_fan_out = server_args.speculative_ssd_fan_out
 
-        # Parse fan-out lists
+        # Parse fan-out lists (for Phase 3 async tree cache)
         if server_args.speculative_ssd_fan_out_list:
             self.fan_out_list = [
                 int(x) for x in server_args.speculative_ssd_fan_out_list.split(",")
@@ -73,10 +73,19 @@ class SSDWorker(EAGLEWorker):
 
         self.mq_len = sum(self.fan_out_list)
 
+        # Set defaults for sync SD: topk=1 (linear speculation), num_draft_tokens=K
+        if server_args.speculative_num_steps is None:
+            server_args.speculative_num_steps = self.spec_k
+        if server_args.speculative_eagle_topk is None:
+            server_args.speculative_eagle_topk = 1
+        if server_args.speculative_num_draft_tokens is None:
+            server_args.speculative_num_draft_tokens = self.spec_k
+
         logger.info(
             f"SSD config: k={self.spec_k}, async={self.ssd_async}, "
-            f"fan_out={self.ssd_fan_out}, fan_out_list={self.fan_out_list}, "
-            f"fan_out_list_miss={self.fan_out_list_miss}, mq_len={self.mq_len}"
+            f"topk={server_args.speculative_eagle_topk}, "
+            f"num_draft_tokens={server_args.speculative_num_draft_tokens}, "
+            f"fan_out={self.ssd_fan_out}, mq_len={self.mq_len}"
         )
 
         # Initialize like StandaloneWorker (full draft model, shared allocator)

@@ -2888,6 +2888,21 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        if self.speculative_algorithm == "SSD":
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = 6
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
+            if self.speculative_num_draft_tokens is None:
+                self.speculative_num_draft_tokens = self.speculative_num_steps
+            logger.info(
+                f"SSD speculative decoding: k={self.speculative_num_steps}, "
+                f"topk={self.speculative_eagle_topk}, "
+                f"num_draft_tokens={self.speculative_num_draft_tokens}"
+            )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -4388,7 +4403,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SSD"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
