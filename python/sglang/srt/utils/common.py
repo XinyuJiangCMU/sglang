@@ -111,10 +111,9 @@ def is_hip() -> bool:
 
 
 if is_hip():
-    HIP_FP8_E4M3_FNUZ_MAX = 224.0
-    FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
+    FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fnuz).max  # 240.0
 else:
-    FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+    FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 
 FP8_E4M3_MIN = -FP8_E4M3_MAX
 
