@@ -851,22 +851,33 @@ class AiterAttnBackend(AttentionBackend):
                     # num_kv_splits_indptr=num_kv_splits_indptr,
                 )
             else:
-                seq_lens_sum = seq_lens.sum().item()
-                self.indices_updater_prefill.update(
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[: bs + 1] = torch.arange(
+                    0,
+                    (1 + bs) * self.num_draft_tokens,
+                    step=self.num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
                     req_pool_indices,
                     seq_lens,
-                    seq_lens_sum,
-                    prefix_lens=None,
-                    encoder_lens=encoder_lens,
-                    spec_info=spec_info,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
                 )
                 self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
                     None,
-                    None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    self.num_draft_tokens,
+                    self.max_context_len,
                 )
         elif forward_mode.is_draft_extend():
             if self.use_mla:
@@ -938,22 +949,34 @@ class AiterAttnBackend(AttentionBackend):
                     # num_kv_splits_indptr=num_kv_splits_indptr,
                 )
             else:
-                seq_lens_sum = seq_lens.sum().item()
-                self.indices_updater_prefill.update(
+                num_tokens_per_bs = self.speculative_num_steps + 1
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[: bs + 1] = torch.arange(
+                    0,
+                    bs * num_tokens_per_bs + 1,
+                    step=num_tokens_per_bs,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
                     req_pool_indices,
                     seq_lens,
-                    seq_lens_sum,
-                    prefix_lens=None,
-                    encoder_lens=encoder_lens,
-                    spec_info=spec_info,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
                 )
                 self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
                     None,
-                    None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    num_tokens_per_bs,
+                    self.max_context_len,
                 )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -1033,22 +1056,20 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 seq_lens = seq_lens[:bs]
-                seq_lens_sum = seq_lens.sum().item()
-                self.indices_updater_prefill.update(
+                accept_lens = spec_info.accept_length[:bs]
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
                     req_pool_indices,
                     seq_lens,
-                    seq_lens_sum,
-                    prefix_lens=None,
-                    encoder_lens=encoder_lens,
-                    spec_info=spec_info,
-                )
-                self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
+                    kv_indptr,
                     None,
-                    None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    kv_indices,
+                    self.req_to_token.stride(0),
                 )
 
         else:
