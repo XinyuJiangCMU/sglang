@@ -451,21 +451,28 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                 )
             else:
-                self.indices_updater_prefill.update(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.seq_lens_sum,
-                    prefix_lens=None,
-                    encoder_lens=forward_batch.encoder_lens,
-                    spec_info=forward_batch.spec_info,
+                kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                    spec_info.generate_attn_arg_prefill(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        forward_batch.seq_lens_sum,
+                        self.req_to_token,
+                    )
                 )
+                # mha_batch_prefill reads up to 128 extra elements beyond
+                # actual kv_indices; pad with 256 to prevent OOB access
+                token_num = kv_indptr[-1]
+                kv_indices = torch.cat([
+                    kv_indices,
+                    kv_indices[0].expand(256),
+                ])
                 self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
                     None,
-                    None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    max(forward_batch.extend_seq_lens_cpu),
+                    forward_batch.seq_lens_cpu.max().item(),
                 )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
@@ -546,21 +553,44 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                 )
             else:
-                self.indices_updater_prefill.update(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.seq_lens_sum,
-                    prefix_lens=None,
-                    encoder_lens=forward_batch.encoder_lens,
-                    spec_info=forward_batch.spec_info,
+                draft_num = spec_info.draft_token_num
+                kv_lens = forward_batch.seq_lens + draft_num
+                kv_lens_sum = forward_batch.seq_lens_sum + draft_num * bs
+                device = forward_batch.seq_lens.device
+
+                qo_indptr = torch.arange(
+                    0,
+                    (1 + bs) * draft_num,
+                    step=draft_num,
+                    dtype=torch.int32,
+                    device=device,
                 )
+                kv_indptr = torch.zeros(
+                    (bs + 1,), dtype=torch.int32, device=device
+                )
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                # mha_batch_prefill reads up to 128 extra elements beyond
+                # actual kv_indices; pad with 256 to prevent OOB access
+                kv_indices = torch.empty(
+                    kv_lens_sum + 256, dtype=torch.int32, device=device
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    kv_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+                kv_indices[kv_lens_sum:] = kv_indices[0]
                 self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
                     None,
-                    None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    draft_num,
+                    kv_lens.max().item(),
                 )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -839,73 +869,92 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.max_kv_len,
                 )
         elif forward_mode.is_draft_extend():
-            num_tokens_per_bs = self.speculative_num_steps + 1
-            qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[: bs + 1] = torch.arange(
-                0,
-                bs * num_tokens_per_bs + 1,
-                step=num_tokens_per_bs,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                seq_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
-            kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-            max_q_len = num_tokens_per_bs
-
-            if _use_mla_ps_kernel:
-
-                num_kv_splits = self.max_split_per_batch
-
-                self.make_mla_meta_data(
-                    qo_indptr,
-                    kv_indptr,
-                    self.work_metadata,
-                    self.work_info_set,
-                    self.work_indptr,
-                    self.reduce_indptr,
-                    self.reduce_final_map,
-                    self.reduce_partial_map,
-                    max_q_len,
-                    fast_mode=fast_mode,
-                    max_split_per_batch=num_kv_splits,
-                    intra_batch_mode=intra_batch_mode,
+            if self.use_mla:
+                num_tokens_per_bs = self.speculative_num_steps + 1
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[: bs + 1] = torch.arange(
+                    0,
+                    bs * num_tokens_per_bs + 1,
+                    step=num_tokens_per_bs,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+                max_q_len = num_tokens_per_bs
 
-                work_metadata = self.work_metadata
-                work_info_set = self.work_info_set
-                work_indptr = self.work_indptr
+                if _use_mla_ps_kernel:
 
-                reduce_indptr = self.reduce_indptr
-                reduce_final_map = self.reduce_final_map
-                reduce_partial_map = self.reduce_partial_map
+                    num_kv_splits = self.max_split_per_batch
 
-            self.forward_metadata = ForwardMetadata(
-                kv_indptr,
-                kv_indices,
-                qo_indptr,
-                kv_last_page_len,
-                max_q_len,
-                kv_indptr[-1].item(),
-                work_metadata=work_metadata,
-                work_info_set=work_info_set,
-                work_indptr=work_indptr,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                num_kv_splits=num_kv_splits,
-                # num_kv_splits_indptr=num_kv_splits_indptr,
-            )
+                    self.make_mla_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        self.work_metadata,
+                        self.work_info_set,
+                        self.work_indptr,
+                        self.reduce_indptr,
+                        self.reduce_final_map,
+                        self.reduce_partial_map,
+                        max_q_len,
+                        fast_mode=fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=intra_batch_mode,
+                    )
+
+                    work_metadata = self.work_metadata
+                    work_info_set = self.work_info_set
+                    work_indptr = self.work_indptr
+
+                    reduce_indptr = self.reduce_indptr
+                    reduce_final_map = self.reduce_final_map
+                    reduce_partial_map = self.reduce_partial_map
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    kv_indptr[-1].item(),
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                    # num_kv_splits_indptr=num_kv_splits_indptr,
+                )
+            else:
+                seq_lens_sum = seq_lens.sum().item()
+                self.indices_updater_prefill.update(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_sum,
+                    prefix_lens=None,
+                    encoder_lens=encoder_lens,
+                    spec_info=spec_info,
+                )
+                self.forward_metadata = ForwardMetadata(
+                    self.indices_updater_prefill.kv_indptr,
+                    self.indices_updater_prefill.kv_indices,
+                    None,
+                    None,
+                    self.indices_updater_prefill.max_q_len,
+                    self.indices_updater_prefill.max_kv_len,
+                )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -965,22 +1014,42 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         elif forward_mode.is_draft_extend():
-            seq_lens = seq_lens[:bs]
-            accept_lens = spec_info.accept_length[:bs]
-            qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                seq_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
+            if self.use_mla:
+                seq_lens = seq_lens[:bs]
+                accept_lens = spec_info.accept_length[:bs]
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+            else:
+                seq_lens = seq_lens[:bs]
+                seq_lens_sum = seq_lens.sum().item()
+                self.indices_updater_prefill.update(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_sum,
+                    prefix_lens=None,
+                    encoder_lens=encoder_lens,
+                    spec_info=spec_info,
+                )
+                self.forward_metadata = ForwardMetadata(
+                    self.indices_updater_prefill.kv_indptr,
+                    self.indices_updater_prefill.kv_indices,
+                    None,
+                    None,
+                    self.indices_updater_prefill.max_q_len,
+                    self.indices_updater_prefill.max_kv_len,
+                )
 
         else:
             raise ValueError("Invalid forward mode")
@@ -1291,12 +1360,22 @@ class AiterAttnBackend(AttentionBackend):
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
 
+            # For draft_extend/target_verify, use indptr from forward_metadata
+            # (set by generate_attn_arg_prefill with correct size);
+            # for normal extend, use backend buffer sliced to batch size
+            if self.forward_metadata.qo_indptr is not None:
+                qo_indptr = self.forward_metadata.qo_indptr
+                kv_indptr = self.forward_metadata.kv_indptr
+            else:
+                qo_indptr = self.qo_indptr[:bs0]
+                kv_indptr = self.forward_metadata.kv_indptr[:bs0]
+
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
+                qo_indptr,
+                kv_indptr,
                 self.forward_metadata.kv_indices,
                 self.forward_metadata.max_q_len,
                 self.forward_metadata.max_kv_len,
