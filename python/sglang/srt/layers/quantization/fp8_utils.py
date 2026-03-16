@@ -1094,17 +1094,16 @@ def apply_fp8_ptpc_linear(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
 
-    # weight is transposed (K, N)
-    output_shape = [*input.shape[:-1], weight.shape[1]]
-
-    q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
-
     per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
-    per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
 
-    if not (per_tensor_weights and per_tensor_activations):
-        # weight is in (N, K)
+    if per_tensor_weights:
+        # weight is transposed (K, N)
+        output_shape = [*input.shape[:-1], weight.shape[1]]
+    else:
+        # weight is in (N, K) shuffled layout
         output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    q_input, x_scale = scaled_fp8_quant(input_2d, use_per_token_if_dynamic=True)
 
     output = aiter.gemm_a8w8_bpreshuffle(
         q_input, weight, x_scale, weight_scale, None, input.dtype
