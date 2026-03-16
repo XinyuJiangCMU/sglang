@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=2, suite="nightly-1-gpu", nightly=True)
@@ -31,7 +32,7 @@ from sglang.test.test_utils import CustomTestCase
 DEFAULT_CONFIG = {
     "device": "cuda",
     "dtype": torch.bfloat16,
-    "kv_cache_dtype": torch.float8_e4m3fn,
+    "kv_cache_dtype": fp8_dtype,
     "context_len": 2048,
     "max_bs": 64,
     "hidden_size": 5120,
@@ -378,7 +379,7 @@ class TestNSAIndexer(CustomTestCase):
 
         def mock_quant(x, *args, **kwargs):
             # Return FP8 tensor and scale
-            return x.to(torch.float8_e4m3fn), torch.ones(
+            return x.to(fp8_dtype), torch.ones(
                 x.shape[0], dtype=torch.float32, device=x.device
             )
 
@@ -459,7 +460,7 @@ class TestNSAIndexer(CustomTestCase):
         mock_deep_gemm.get_paged_mqa_logits_metadata.return_value = MagicMock()
 
         def mock_quant(x, *args, **kwargs):
-            return x.to(torch.float8_e4m3fn), torch.ones(
+            return x.to(fp8_dtype), torch.ones(
                 x.shape[0], dtype=torch.float32, device=x.device
             )
 
