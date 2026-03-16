@@ -1431,12 +1431,14 @@ if _is_hip:
         scale: Optional[torch.Tensor] = None,
         num_token_padding: Optional[int] = None,
         use_per_token_if_dynamic: bool = False,
+        output: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
         shape = input.shape
         if num_token_padding:
             shape = (max(num_token_padding, input.shape[0]), shape[1])
-        output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
+        if output is None:
+            output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
 
         if scale is None:
             # Dynamic scaling
@@ -1475,13 +1477,15 @@ else:
         scale: Optional[torch.Tensor] = None,
         num_token_padding: Optional[int] = None,
         use_per_token_if_dynamic: bool = False,
+        output: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
         shape = input.shape
         if num_token_padding:
             shape = (max(num_token_padding, input.shape[0]), shape[1])
-        output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
+        if output is None:
+            output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
 
         if scale is None:
             # Dynamic scaling
