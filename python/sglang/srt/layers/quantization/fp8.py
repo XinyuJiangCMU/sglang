@@ -444,11 +444,26 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
 
                 # cutlass sgl-kernel and marlin only support per-channel scale
-                if self.cutlass_fp8_supported or self.use_marlin:
+                if self.cutlass_fp8_supported or self.use_marlin or _use_aiter:
                     weight = layer.weight
                     weight_scale = convert_to_channelwise(
                         layer.weight_scale, layer.logical_widths
                     )
+                    # If ROCm, normalize e4m3fn weights to e4m3fnuz
+                    if _is_fp8_fnuz:
+                        weight, weight_scale, input_scale = (
+                            normalize_e4m3fn_to_e4m3fnuz(
+                                weight=weight,
+                                weight_scale=weight_scale,
+                                input_scale=getattr(
+                                    layer, "input_scale", None
+                                ),
+                            )
+                        )
+                        if input_scale is not None:
+                            layer.input_scale = Parameter(
+                                input_scale, requires_grad=False
+                            )
                 else:
                     # Dequant -> Quant with max scale so we can run per tensor.
                     weight = layer.weight
@@ -474,7 +489,15 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
 
                 # Update layer with new values.
-                layer.weight = Parameter(weight.t(), requires_grad=False)
+                if _use_aiter and not (
+                    self.cutlass_fp8_supported or self.use_marlin
+                ):
+                    layer.weight = Parameter(
+                        shuffle_weight(weight.contiguous(), (16, 16)),
+                        requires_grad=False,
+                    )
+                else:
+                    layer.weight = Parameter(weight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 if (
                     hasattr(self.quant_config, "activation_scheme")
