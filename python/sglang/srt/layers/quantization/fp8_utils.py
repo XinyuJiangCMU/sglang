@@ -622,11 +622,7 @@ def block_quant_to_tensor_quant(
         for j in range(n_tiles):
             x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
 
-    x_q_tensor, scale = (
-        scaled_fp8_quant(x_dq_block)
-        if _is_cuda
-        else input_to_float8(x_dq_block, dtype=x_q_block.dtype)
-    )
+    x_q_tensor, scale = scaled_fp8_quant(x_dq_block)
     return x_q_tensor, scale
 
 
