@@ -1014,8 +1014,19 @@ if _is_hip:
         # Use manually unrolledx4 kernel on AMD GPU when the grid size is small.
         # Empirical testing shows the sweet spot lies when it's less than the # of
         # compute units available on the device.
-        num_workgroups = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(
-            N, META["BLOCK_SIZE_N"]
+        #
+        # The unrolled kernel processes 4 K-blocks per iteration, requiring ~4x
+        # shared memory. Guard against exceeding the hardware limit (65536 bytes
+        # on MI300X).
+        BLOCK_SIZE_M = META["BLOCK_SIZE_M"]
+        BLOCK_SIZE_N = META["BLOCK_SIZE_N"]
+        BLOCK_SIZE_K = META["BLOCK_SIZE_K"]
+        # Estimate shared memory: A tile (M*K*4) + B tile (K*4*N), each element 1 byte (fp8)
+        estimated_smem = (BLOCK_SIZE_M + BLOCK_SIZE_N) * BLOCK_SIZE_K * 4
+        if estimated_smem > 65536:
+            return False
+        num_workgroups = triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(
+            N, BLOCK_SIZE_N
         )
         return num_workgroups <= get_device_core_count()
 
