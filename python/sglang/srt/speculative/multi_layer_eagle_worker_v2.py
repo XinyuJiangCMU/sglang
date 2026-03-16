@@ -154,7 +154,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.tree_mask_mode = (
+            TreeMaskMode.QLEN_ONLY
+            if self.server_args.attention_backend == "aiter"
+            else TreeMaskMode.FULL_MASK
+        )
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 

@@ -44,6 +44,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyOutput,
 )
 from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
     build_tree_kernel_efficient,
     organize_draft_results,
 )
@@ -100,6 +101,13 @@ class EAGLEWorker(TpModelWorker):
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
+        )
+        # AITER backend ignores custom_mask for target_verify, so QLEN_ONLY
+        # reduces tree_mask allocation without requiring attention kernel changes.
+        self.tree_mask_mode = (
+            TreeMaskMode.QLEN_ONLY
+            if server_args.attention_backend == "aiter"
+            else TreeMaskMode.FULL_MASK
         )
 
         # Override the context length of the draft model to be the same as the target model.
@@ -577,6 +585,7 @@ class EAGLEWorker(TpModelWorker):
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
+            self.tree_mask_mode,
         )
 
         return EagleVerifyInput(

@@ -39,6 +39,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyOutput,
 )
 from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
     build_tree_kernel_efficient,
     organize_draft_results,
 )
@@ -90,6 +91,11 @@ class MultiLayerEagleWorker(TpModelWorker):
             server_args.speculative_algorithm
         )
         self.draft_extend_attn_backend_list = []
+        self.tree_mask_mode = (
+            TreeMaskMode.QLEN_ONLY
+            if server_args.attention_backend == "aiter"
+            else TreeMaskMode.FULL_MASK
+        )
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -434,6 +440,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
+            self.tree_mask_mode,
         )
 
         return EagleVerifyInput(
