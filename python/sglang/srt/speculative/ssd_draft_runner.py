@@ -1,5 +1,8 @@
 """SSD Draft Runner — runs on a separate GPU as an independent process.
 
+Uses a full SGLang TpModelWorker (with ModelRunner, paged attention, KV cache)
+instead of a bare HuggingFace wrapper, giving proper KV cache management.
+
 Handles three NCCL commands from the target:
   CMD_PREFILL (1):  Run draft model prefill for new sequences
   CMD_SPECULATE (0): Check tree cache → hit: return cached / miss: JIT speculate
@@ -10,15 +13,11 @@ Tree Cache:
   Keys:   [N, 3] — (seq_id, k_idx, recovery_token_id)
   Tokens: [N, K] — speculated token sequences per branch
   Logits: [N, K, V] — draft logits for each step per branch
-
-Tree Decode Pipeline (runs AFTER responding to target):
-  1. Glue Decode: run draft on [rec_token, spec_0, ..., spec_{K-1}] → K+1 logits
-  2. Fork: from K+1 logits, sample top-F per position → N=B*MQ_LEN branches
-  3. Tree Decode: run K steps on all N branches in parallel → [N, K] tokens
-  4. Populate Cache: store results keyed by (seq_id, k_idx, forked_token)
 """
 
+import copy
 import logging
+import os
 import time
 from typing import List, Optional
 
@@ -48,14 +47,12 @@ logger = logging.getLogger(__name__)
 class SSDDraftRunner:
     """Draft model runner for async SSD.
 
-    Runs in a separate process on its own GPU. Loads the draft model,
-    maintains a tree cache, and responds to NCCL commands from target.
-    After responding, builds a speculation tree for the NEXT request.
+    Runs in a separate process on its own GPU. Uses a full SGLang ModelRunner
+    with paged attention and proper KV cache management.
     """
 
     def __init__(
         self,
-        draft_model_path: str,
         device: torch.device,
         gpu_id: int,
         async_pg: dist.ProcessGroup,
@@ -95,6 +92,15 @@ class SSDDraftRunner:
         # Tree cache tensors
         self._reset_tree_cache()
 
+        # ModelRunner and memory pool references (set by set_model_runner)
+        self.model_runner = None
+        self.req_to_token_pool = None
+        self.allocator = None
+
+        # Sequence tracking: seq_id → req_pool_idx, seq_id → kv_len
+        self._seq_to_req_pool = {}
+        self._seq_lens = {}
+
         # Timing
         self._draft_step_times = []
 
@@ -102,6 +108,31 @@ class SSDDraftRunner:
             f"SSDDraftRunner initialized: K={spec_k}, fan_out={fan_out}, "
             f"mq_len={self.mq_len}, vocab={vocab_size}, jit={jit_speculate}"
         )
+
+    def set_model_runner(self, model_runner):
+        """Attach the ModelRunner from TpModelWorker."""
+        self.model_runner = model_runner
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.allocator = model_runner.token_to_kv_pool_allocator
+
+    # ------------------------------------------------------------------
+    # req_to_token_pool allocation helpers (bypass Req objects)
+    # ------------------------------------------------------------------
+
+    def _alloc_req_pool(self, n: int) -> List[int]:
+        """Allocate n req_pool_indices directly from the pool."""
+        pool = self.req_to_token_pool
+        if n > len(pool.free_slots):
+            raise RuntimeError(
+                f"No free req_pool slots: need {n}, have {len(pool.free_slots)}"
+            )
+        indices = pool.free_slots[:n]
+        pool.free_slots = pool.free_slots[n:]
+        return indices
+
+    def _free_req_pool(self, idx: int):
+        """Return a req_pool_index to the pool."""
+        self.req_to_token_pool.free_slots.append(idx)
 
     # ------------------------------------------------------------------
     # Tree cache management
@@ -116,21 +147,13 @@ class SSDDraftRunner:
         self.tree_cache_logits = None
 
     def _hit_cache(self, request_keys: torch.Tensor, B: int, K: int):
-        """Check tree cache for hits.
-
-        Args:
-            request_keys: [B, 3] — (seq_id, k_idx, recovery_token_id)
-
-        Returns:
-            out_tokens: [B, K], out_logits: [B, K, V], cache_hits: [B]
-        """
+        """Check tree cache for hits."""
         V = self.vocab_size
         out_logits = torch.zeros((B, K, V), dtype=self.dtype, device=self.device)
         out_tokens = torch.zeros((B, K), dtype=torch.int64, device=self.device)
         cache_hits = torch.zeros(B, dtype=torch.int64, device=self.device)
 
         if self.tree_cache_keys.numel() > 0:
-            # Vectorized membership: [B, T, 3] → [B, T] → [B]
             eq = request_keys.unsqueeze(1) == self.tree_cache_keys.unsqueeze(0)
             match = torch.all(eq, dim=2)
             cache_hits = match.any(dim=1).to(torch.int64)
@@ -151,60 +174,227 @@ class SSDDraftRunner:
         tokens: torch.Tensor,
         logits: torch.Tensor,
     ):
-        """Populate tree cache from tree decode results.
-
-        Each branch in the tree becomes a cache entry keyed by
-        (seq_id, fork_depth, forked_recovery_token).
-
-        Args:
-            seq_ids_expanded: [N] — sequence ID per branch
-            rec_flat: [N] — forked recovery token per branch
-            k_flat: [N] — fork depth index per branch
-            tokens: [N, K] — speculated tokens per branch
-            logits: [N, K, V] — logits per branch
-        """
+        """Populate tree cache from tree decode results."""
         keys = torch.stack([seq_ids_expanded, k_flat, rec_flat], dim=1)
         self.tree_cache_keys = keys
         self.tree_cache_tokens = tokens
         self.tree_cache_logits = logits
 
     # ------------------------------------------------------------------
-    # JIT speculation (sequential K-step, fallback for cache miss)
+    # KV cache rollback
+    # ------------------------------------------------------------------
+
+    def _rollback_kv(self, req_pool_idx: int, current_len: int, target_len: int):
+        """Free KV cache entries from target_len to current_len."""
+        if current_len <= target_len:
+            return
+        excess_locs = self.req_to_token_pool.req_to_token[
+            req_pool_idx, target_len:current_len
+        ].to(torch.int64)
+        self.allocator.free(excess_locs)
+
+    # ------------------------------------------------------------------
+    # JIT speculation via ModelRunner
     # ------------------------------------------------------------------
 
     def _jit_speculate(
         self,
-        model,
         request_keys: torch.Tensor,
         num_tokens: torch.Tensor,
         temperatures: torch.Tensor,
         draft_block_tables: torch.Tensor,
         out_tokens: torch.Tensor,
         out_logits: torch.Tensor,
+        miss_mask: torch.Tensor,
     ):
-        """Run draft model forward K times for cache-miss sequences."""
-        input_ids = request_keys[:, -1]  # recovery_token_id
-        positions = num_tokens - 1
+        """Run draft model forward K times for cache-miss sequences.
 
-        for i in range(self.K):
-            logits = model.forward_draft_step(
-                input_ids=input_ids,
-                positions=positions,
-                block_tables=draft_block_tables,
+        Uses ModelRunner with paged attention for batched forward passes.
+        """
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+            clamp_position,
+        )
+
+        miss_indices = miss_mask.nonzero(as_tuple=True)[0]
+        B_miss = len(miss_indices)
+        if B_miss == 0:
+            return
+
+        # Gather miss sequence info
+        miss_seq_ids = []
+        miss_req_pool_indices = []
+        for b_idx in miss_indices:
+            b = int(b_idx.item())
+            seq_id = int(request_keys[b, 0].item())
+            miss_seq_ids.append(seq_id)
+            req_pool_idx = self._seq_to_req_pool.get(seq_id)
+            if req_pool_idx is None:
+                logger.warning(f"Seq {seq_id} not in req_pool, skipping")
+                return
+            miss_req_pool_indices.append(req_pool_idx)
+
+        miss_req_pool_tensor = torch.tensor(
+            miss_req_pool_indices, dtype=torch.int64, device=self.device
+        )
+        miss_recovery_tokens = request_keys[miss_indices, 2]
+        miss_verified_lens = num_tokens[miss_indices].to(torch.int64)
+        miss_temps = temperatures[miss_indices]
+
+        # Rollback KV to verified_len. verified_len = number of committed
+        # tokens (excluding recovery). Recovery goes at position verified_len.
+        # Positions 0..verified_len-1 are already correct in KV cache.
+        for i, seq_id in enumerate(miss_seq_ids):
+            current_len = self._seq_lens.get(seq_id, 0)
+            verified_len = int(miss_verified_lens[i].item())
+            if current_len > verified_len:
+                self._rollback_kv(miss_req_pool_indices[i], current_len, verified_len)
+            self._seq_lens[seq_id] = verified_len
+
+        # Run recovery token as step 0 to build KV and get logits
+        recovery_tokens = miss_recovery_tokens.to(torch.int64)
+        base_seq_lens = torch.tensor(
+            [self._seq_lens[int(miss_seq_ids[i])] for i in range(B_miss)],
+            dtype=torch.int64, device=self.device,
+        )
+
+        # Allocate KV slots for recovery token
+        recovery_cache_locs = self.allocator.alloc(B_miss)
+        if recovery_cache_locs is None:
+            logger.warning("KV cache full during recovery step, skipping speculation")
+            return
+
+        for i in range(B_miss):
+            pos = int(base_seq_lens[i].item())
+            self.req_to_token_pool.req_to_token[
+                miss_req_pool_indices[i], pos
+            ] = recovery_cache_locs[i].to(torch.int32)
+
+        recovery_seq_lens = base_seq_lens + 1
+        seq_lens_cpu = recovery_seq_lens.to(torch.int32).cpu()
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=B_miss,
+            input_ids=recovery_tokens.to(torch.int32),
+            req_pool_indices=miss_req_pool_tensor,
+            seq_lens=recovery_seq_lens.to(torch.int32),
+            seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=recovery_cache_locs,
+            seq_lens_sum=int(recovery_seq_lens.sum().item()),
+            positions=clamp_position(recovery_seq_lens),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            attn_backend=self.model_runner.attn_backend,
+        )
+        recovery_output = self.model_runner.forward(forward_batch)
+        recovery_logits = recovery_output.logits_output.next_token_logits
+
+        # Always use greedy (argmax) in draft to maximize accept rate.
+        # SGLang converts temperature=0 to temperature=1.0 + top_k=1,
+        # so we cannot rely on temperature to detect greedy mode.
+        first_spec = recovery_logits.argmax(dim=-1)
+
+        # Update seq_lens and store step 0 results
+        for i, seq_id in enumerate(miss_seq_ids):
+            self._seq_lens[seq_id] = int(recovery_seq_lens[i].item())
+        for i, b_idx in enumerate(miss_indices):
+            b = int(b_idx.item())
+            out_logits[b, 0, :] = recovery_logits[i]
+            out_tokens[b, 0] = first_spec[i]
+
+        # Run remaining K-1 decode steps
+        current_tokens = first_spec
+        current_seq_lens = recovery_seq_lens.clone()
+
+        for step in range(1, self.K):
+            # Allocate new KV cache locations
+            new_cache_locs = self.allocator.alloc(B_miss)
+            if new_cache_locs is None:
+                logger.warning(f"KV cache full at step {step}, stopping speculation")
+                break
+
+            # Write cache locations to req_to_token_pool
+            for i in range(B_miss):
+                pos = int(current_seq_lens[i].item())
+                self.req_to_token_pool.req_to_token[
+                    miss_req_pool_indices[i], pos
+                ] = new_cache_locs[i].to(torch.int32)
+
+            # Advance seq_lens (new token being added)
+            current_seq_lens += 1
+
+            # Build ForwardBatch for DECODE
+            seq_lens_cpu = current_seq_lens.to(torch.int32).cpu()
+            forward_batch = ForwardBatch(
+                forward_mode=ForwardMode.DECODE,
+                batch_size=B_miss,
+                input_ids=current_tokens.to(torch.int32),
+                req_pool_indices=miss_req_pool_tensor,
+                seq_lens=current_seq_lens.to(torch.int32),
+                seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=new_cache_locs,
+                seq_lens_sum=int(current_seq_lens.sum().item()),
+                positions=clamp_position(current_seq_lens),
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                token_to_kv_pool=self.model_runner.token_to_kv_pool,
+                attn_backend=self.model_runner.attn_backend,
             )
-            out_logits[:, i, :] = logits
 
-            if (temperatures == 0).all():
-                next_tokens = logits.argmax(dim=-1)
-            else:
-                probs = torch.softmax(
-                    logits / temperatures.unsqueeze(-1).clamp(min=1e-6), dim=-1
-                )
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            # Run forward (init attention backend each step since seq_lens change)
+            output = self.model_runner.forward(forward_batch)
+            logits = output.logits_output.next_token_logits  # [B_miss, V]
 
-            out_tokens[:, i] = next_tokens
-            input_ids = next_tokens
-            positions = positions + 1
+            # Store logits
+            for i, b_idx in enumerate(miss_indices):
+                b = int(b_idx.item())
+                out_logits[b, step, :] = logits[i]
+
+            # Always greedy in draft to maximize accept rate
+            next_tokens = logits.argmax(dim=-1)
+
+            # Store tokens
+            for i, b_idx in enumerate(miss_indices):
+                b = int(b_idx.item())
+                out_tokens[b, step] = next_tokens[i]
+
+            current_tokens = next_tokens
+
+        # Process the last predicted token to create its KV entry.
+        # Without this, when the target accepts all K tokens, there's a gap:
+        # draft has KV for K positions but the last predicted token has no KV.
+        tail_cache_locs = self.allocator.alloc(B_miss)
+        if tail_cache_locs is not None:
+            for i in range(B_miss):
+                pos = int(current_seq_lens[i].item())
+                self.req_to_token_pool.req_to_token[
+                    miss_req_pool_indices[i], pos
+                ] = tail_cache_locs[i].to(torch.int32)
+            current_seq_lens += 1
+            sl_cpu = current_seq_lens.to(torch.int32).cpu()
+            fb = ForwardBatch(
+                forward_mode=ForwardMode.DECODE,
+                batch_size=B_miss,
+                input_ids=current_tokens.to(torch.int32),
+                req_pool_indices=miss_req_pool_tensor,
+                seq_lens=current_seq_lens.to(torch.int32),
+                seq_lens_cpu=sl_cpu,
+                out_cache_loc=tail_cache_locs,
+                seq_lens_sum=int(current_seq_lens.sum().item()),
+                positions=clamp_position(current_seq_lens),
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                token_to_kv_pool=self.model_runner.token_to_kv_pool,
+                attn_backend=self.model_runner.attn_backend,
+            )
+            self.model_runner.forward(fb)
+
+        # Update tracked seq_lens
+        for i, seq_id in enumerate(miss_seq_ids):
+            self._seq_lens[seq_id] = int(current_seq_lens[i].item())
 
     # ------------------------------------------------------------------
     # Tree decode pipeline (glue → fork → tree decode → populate)
@@ -219,56 +409,26 @@ class SSDDraftRunner:
         num_tokens: torch.Tensor,
         temperatures: torch.Tensor,
         draft_block_tables: torch.Tensor,
-        model=None,
     ):
-        """Build the tree batch: glue decode → fork → prepare tree decode args.
+        """Build the tree batch for pre-computing the next speculation tree.
 
-        After the immediate response to target, this runs asynchronously
-        to pre-compute the speculation tree for the NEXT request.
-
-        Args:
-            out_tokens: [B, K] — tokens returned to target
-            out_logits: [B, K, V] — logits returned to target
-            cache_hits: [B] — cache hit status
-            cache_keys: [B, 3] — request keys
-            num_tokens: [B] — sequence lengths
-            temperatures: [B] — sampling temperatures
-            draft_block_tables: [B, max_blocks] — block tables
-            model: draft model (None = skip glue decode, use returned logits)
-
-        Returns:
-            tree_decode_args dict or None if no model available
+        Currently uses approximate logits (no model forward) since
+        tree decode via ModelRunner is deferred to a future phase.
         """
         B = cache_keys.shape[0]
         K = self.K
-        rec_tokens = cache_keys[:, 2]  # recovery token IDs
+        rec_tokens = cache_keys[:, 2]
         seq_ids = cache_keys[:, 0]
 
-        # ---- Step 1: Glue Decode ----
-        # Combine recovery + spec tokens and run draft model forward
-        # to get K+1 logits for forking
-        if model is not None:
-            glue_input_ids = make_glue_decode_input_ids(out_tokens, rec_tokens)
-            # [B*(K+1)] → run draft model → [B, K+1, V] logits
-            glue_logits = model.forward_glue_decode(
-                input_ids=glue_input_ids,
-                num_tokens=num_tokens,
-                block_tables=draft_block_tables,
-                K=K,
-            )  # [B, K+1, V]
-        else:
-            # No model: use returned logits as approximate glue logits
-            # Pad with zeros for the recovery position
-            rec_logits = torch.zeros(
-                (B, 1, self.vocab_size), dtype=self.dtype, device=self.device
-            )
-            glue_logits = torch.cat([rec_logits, out_logits], dim=1)  # [B, K+1, V]
+        # Use returned logits as approximate glue logits (no model forward)
+        rec_logits = torch.zeros(
+            (B, 1, self.vocab_size), dtype=self.dtype, device=self.device
+        )
+        glue_logits = torch.cat([rec_logits, out_logits], dim=1)
 
-        # ---- Step 2: Fork ----
-        # Build returned_tokens = [rec, spec_0, ..., spec_{K-1}]
         returned_tokens = torch.cat(
             [rec_tokens.unsqueeze(1), out_tokens], dim=1
-        )  # [B, K+1]
+        )
 
         forked_tokens = get_forked_recovery_tokens(
             logits=glue_logits,
@@ -276,36 +436,31 @@ class SSDDraftRunner:
             returned_tokens=returned_tokens,
             fan_out_list=self.fan_out_list,
             fan_out_list_miss=self.fan_out_list_miss,
-        )  # [B, MQ_LEN]
+        )
 
-        # ---- Step 3: Prepare tree decode args ----
         MQ_LEN = self.mq_len
         N = B * MQ_LEN
 
-        # Expand sequence info to per-branch
         b_flat = (
             torch.arange(B, device=self.device)
             .unsqueeze(1)
             .expand(B, MQ_LEN)
             .flatten()
-        )  # [N]
-        seq_ids_expanded = seq_ids[b_flat]  # [N]
-        temperatures_expanded = temperatures[b_flat]  # [N]
+        )
+        seq_ids_expanded = seq_ids[b_flat]
+        temperatures_expanded = temperatures[b_flat]
 
-        # Initial positions for tree decode: after glue decode output
-        initial_positions = num_tokens[b_flat] + K  # [N]
-        fkp1_flat = torch.arange(MQ_LEN, device=self.device).repeat(B)  # [N]
+        initial_positions = num_tokens[b_flat] + K
+        fkp1_flat = torch.arange(MQ_LEN, device=self.device).repeat(B)
         initial_positions = initial_positions + fkp1_flat
 
-        # Build k_flat (fork depth index per branch) for cache population
         k_flat = torch.cat(
             [
                 self._fan_idx_hit if cache_hits[b] else self._fan_idx_miss
                 for b in range(B)
             ]
-        )  # [N]
+        )
 
-        # Precompute positions and slot maps for all K steps
         step_positions, step_context_lens, step_slot_maps = (
             compute_step_positions_and_slot_maps(
                 initial_positions=initial_positions,
@@ -324,31 +479,22 @@ class SSDDraftRunner:
             "K": K,
             "N": N,
             "MQ_LEN": MQ_LEN,
-            "input_ids": forked_tokens.flatten(),  # [N]
-            "seq_ids_expanded": seq_ids_expanded,  # [N]
-            "rec_flat": forked_tokens.flatten(),  # [N] — the forked recovery tokens
-            "k_flat": k_flat,  # [N]
-            "temperatures": temperatures_expanded,  # [N]
-            "block_tables": draft_block_tables,  # [B, M]
-            "step_positions": step_positions,  # [K, N]
-            "step_context_lens": step_context_lens,  # [K, N]
-            "step_slot_maps": step_slot_maps,  # [K, N]
-            "cache_hits": cache_hits,  # [B]
+            "input_ids": forked_tokens.flatten(),
+            "seq_ids_expanded": seq_ids_expanded,
+            "rec_flat": forked_tokens.flatten(),
+            "k_flat": k_flat,
+            "temperatures": temperatures_expanded,
+            "block_tables": draft_block_tables,
+            "step_positions": step_positions,
+            "step_context_lens": step_context_lens,
+            "step_slot_maps": step_slot_maps,
+            "cache_hits": cache_hits,
         }
 
-    def _decode_tree(self, args: dict, model=None):
-        """Decode all N branches for K steps.
+    def _decode_tree(self, args: dict):
+        """Decode all N branches for K steps using random logits.
 
-        All N branches are processed in a single batched forward pass
-        per depth, maximizing GPU utilization.
-
-        Args:
-            args: tree decode args from _build_tree_batch()
-            model: draft model for forward passes
-
-        Returns:
-            spec_tokens: [N, K] — generated tokens per branch
-            spec_logits: [N, K, V] — logits per branch
+        Tree decode via ModelRunner is deferred to a future phase.
         """
         B, K, N = args["B"], args["K"], args["N"]
         V = self.vocab_size
@@ -356,33 +502,17 @@ class SSDDraftRunner:
         spec_tokens = torch.zeros((N, K), dtype=torch.int64, device=self.device)
         spec_logits = torch.zeros((N, K, V), dtype=self.dtype, device=self.device)
 
-        current_input_ids = args["input_ids"]  # [N]
-        temperatures = args["temperatures"]  # [N]
+        current_input_ids = args["input_ids"]
+        temperatures = args["temperatures"]
         all_greedy = bool((temperatures == 0).all())
 
         for depth in range(K):
-            if model is not None:
-                # Run all N branches in one forward pass
-                logits = model.forward_tree_step(
-                    input_ids=current_input_ids,
-                    positions=args["step_positions"][depth],
-                    slot_maps=args["step_slot_maps"][depth],
-                    context_lens=args["step_context_lens"][depth],
-                    block_tables=args["block_tables"],
-                    b_flat=torch.arange(B, device=self.device)
-                    .unsqueeze(1)
-                    .expand(B, args["MQ_LEN"])
-                    .flatten(),
-                )  # [N, V]
-            else:
-                # No model: generate random logits (for testing pipeline)
-                logits = torch.randn(
-                    (N, V), dtype=self.dtype, device=self.device
-                )
+            logits = torch.randn(
+                (N, V), dtype=self.dtype, device=self.device
+            )
 
             spec_logits[:, depth, :] = logits
 
-            # Sample next tokens
             if all_greedy:
                 next_tokens = logits.argmax(dim=-1)
             else:
@@ -402,13 +532,21 @@ class SSDDraftRunner:
     # ------------------------------------------------------------------
 
     def _handle_prefill(self):
-        """Handle CMD_PREFILL: receive prefill data from target."""
+        """Handle CMD_PREFILL: receive data and run draft model prefill."""
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+            compute_position,
+        )
+
         meta = recv_meta(
             self.async_pg, src=self.target_rank, n=3, device=self.device
         )
         total_new_tokens, batch_size, max_blocks = meta
 
-        fused_total = total_new_tokens + batch_size + batch_size * max_blocks
+        # Fused payload: input_ids + num_tokens + seq_ids + block_tables
+        fused_total = total_new_tokens + batch_size + batch_size + batch_size * max_blocks
         fused = recv_int64(
             self.async_pg,
             src=self.target_rank,
@@ -421,6 +559,8 @@ class SSDDraftRunner:
         off += total_new_tokens
         num_tokens = fused[off : off + batch_size]
         off += batch_size
+        seq_ids = fused[off : off + batch_size]
+        off += batch_size
         draft_block_tables = (
             fused[off : off + batch_size * max_blocks]
             .view(batch_size, max_blocks)
@@ -428,17 +568,98 @@ class SSDDraftRunner:
         )
 
         logger.debug(f"Draft prefill: B={batch_size}, tokens={total_new_tokens}")
-        # TODO: Run draft model prefill with these inputs
 
-    def _handle_speculate(self, model=None):
-        """Handle CMD_SPECULATE: check cache → respond → build tree for next.
+        if self.model_runner is None:
+            logger.warning("No model_runner, skipping prefill forward")
+            return
 
-        Flow:
-          1. Receive request from target
-          2. Check tree cache for hits (+ JIT for misses)
-          3. Send response immediately (low latency path)
-          4. Build speculation tree for NEXT request (async, overlaps with target verify)
-        """
+        # Allocate req_pool_indices for new sequences
+        req_pool_indices = self._alloc_req_pool(batch_size)
+
+        # Allocate KV cache locations for all tokens
+        all_cache_locs = self.allocator.alloc(total_new_tokens)
+        if all_cache_locs is None:
+            logger.error("KV cache full during prefill, cannot allocate")
+            # Return the req_pool_indices
+            for idx in req_pool_indices:
+                self._free_req_pool(idx)
+            return
+
+        # Set up req_to_token_pool mapping and track sequences
+        token_offset = 0
+        cache_offset = 0
+        seq_lens_list = []
+        for i in range(batch_size):
+            seq_id = int(seq_ids[i].item())
+            seq_len = int(num_tokens[i].item())
+            req_pool_idx = req_pool_indices[i]
+
+            # Write cache locations for this sequence
+            self.req_to_token_pool.req_to_token[
+                req_pool_idx, :seq_len
+            ] = all_cache_locs[cache_offset : cache_offset + seq_len].to(torch.int32)
+
+            # Track sequence
+            self._seq_to_req_pool[seq_id] = req_pool_idx
+            self._seq_lens[seq_id] = seq_len
+
+            seq_lens_list.append(seq_len)
+            token_offset += seq_len
+            cache_offset += seq_len
+
+        # Build ForwardBatch for EXTEND (prefill)
+        req_pool_indices_tensor = torch.tensor(
+            req_pool_indices, dtype=torch.int64, device=self.device
+        )
+        seq_lens_tensor = torch.tensor(
+            seq_lens_list, dtype=torch.int32, device=self.device
+        )
+        extend_seq_lens = seq_lens_tensor.clone()
+        extend_prefix_lens = torch.zeros(
+            batch_size, dtype=torch.int32, device=self.device
+        )
+
+        positions, extend_start_loc = compute_position(
+            self.model_runner.server_args.attention_backend,
+            extend_prefix_lens,
+            extend_seq_lens,
+            total_new_tokens,
+        )
+
+        seq_lens_cpu = torch.tensor(seq_lens_list, dtype=torch.int32)
+
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=batch_size,
+            input_ids=input_ids.to(torch.int32),
+            req_pool_indices=req_pool_indices_tensor,
+            seq_lens=seq_lens_tensor,
+            seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=all_cache_locs,
+            seq_lens_sum=total_new_tokens,
+            positions=positions,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_num_tokens=total_new_tokens,
+            extend_start_loc=extend_start_loc,
+            extend_seq_lens_cpu=seq_lens_list,
+            extend_prefix_lens_cpu=[0] * batch_size,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            attn_backend=self.model_runner.attn_backend,
+        )
+
+        # Run prefill forward
+        self.model_runner.forward(forward_batch)
+
+        logger.debug(
+            f"Draft prefill done: {batch_size} seqs, "
+            f"tracked seqs: {len(self._seq_to_req_pool)}"
+        )
+
+    def _handle_speculate(self):
+        """Handle CMD_SPECULATE: check cache → respond → build tree for next."""
         # ---- Receive request ----
         meta = recv_meta(
             self.async_pg, src=self.target_rank, n=3, device=self.device
@@ -469,16 +690,19 @@ class SSDDraftRunner:
         assert off == fused_total
         temperatures = int64_to_temps(temps_as_int64)
 
-        # ---- Step 1: Check cache + JIT ----
-        out_tokens, out_logits, cache_hits = self._hit_cache(cache_keys, B, K)
+        # ---- Step 1: JIT speculate (always, tree cache disabled with ModelRunner) ----
+        V = self.vocab_size
+        out_logits = torch.zeros((B, K, V), dtype=self.dtype, device=self.device)
+        out_tokens = torch.zeros((B, K), dtype=torch.int64, device=self.device)
+        cache_hits = torch.zeros(B, dtype=torch.int64, device=self.device)
 
-        if model is not None and self.jit_speculate:
-            miss_mask = cache_hits == 0
-            if miss_mask.any():
-                self._jit_speculate(
-                    model, cache_keys, num_tokens, temperatures,
-                    draft_block_tables, out_tokens, out_logits,
-                )
+        if self.model_runner is not None and self.jit_speculate:
+            miss_mask = torch.ones(B, dtype=torch.bool, device=self.device)
+            self._jit_speculate(
+                cache_keys, num_tokens, temperatures,
+                draft_block_tables, out_tokens, out_logits,
+                miss_mask=miss_mask,
+            )
 
         # ---- Step 2: Send response IMMEDIATELY ----
         fused_response = torch.cat(
@@ -501,14 +725,11 @@ class SSDDraftRunner:
             num_tokens=num_tokens,
             temperatures=temperatures,
             draft_block_tables=draft_block_tables,
-            model=model,
         )
 
         if tree_args is not None:
-            # ---- Step 4: Tree decode ----
-            spec_tokens, spec_logits = self._decode_tree(tree_args, model)
+            spec_tokens, spec_logits = self._decode_tree(tree_args)
 
-            # ---- Step 5: Populate cache ----
             self._populate_tree_cache_from_tree(
                 seq_ids_expanded=tree_args["seq_ids_expanded"],
                 rec_flat=tree_args["rec_flat"],
@@ -525,12 +746,8 @@ class SSDDraftRunner:
     # Main loop
     # ------------------------------------------------------------------
 
-    def draft_loop(self, model=None):
-        """Main async draft loop. Blocks until CMD_EXIT.
-
-        Args:
-            model: draft model runner for JIT/glue/tree decode. None = cache-only.
-        """
+    def draft_loop(self):
+        """Main async draft loop. Blocks until CMD_EXIT."""
         logger.info("Draft loop started, waiting for commands...")
 
         while True:
@@ -543,7 +760,7 @@ class SSDDraftRunner:
 
             elif cmd == CMD_SPECULATE:
                 t0 = time.perf_counter()
-                self._handle_speculate(model)
+                self._handle_speculate()
                 self._draft_step_times.append(time.perf_counter() - t0)
 
             elif cmd == CMD_EXIT:
@@ -561,129 +778,11 @@ class SSDDraftRunner:
                 raise RuntimeError(f"draft_loop: unknown command {cmd}")
 
 
-class HFDraftModel:
-    """Lightweight HuggingFace-based draft model wrapper.
-
-    Provides simple forward interfaces for the SSDDraftRunner without
-    requiring full SGLang ModelRunner infrastructure. Uses HuggingFace's
-    built-in KV cache for simplicity.
-
-    This is a minimal implementation for getting the async pipeline working.
-    For production, consider using SGLang's ModelRunner with paged attention.
-    """
-
-    def __init__(self, model_path: str, device: torch.device, dtype: torch.dtype):
-        from transformers import AutoModelForCausalLM
-
-        logger.info(f"Loading draft model from {model_path} on {device}")
-        self.device = device
-        self.dtype = dtype
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            device_map={"": device},
-            attn_implementation="flash_attention_2",
-        )
-        self.model.eval()
-        # Per-sequence KV cache: {seq_idx: past_key_values}
-        self._kv_caches = {}
-        logger.info(f"Draft model loaded: {type(self.model).__name__}")
-
-    def clear_kv_cache(self):
-        """Clear all KV caches."""
-        self._kv_caches.clear()
-
-    def forward_draft_step(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        block_tables: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run one decode step on the draft model.
-
-        Args:
-            input_ids: [B] token IDs
-            positions: [B] position indices (unused, implicit in KV cache)
-            block_tables: [B, M] block tables (unused with HF cache)
-
-        Returns:
-            logits: [B, V]
-        """
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids.unsqueeze(1) if input_ids.dim() == 1 else input_ids,
-                use_cache=False,  # Simplified: no KV cache tracking
-            )
-            # Last token logits
-            return outputs.logits[:, -1, :]
-
-    def forward_glue_decode(
-        self,
-        input_ids: torch.Tensor,
-        num_tokens: torch.Tensor,
-        block_tables: torch.Tensor,
-        K: int,
-    ) -> torch.Tensor:
-        """Run glue decode: process K+1 tokens per sequence.
-
-        Args:
-            input_ids: [B*(K+1)] flattened input IDs
-            num_tokens: [B] sequence lengths
-            block_tables: [B, M] block tables
-            K: speculation depth
-
-        Returns:
-            logits: [B, K+1, V]
-        """
-        B = num_tokens.shape[0]
-        Kp1 = K + 1
-        # Reshape to [B, K+1]
-        tokens_2d = input_ids.view(B, Kp1)
-
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=tokens_2d,
-                use_cache=False,
-            )
-            return outputs.logits  # [B, K+1, V]
-
-    def forward_tree_step(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        slot_maps: torch.Tensor,
-        context_lens: torch.Tensor,
-        block_tables: torch.Tensor,
-        b_flat: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run one tree decode step on all N branches.
-
-        Args:
-            input_ids: [N] token IDs
-            positions: [N] position indices
-            slot_maps: [N] KV slot mappings (unused with HF)
-            context_lens: [N] context lengths (unused with HF)
-            block_tables: [B, M] block tables (unused with HF)
-            b_flat: [N] batch index per branch
-
-        Returns:
-            logits: [N, V]
-        """
-        N = input_ids.shape[0]
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids.unsqueeze(1),
-                use_cache=False,
-            )
-            return outputs.logits[:, -1, :]
-
-
 def run_draft_process(
-    draft_model_path: str,
+    server_args,
     gpu_id: int,
     nccl_init_method: str,
-    world_size: int,
-    rank: int,
+    nccl_port_dist: int,
     spec_k: int,
     fan_out: int,
     fan_out_list: list,
@@ -696,29 +795,82 @@ def run_draft_process(
 ):
     """Entry point for the draft process (mp.Process target).
 
-    Sets up NCCL, loads the draft model, and enters draft_loop().
+    Creates a full TpModelWorker with ModelRunner on the draft GPU,
+    sets up async NCCL, and enters draft_loop().
     """
+    from sglang.srt.distributed import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from sglang.srt.managers.tp_worker import TpModelWorker
+
     torch.cuda.set_device(gpu_id)
     device = torch.device(f"cuda:{gpu_id}")
+    dtype = getattr(torch, dtype_str)
 
-    # Initialize NCCL process group for async communication.
-    # Use TCPStore + ProcessGroupNCCL directly (matches target side).
+    # --- 1. Initialize NCCL process group for async communication ---
     nccl_host, nccl_port_str = nccl_init_method.replace("tcp://", "").split(":")
     store = dist.TCPStore(
         host_name=nccl_host,
         port=int(nccl_port_str),
-        world_size=world_size,
-        is_master=False,  # draft is rank 1 = worker
+        world_size=2,
+        is_master=False,
         wait_for_workers=False,
     )
-    async_pg = dist.ProcessGroupNCCL(
-        store, rank, world_size
-    )
+    async_pg = dist.ProcessGroupNCCL(store, 1, 2)
 
-    dtype = getattr(torch, dtype_str)
+    # --- 2. Set up server_args for draft-as-standalone model ---
+    # Deep copy to avoid mutating the original
+    draft_server_args = copy.deepcopy(server_args)
+    # Swap model_path to draft model so TpModelWorker loads the draft model
+    draft_server_args.model_path = draft_server_args.speculative_draft_model_path
+    # Clear speculative config so it doesn't try to act as a spec worker
+    draft_server_args.speculative_algorithm = None
+    draft_server_args.speculative_draft_model_path = None
+    # Single GPU, no TP
+    draft_server_args.tp_size = 1
+    draft_server_args.dp_size = 1
+    draft_server_args.pp_size = 1
+    draft_server_args.ep_size = 1
+    # Disable cuda graph for now (simpler init)
+    draft_server_args.disable_cuda_graph = True
+    # Skip tokenizer (not needed for draft)
+    draft_server_args.skip_tokenizer_init = True
+    # Use the separate port for distributed init
+    draft_server_args.dist_init_addr = None  # will use nccl_port
+    # Disable features that may conflict
+    draft_server_args.enable_dp_attention = False
+    draft_server_args.disable_overlap_schedule = True
 
+    # --- 3. Initialize distributed environment for the draft process ---
+    # TpModelWorker with is_draft_worker=False will call init_distributed_environment
+    # inside init_torch_distributed. We provide a dedicated nccl_port for this.
+    logger.info(f"Creating TpModelWorker on GPU {gpu_id}, dist port {nccl_port_dist}")
+    try:
+        tp_worker = TpModelWorker(
+            server_args=draft_server_args,
+            gpu_id=gpu_id,
+            tp_rank=0,
+            pp_rank=0,
+            dp_rank=None,
+            moe_ep_rank=0,
+            attn_cp_rank=0,
+            moe_dp_rank=0,
+            nccl_port=nccl_port_dist,
+            is_draft_worker=False,  # standalone model, creates own pools
+        )
+        model_runner = tp_worker.model_runner
+        logger.info(
+            f"TpModelWorker created: "
+            f"max_tokens={model_runner.max_total_num_tokens}, "
+            f"max_reqs={model_runner.max_running_requests}"
+        )
+    except Exception as e:
+        logger.error(f"Failed to create TpModelWorker: {e}", exc_info=True)
+        return
+
+    # --- 4. Create SSDDraftRunner ---
     runner = SSDDraftRunner(
-        draft_model_path=draft_model_path,
         device=device,
         gpu_id=gpu_id,
         async_pg=async_pg,
@@ -733,21 +885,7 @@ def run_draft_process(
         block_size=block_size,
         jit_speculate=jit_speculate,
     )
+    runner.set_model_runner(model_runner)
 
-    # Load draft model
-    model = None
-    try:
-        model = HFDraftModel(
-            model_path=draft_model_path,
-            device=device,
-            dtype=dtype,
-        )
-    except Exception as e:
-        logger.warning(
-            f"Failed to load draft model: {e}. "
-            "Running in cache-only mode (tree decode uses random logits)."
-        )
-
-    runner.draft_loop(model=model)
-
-    # No dist.destroy_process_group() — we used ProcessGroupNCCL directly
+    # --- 5. Enter draft loop ---
+    runner.draft_loop()

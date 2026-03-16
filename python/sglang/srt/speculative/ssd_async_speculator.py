@@ -85,6 +85,7 @@ class SSDAsyncSpeculator:
         input_ids_list: List[torch.Tensor],
         num_tokens_list: List[int],
         block_tables_list: List[torch.Tensor],
+        seq_ids_list: Optional[List[int]] = None,
     ):
         """Send prefill command to draft process.
 
@@ -92,6 +93,7 @@ class SSDAsyncSpeculator:
             input_ids_list: list of [seq_len] token ID tensors per sequence
             num_tokens_list: list of sequence lengths
             block_tables_list: list of block table tensors per sequence
+            seq_ids_list: list of sequence IDs (req_pool_indices)
         """
         B = len(input_ids_list)
         total_new_tokens = sum(t.shape[0] for t in input_ids_list)
@@ -101,6 +103,14 @@ class SSDAsyncSpeculator:
         num_tokens = torch.tensor(
             num_tokens_list, dtype=torch.int64, device=self.device
         )
+
+        # Seq IDs for KV cache tracking
+        if seq_ids_list is not None:
+            seq_ids = torch.tensor(
+                seq_ids_list, dtype=torch.int64, device=self.device
+            )
+        else:
+            seq_ids = torch.arange(B, dtype=torch.int64, device=self.device)
 
         # Pad block tables to max_blocks
         max_blocks = self.max_blocks
@@ -112,7 +122,7 @@ class SSDAsyncSpeculator:
             if bt_len > 0:
                 draft_block_table[i, :bt_len] = bt[:bt_len].to(torch.int64)
 
-        # Send: cmd → meta → fused payload
+        # Send: cmd → meta → fused payload (now includes seq_ids)
         send_cmd(self.async_pg, self.draft_rank, CMD_PREFILL, self.device)
         send_meta(
             self.async_pg,
@@ -127,6 +137,7 @@ class SSDAsyncSpeculator:
             self.draft_rank,
             input_ids,
             num_tokens,
+            seq_ids,
             draft_block_table,
         )
 

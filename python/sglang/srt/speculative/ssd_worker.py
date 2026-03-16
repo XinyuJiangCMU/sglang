@@ -215,6 +215,7 @@ class SSDWorker(EAGLEWorker):
 
         The draft model runs as a separate process on its own GPU.
         Target communicates via NCCL send/recv through SSDAsyncSpeculator.
+        Only tp_rank=0 spawns the draft process and communicates with it.
         """
         from sglang.srt.speculative.ssd_async_speculator import SSDAsyncSpeculator
         from sglang.srt.speculative.ssd_draft_runner import run_draft_process
@@ -224,12 +225,33 @@ class SSDWorker(EAGLEWorker):
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.gpu_id = gpu_id
+        self.tp_rank = tp_rank
         self.device = server_args.device
         self.target_worker = target_worker
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        # Only tp_rank 0 spawns draft process and manages async speculation.
+        # Other TP ranks only participate in the target verify forward.
+        if tp_rank != 0:
+            self.async_speculator = None
+            self.draft_process = None
+
+            # Still need model_runner/model_config proxied through target
+            self._model_runner = target_worker.model_runner
+            self.model_config = target_worker.model_config
+            self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+                target_worker.get_memory_pool()
+            )
+            self.num_new_pages_per_topk = torch.empty(
+                (), dtype=torch.int64, device=self.device
+            )
+            self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+            logger.info(f"SSD async: tp_rank={tp_rank}, skipping draft spawn (non-master)")
+            return
 
         # Determine draft GPU (last visible GPU)
         visible_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -239,8 +261,12 @@ class SSDWorker(EAGLEWorker):
         else:
             self.draft_gpu_id = server_args.tp_size  # GPU after TP group
 
-        # NCCL init for async process group
-        nccl_port_async = nccl_port + 100  # offset to avoid conflict
+        # NCCL init for async process group — find a free port
+        import socket
+        _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _sock.bind(("127.0.0.1", 0))
+        nccl_port_async = _sock.getsockname()[1]
+        _sock.close()
         nccl_init_method = f"tcp://127.0.0.1:{nccl_port_async}"
         world_size = 2  # target (rank 0) + draft (rank 1)
         draft_rank = 1
@@ -256,19 +282,24 @@ class SSDWorker(EAGLEWorker):
         block_size = server_args.page_size
         max_blocks = (context_len + block_size - 1) // block_size
 
-        # Spawn draft process
+        # Dedicated port for the draft process's own distributed init (tp=1)
+        _sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _sock2.bind(("127.0.0.1", 0))
+        nccl_port_dist = _sock2.getsockname()[1]
+        _sock2.close()
+
+        # Spawn draft process with full TpModelWorker
         logger.info(
             f"Spawning async draft process on GPU {self.draft_gpu_id}, "
-            f"NCCL port {nccl_port_async}"
+            f"async NCCL port {nccl_port_async}, dist port {nccl_port_dist}"
         )
         self.draft_process = mp.Process(
             target=run_draft_process,
             kwargs=dict(
-                draft_model_path=draft_model_path,
+                server_args=server_args,
                 gpu_id=self.draft_gpu_id,
                 nccl_init_method=nccl_init_method,
-                world_size=world_size,
-                rank=draft_rank,
+                nccl_port_dist=nccl_port_dist,
                 spec_k=self.spec_k,
                 fan_out=self.ssd_fan_out,
                 fan_out_list=self.fan_out_list,
@@ -277,7 +308,6 @@ class SSDWorker(EAGLEWorker):
                 dtype_str=dtype_str,
                 max_blocks=max_blocks,
                 block_size=block_size,
-                jit_speculate=True,
             ),
             daemon=True,
         )
@@ -403,10 +433,16 @@ class SSDWorker(EAGLEWorker):
             bt = batch.req_to_token_pool.req_to_token[req_pool_idx]
             block_tables_list.append(bt)
 
+        # Pass req_pool_indices as seq_ids so draft can key KV caches correctly
+        seq_ids_list = [
+            int(batch.req_pool_indices[i].item()) for i in range(len(batch.reqs))
+        ]
+
         self.async_speculator.prefill(
             input_ids_list=input_ids_list,
             num_tokens_list=num_tokens_list,
             block_tables_list=block_tables_list,
+            seq_ids_list=seq_ids_list,
         )
 
     # ------------------------------------------------------------------
@@ -430,34 +466,46 @@ class SSDWorker(EAGLEWorker):
         if verified_id.shape[0] != B:
             verified_id = verified_id[:B]
 
-        # Extract info for speculate call
-        seq_ids = batch.req_pool_indices.to(torch.int64)
-        recovery_token_ids = verified_id.to(torch.int64)
-        num_tokens = batch.seq_lens.to(torch.int64)
-        temperatures = batch.sampling_info.temperatures.squeeze(-1)
+        tp_size = self.server_args.tp_size
+        if self.async_speculator is not None:
+            # tp_rank=0: speculate via NCCL with draft process
+            seq_ids = batch.req_pool_indices.to(torch.int64)
+            recovery_token_ids = verified_id.to(torch.int64)
+            num_tokens = batch.seq_lens.to(torch.int64)
+            temperatures = batch.sampling_info.temperatures.squeeze(-1)
 
-        # Get last accepted lengths for cache key depth
-        last_accepted_lens = self._get_last_accepted_lens(batch)
-        if last_accepted_lens.shape[0] != B:
-            last_accepted_lens = last_accepted_lens[:B]
+            last_accepted_lens = self._get_last_accepted_lens(batch)
+            if last_accepted_lens.shape[0] != B:
+                last_accepted_lens = last_accepted_lens[:B]
 
-        # Get block tables
-        block_tables = batch.req_to_token_pool.req_to_token[batch.req_pool_indices]
+            block_tables = batch.req_to_token_pool.req_to_token[batch.req_pool_indices]
 
-        # Call async speculator
-        spec_tokens, logits_q, cache_hits = self.async_speculator.speculate(
-            seq_ids=seq_ids,
-            cache_key_depths=last_accepted_lens,
-            recovery_token_ids=recovery_token_ids,
-            num_tokens=num_tokens,
-            temperatures=temperatures,
-            block_tables=block_tables,
-        )
+            spec_tokens, logits_q, cache_hits = self.async_speculator.speculate(
+                seq_ids=seq_ids,
+                cache_key_depths=last_accepted_lens,
+                recovery_token_ids=recovery_token_ids,
+                num_tokens=num_tokens,
+                temperatures=temperatures,
+                block_tables=block_tables,
+            )
 
-        logger.debug(
-            f"Async spec: B={B}, K={K}, "
-            f"hits={cache_hits.sum().item()}/{B}"
-        )
+            # Broadcast spec_tokens to other TP ranks so they build identical verify input
+            if tp_size > 1:
+                tp_group = self.target_worker.model_runner.tp_group
+                dist.broadcast(spec_tokens, src=tp_group.ranks[0], group=tp_group.device_group)
+                dist.broadcast(cache_hits, src=tp_group.ranks[0], group=tp_group.device_group)
+
+            logger.debug(
+                f"Async spec: B={B}, K={K}, "
+                f"hits={cache_hits.sum().item()}/{B}"
+            )
+        else:
+            # Non-master TP rank: receive broadcast spec_tokens from rank 0
+            spec_tokens = torch.empty(B, K, dtype=torch.int64, device=device)
+            cache_hits = torch.empty(B, dtype=torch.int64, device=device)
+            tp_group = self.target_worker.model_runner.tp_group
+            dist.broadcast(spec_tokens, src=tp_group.ranks[0], group=tp_group.device_group)
+            dist.broadcast(cache_hits, src=tp_group.ranks[0], group=tp_group.device_group)
 
         # Build EagleVerifyInput for topk=1 linear chain
         spec_info = self._build_verify_input(
@@ -615,16 +663,32 @@ class SSDWorker(EAGLEWorker):
         if not isinstance(eagle_draft_input, EagleDraftInput):
             return
 
-        # Extract accept lengths from verify output
+        # Use accept_length from draft_input (not verify_output) because
+        # when requests finish, draft_input is filtered to unfinished only,
+        # while verify_output.accept_length_per_req_cpu has ALL requests.
+        if eagle_draft_input.accept_length_cpu is not None:
+            accept_lens_cpu = eagle_draft_input.accept_length_cpu
+        else:
+            accept_lens_cpu = verify_output.accept_length_per_req_cpu
         accept_lens = torch.tensor(
-            verify_output.accept_length_per_req_cpu,
-            dtype=torch.int64,
-            device=self.device,
+            accept_lens_cpu, dtype=torch.int64, device=self.device,
         )
 
-        # Create SSDDraftInput preserving verified_id from EagleDraftInput
+        # Extract the LAST accepted prediction per request as the recovery token.
+        # eagle_draft_input.verified_id is a flat array of accepted predictions
+        # for unfinished requests: [req0_t0, req0_t1, ..., req1_t0, ...].
+        # Each request i has (accept_lens[i] + 1) accepted predictions.
+        # The recovery token is the last one per request (the bonus token).
+        all_verified = eagle_draft_input.verified_id
+        if all_verified.numel() > 0 and accept_lens.numel() > 0:
+            cum_lens = (accept_lens + 1).cumsum(0)
+            last_indices = cum_lens - 1
+            last_verified_ids = all_verified[last_indices]
+        else:
+            last_verified_ids = all_verified
+
         batch.spec_info = SSDDraftInput(
-            verified_id=eagle_draft_input.verified_id,
+            verified_id=last_verified_ids,
             last_accepted_lens=accept_lens + 1,  # +1 for the bonus token
         )
 
