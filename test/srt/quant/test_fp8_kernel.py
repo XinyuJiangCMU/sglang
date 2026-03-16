@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype,
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
@@ -17,7 +18,8 @@ class TestFP8Base(CustomTestCase):
         cls.N = 1024 + 64
         cls.K = 512
         cls.group_size = 128
-        cls.quant_type = torch.float8_e4m3fn
+        # Use platform-aware FP8 dtype (e4m3fnuz on MI300X, e4m3fn on NVIDIA)
+        cls.quant_type = fp8_dtype
         cls.output_type = torch.bfloat16
 
     @staticmethod
