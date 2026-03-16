@@ -840,11 +840,7 @@ def channel_quant_to_tensor_quant(
     x_s: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     x_dq_channel = x_q_channel.to(torch.float32) * x_s
-    x_q_tensor, scale = (
-        scaled_fp8_quant(x_dq_channel)
-        if _is_cuda
-        else input_to_float8(x_dq_channel, dtype=x_q_channel.dtype)
-    )
+    x_q_tensor, scale = scaled_fp8_quant(x_dq_channel)
     return x_q_tensor, scale
 
 
