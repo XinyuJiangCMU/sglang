@@ -2136,7 +2136,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         elif _is_hip:
-            # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
                 attn_bmm_output = torch.empty(

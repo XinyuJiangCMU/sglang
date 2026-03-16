@@ -525,7 +525,7 @@ class KVCache(abc.ABC):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -1490,7 +1490,7 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_nsa = use_nsa
-        self.nsa_kv_cache_store_fp8 = use_nsa and dtype == torch.float8_e4m3fn
+        self.nsa_kv_cache_store_fp8 = use_nsa and dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
         assert not (
             self.nsa_kv_cache_store_fp8 and override_kv_cache_dim is None
         ), "override_kv_cache_dim must be provided when using NSA with FP8 kv cache storage"
