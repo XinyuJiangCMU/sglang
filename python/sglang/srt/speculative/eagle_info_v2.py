@@ -48,6 +48,12 @@ if is_cuda():
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
     )
+elif is_hip():
+    from sglang.srt.speculative.spec_sampling_pytorch import (
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+        tree_speculative_sampling_target_only,
+    )
 
 
 @triton.jit
