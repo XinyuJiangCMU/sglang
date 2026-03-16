@@ -1295,6 +1295,14 @@ class AiterAttnBackend(AttentionBackend):
                 dtype = q.dtype
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
+                # set_kv_buffer divides by k_scale/v_scale before FP8 cast,
+                # so we must multiply back when scales are non-trivial
+                k_sf = getattr(layer, "k_scale_float", None)
+                v_sf = getattr(layer, "v_scale_float", None)
+                if k_sf is not None and k_sf != 1.0:
+                    k_cache = k_cache * layer.k_scale
+                if v_sf is not None and v_sf != 1.0:
+                    v_cache = v_cache * layer.v_scale
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
