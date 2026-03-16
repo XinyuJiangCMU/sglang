@@ -52,9 +52,11 @@ class TestScaledMM(CustomTestCase):
         ]
 
         try:
-            torch.tensor([1.0], dtype=torch.float8_e4m3fn, device="cuda")
-            test_configs.append((32, 32, 32, torch.float8_e4m3fn, torch.float16, False))
-        except:
+            from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+            torch.tensor([1.0], dtype=fp8_dtype, device="cuda")
+            test_configs.append((32, 32, 32, fp8_dtype, torch.float16, False))
+        except Exception:
             print("FP8 not supported, skipping")
 
         for M, K, N, in_dtype, out_dtype, with_bias in test_configs:
