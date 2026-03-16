@@ -21,11 +21,12 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    apply_fp8_ptpc_linear,
     cutlass_fp8_supported,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -34,6 +35,11 @@ if TYPE_CHECKING:
     )
 
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter.ops.shuffle import shuffle_weight
 
 
 class W8A8Fp8Config(QuantizationConfig):
@@ -117,24 +123,35 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
                     weight=weight, weight_scale=weight_scale
                 )
 
-            layer.weight = Parameter(weight.t(), requires_grad=False)
+            if _use_aiter:
+                layer.weight = Parameter(
+                    shuffle_weight(weight.contiguous(), (16, 16)),
+                    requires_grad=False,
+                )
+            else:
+                layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         else:
-            # If checkpoint not offline quantized, quantize the weights with per-channel quantization.
-            if self.cutlass_fp8_supported:
-                # if cutlass supported, we use cutlass_scaled_mm
-                # which requires per-channel quantization on weight
+            # If checkpoint not offline quantized, quantize the weights.
+            if self.cutlass_fp8_supported or _use_aiter:
+                # Per-channel quantization: cutlass requires it,
+                # AITER uses it for fast gemm_a8w8_bpreshuffle.
                 qweight, weight_scale = per_token_group_quant_fp8(
                     layer.weight, layer.weight.shape[-1]
                 )
                 weight_scale = weight_scale.t().contiguous()
             else:
-                # if cutlass not supported, we fall back to use torch._scaled_mm
-                # which requires per tensor quantization on weight
+                # per tensor quantization fallback
                 qweight, weight_scale = input_to_float8(layer.weight, dtype=fp8_dtype)
 
             # Update the layer with the new values.
-            layer.weight = Parameter(qweight.t(), requires_grad=False)
+            if _use_aiter and not self.cutlass_fp8_supported:
+                layer.weight = Parameter(
+                    shuffle_weight(qweight.contiguous(), (16, 16)),
+                    requires_grad=False,
+                )
+            else:
+                layer.weight = Parameter(qweight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             layer.input_scale = None
 
@@ -185,6 +202,14 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
+        if _use_aiter:
+            return apply_fp8_ptpc_linear(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                bias=bias,
+                use_per_token_if_dynamic=True,
+            )
         return apply_fp8_linear(
             x,
             layer.weight,
