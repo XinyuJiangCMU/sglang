@@ -2256,10 +2256,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         if _is_hip:
-            # TODO(haishaw): add bmm_fp8 to ROCm
+            # w_kc is pre-dequantized to bf16 at load time (see load_weights)
             q_nope_out = torch.bmm(
-                q_nope.to(torch.bfloat16).transpose(0, 1),
-                self.w_kc.to(torch.bfloat16) * self.w_scale,
+                q_nope.to(torch.bfloat16).transpose(0, 1), self.w_kc
             )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
@@ -2441,10 +2440,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if _is_hip:
-            # TODO(haishaw): add bmm_fp8 to ROCm
+            # w_vc is pre-dequantized to bf16 at load time (see load_weights)
             attn_bmm_output = torch.bmm(
-                attn_output.to(torch.bfloat16).transpose(0, 1),
-                self.w_vc.to(torch.bfloat16) * self.w_scale,
+                attn_output.to(torch.bfloat16).transpose(0, 1), self.w_vc
             )
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
@@ -3610,6 +3608,15 @@ class DeepseekV2ForCausalLM(nn.Module):
                     )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
+                # Pre-dequantize FP8 weights to bf16 on ROCm and CPU to avoid
+                # runtime cast+scale overhead in the BMM hot path.
+                if _is_hip and w.dtype == torch.float8_e4m3fn:
+                    self_attn.w_kc = (
+                        self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
+                    )
+                    self_attn.w_vc = (
+                        self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
+                    )
                 # TODO: remove this after adding FP8 support in bmm cpu kernel
                 if _is_cpu and _is_cpu_amx_available and w.dtype == torch.float8_e4m3fn:
                     self_attn.w_kc = (
