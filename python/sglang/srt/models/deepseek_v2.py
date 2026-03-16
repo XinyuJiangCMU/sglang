@@ -734,7 +734,7 @@ class DeepseekV2MoE(nn.Module):
             )
             self.shared_experts_is_fp8 = (
                 not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+                and self.shared_experts.gate_up_proj.weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
             )
             if self.shared_experts_is_fp8:
                 if (
@@ -1507,7 +1507,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.qkv_proj_with_rope_is_fp8 = (
             has_fused_proj
             and not is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
         )
 
         self.weight_block_size = None
@@ -3605,7 +3605,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         self_attn.w_scale *= 2.0
                 # Pre-dequantize FP8 weights to bf16 on ROCm and CPU to avoid
                 # runtime cast+scale overhead in the BMM hot path.
-                if _is_hip and not _use_aiter_gfx95 and w.dtype == torch.float8_e4m3fn:
+                if _is_hip and not _use_aiter_gfx95 and w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
                     self_attn.w_kc = (
                         self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
                     )
@@ -3613,7 +3613,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
                     )
                 # TODO: remove this after adding FP8 support in bmm cpu kernel
-                if _is_cpu and _is_cpu_amx_available and w.dtype == torch.float8_e4m3fn:
+                if _is_cpu and _is_cpu_amx_available and w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
                     self_attn.w_kc = (
                         self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
                     )
