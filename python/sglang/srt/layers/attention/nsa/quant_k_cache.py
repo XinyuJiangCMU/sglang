@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.nsa.utils import NSA_QUANT_K_CACHE_FAST
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, fp8_max, fp8_min
 
 
 def quantize_k_cache(cache_k):
@@ -111,7 +112,7 @@ def _quantize_k_cache_slow(
 
     result = torch.empty(
         (num_blocks, block_size, dv + num_tiles * 4 + input_elem_size * (d - dv)),
-        dtype=torch.float8_e4m3fn,
+        dtype=fp8_dtype,
         device=input_k_cache.device,
     )
     result_k_nope_part = result[..., :dv]
@@ -126,7 +127,7 @@ def _quantize_k_cache_slow(
             )
             .max(dim=-1)
             .values
-            / 448.0
+            / fp8_max
         )  # [num_blocks, block_size]
         result_k_scale_factor[:, :, tile_idx] = cur_scale_factors_inv
 
@@ -136,7 +137,7 @@ def _quantize_k_cache_slow(
                 ..., tile_idx * tile_size : (tile_idx + 1) * tile_size
             ].float()
             / cur_scale_factors_inv.float()
-        ).to(torch.float8_e4m3fn)
+        ).to(fp8_dtype)
         result_k_nope_part[..., tile_idx * tile_size : (tile_idx + 1) * tile_size] = (
             cur_quantized_nope
         )
@@ -188,7 +189,7 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
 
     output = torch.empty(
         (num_tokens, dim_nope + num_tiles * 4 + k_rope.element_size() * dim_rope),
-        dtype=torch.float8_e4m3fn,
+        dtype=fp8_dtype,
         device=k_nope.device,
     )
     output_nope_q = output[..., :dim_nope]
@@ -216,8 +217,8 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
         GROUP_SIZE=group_size,
         DIM_NOPE=dim_nope,
         DIM_ROPE=dim_rope,
-        FP8_MIN=torch.finfo(torch.float8_e4m3fn).min,
-        FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+        FP8_MIN=fp8_min,
+        FP8_MAX=fp8_max,
     )
 
     return output
@@ -268,7 +269,7 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
     # Create typed views for the kernel to write into
     # Fixed byte layout for nope_part: [nope_fp8 (dim_nope bytes) | scales_fp32 (num_tiles*4 bytes)]
     # Fixed byte layout for rope_part: [rope_bf16 (dim_rope*2 bytes)]
-    nope_q_view = nope_part_u8[:, :dim_nope].view(torch.float8_e4m3fn)
+    nope_q_view = nope_part_u8[:, :dim_nope].view(fp8_dtype)
     nope_s_view = nope_part_u8[:, dim_nope:].view(torch.float32)
     rope_view = rope_part_u8.view(torch.bfloat16)
 
@@ -292,8 +293,8 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
         GROUP_SIZE=group_size,
         DIM_NOPE=dim_nope,
         DIM_ROPE=dim_rope,
-        FP8_MIN=torch.finfo(torch.float8_e4m3fn).min,
-        FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+        FP8_MIN=fp8_min,
+        FP8_MAX=fp8_max,
     )
 
     # Add middle dimension for compatibility with set_mla_kv_buffer_triton
