@@ -257,44 +257,57 @@ def _per_token_group_quant_8bit_raw(
         scale_ue8m0=False,
     )
 
-    M = x.numel() // group_size
-    N = group_size
-
-    BLOCK = triton.next_power_of_2(N)
-    # heuristics for number of warps
-    num_warps = min(max(BLOCK // 256, 1), 8)
-    num_stages = 1
-    if column_major_scales:
-        _per_token_group_quant_8bit_colmajor[(M,)](
-            x,
+    # Fast path: use AITER HIP kernel for simple row-major group quant (2.5-3.9x faster)
+    if (
+        _use_aiter
+        and not column_major_scales
+        and not scale_ue8m0
+        and group_size in (32, 64, 128)
+    ):
+        dynamic_per_token_scaled_quant(
             x_q,
+            x.view(-1, group_size),
             x_s,
-            group_size,
-            x.shape[1],
-            x_s.stride(1),
-            eps,
-            bit8_min=bit8_min,
-            bit8_max=bit8_max,
-            BLOCK=BLOCK,
-            num_warps=num_warps,
-            num_stages=num_stages,
-            SCALE_UE8M0=scale_ue8m0,
         )
     else:
-        assert not scale_ue8m0
-        _per_token_group_quant_8bit[(M,)](
-            x,
-            x_q,
-            x_s,
-            group_size,
-            N,
-            eps,
-            bit8_min=bit8_min,
-            bit8_max=bit8_max,
-            BLOCK=BLOCK,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
+        M = x.numel() // group_size
+        N = group_size
+
+        BLOCK = triton.next_power_of_2(N)
+        # heuristics for number of warps
+        num_warps = min(max(BLOCK // 256, 1), 8)
+        num_stages = 1
+        if column_major_scales:
+            _per_token_group_quant_8bit_colmajor[(M,)](
+                x,
+                x_q,
+                x_s,
+                group_size,
+                x.shape[1],
+                x_s.stride(1),
+                eps,
+                bit8_min=bit8_min,
+                bit8_max=bit8_max,
+                BLOCK=BLOCK,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                SCALE_UE8M0=scale_ue8m0,
+            )
+        else:
+            assert not scale_ue8m0
+            _per_token_group_quant_8bit[(M,)](
+                x,
+                x_q,
+                x_s,
+                group_size,
+                N,
+                eps,
+                bit8_min=bit8_min,
+                bit8_max=bit8_max,
+                BLOCK=BLOCK,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
 
     if scale_ue8m0:
         from deep_gemm import transform_sf_into_required_layout
