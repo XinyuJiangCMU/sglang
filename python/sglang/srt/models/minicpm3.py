@@ -83,6 +83,11 @@ class MiniCPM3MLP(nn.Module):
         return x
 
 
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+
+
 def input_to_float8(x, dtype=torch.float8_e4m3fn):
     finfo = torch.finfo(dtype)
     min_val, max_val = x.aminmax()
@@ -219,9 +224,9 @@ class MiniCPM3AttentionMLA(nn.Module):
             )
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        if self.w_kc.dtype == torch.float8_e4m3fn:
+        if self.w_kc.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             q_nope_val, q_nope_scale = input_to_float8(
-                q_nope.transpose(0, 1), torch.float8_e4m3fn
+                q_nope.transpose(0, 1), self.w_kc.dtype
             )
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
@@ -248,9 +253,9 @@ class MiniCPM3AttentionMLA(nn.Module):
         attn_output = self.attn(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        if self.w_vc.dtype == torch.float8_e4m3fn:
+        if self.w_vc.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             attn_output_val, attn_output_scale = input_to_float8(
-                attn_output.transpose(0, 1), torch.float8_e4m3fn
+                attn_output.transpose(0, 1), self.w_vc.dtype
             )
             attn_bmm_output = bmm_fp8(
                 attn_output_val,
@@ -511,6 +516,18 @@ class MiniCPM3ForCausalLM(nn.Module):
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
             if hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+                if _is_hip:
+                    self_attn.w_scale *= 2.0
+            # Pre-dequantize FP8 weights to bf16 on ROCm to avoid
+            # runtime cast+scale overhead in the BMM hot path.
+            if _is_hip and self_attn.w_kc.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+                if hasattr(self_attn, "w_scale") and self_attn.w_scale is not None:
+                    self_attn.w_kc = (
+                        self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
+                    )
+                    self_attn.w_vc = (
+                        self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
+                    )
             del self_attn.kv_b_proj
 
 
