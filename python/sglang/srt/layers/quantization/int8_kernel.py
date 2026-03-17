@@ -185,6 +185,11 @@ def per_token_group_quant_int8(
         dtype=torch.float32,
     )
 
+    # AITER fast path for AMD: ~4.5x faster than Triton
+    if _use_aiter:
+        dynamic_per_token_scaled_quant(x_q, x.view(-1, group_size), x_s.view(-1, 1))
+        return x_q, x_s
+
     BLOCK = triton.next_power_of_2(N)
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
