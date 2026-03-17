@@ -49,7 +49,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda, is_cuda_alike
+from sglang.srt.utils import is_cuda
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -58,7 +58,7 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-_is_cuda = is_cuda_alike()
+_is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import gptq_gemm, gptq_marlin_repack, gptq_shuffle

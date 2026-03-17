@@ -58,7 +58,7 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
-_is_cuda = is_cuda_alike()
+_is_cuda = is_cuda()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 

@@ -50,7 +50,7 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
-_is_cuda = is_cuda_alike()
+_is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
