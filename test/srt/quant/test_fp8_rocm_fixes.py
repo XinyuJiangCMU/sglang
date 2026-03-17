@@ -421,5 +421,80 @@ class TestFP8DtypeConsistency(unittest.TestCase):
         self.assertEqual(ds_fp8_dtype, torch.float8_e4m3fnuz)
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestFP8EdgeCases(unittest.TestCase):
+    """Edge case tests for FP8 on AMD MI300X."""
+
+    def test_zero_input_quant(self):
+        """Zero input should produce zero dequantized output."""
+        from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+
+        x = torch.zeros(4, 128, device="cuda", dtype=torch.bfloat16)
+        q, s = scaled_fp8_quant(x)
+        # Scale is 0, so dequantized = q * s = 0 regardless of q values
+        dequant = q.float() * s
+        self.assertTrue((dequant == 0).all().item())
+
+    def test_large_input_clamp(self):
+        """Large values should be clamped to fp8_max."""
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            fp8_max,
+            scaled_fp8_quant,
+        )
+
+        x = torch.full((4, 128), 1e6, device="cuda", dtype=torch.bfloat16)
+        q, s = scaled_fp8_quant(x)
+        # After quant, max abs value should be <= fp8_max
+        self.assertTrue(q.float().abs().max().item() <= fp8_max + 1)
+
+    def test_single_token_quant(self):
+        """M=1 quantization should work correctly."""
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            per_token_group_quant_fp8,
+        )
+
+        x = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16)
+        q, s = per_token_group_quant_fp8(x, group_size=128)
+        self.assertEqual(q.shape, (1, 2560))
+        self.assertEqual(s.shape, (1, 20))  # 2560/128 = 20 groups
+        self.assertFalse(q.float().isnan().any().item())
+
+    def test_large_batch_quant(self):
+        """Large batch quantization should work."""
+        from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+
+        x = torch.randn(512, 4096, device="cuda", dtype=torch.bfloat16)
+        q, s = scaled_fp8_quant(x, use_per_token_if_dynamic=True)
+        self.assertEqual(q.shape, (512, 4096))
+        self.assertEqual(s.shape, (512, 1))
+
+    def test_fp8_gemm_numerical_stability(self):
+        """FP8 GEMM should produce finite outputs for normal inputs."""
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            fp8_dtype,
+            per_token_group_quant_fp8,
+            scaled_fp8_quant,
+        )
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
+
+        try:
+            from aiter.ops.shuffle import shuffle_weight
+        except ImportError:
+            self.skipTest("AITER shuffle_weight not available")
+
+        M, N, K = 32, 2560, 2560
+        W = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        qW, wscale = per_token_group_quant_fp8(W, K)
+        wscale_stored = wscale.t().contiguous()
+        W_shuffled = shuffle_weight(qW.contiguous(), (16, 16))
+
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        out = apply_fp8_ptpc_linear(
+            x, W_shuffled, wscale_stored, None, None, use_per_token_if_dynamic=True
+        )
+        self.assertTrue(out.isfinite().all().item())
+        self.assertEqual(out.shape, (M, N))
+
+
 if __name__ == "__main__":
     unittest.main()
