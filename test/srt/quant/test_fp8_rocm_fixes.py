@@ -212,5 +212,70 @@ class TestScaledFP8Quant(unittest.TestCase):
         self.assertTrue(torch.equal(scale, scale_out))
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestAITERPerChannelGEMM(unittest.TestCase):
+    """Test AITER per-channel FP8 GEMM via apply_fp8_ptpc_linear."""
+
+    def _test_shape(self, M, N, K):
+        from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
+
+        try:
+            from aiter.ops.shuffle import shuffle_weight
+        except ImportError:
+            self.skipTest("AITER not available")
+
+        torch.manual_seed(42)
+        W = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        qw, ws = per_token_group_quant_fp8(W, W.shape[-1])
+        ws_stored = ws.t().contiguous()
+        qw_shuffled = shuffle_weight(qw.contiguous(), (16, 16))
+
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        ref = x @ W.T
+
+        out = apply_fp8_ptpc_linear(
+            x, qw_shuffled, ws_stored, use_per_token_if_dynamic=True
+        )
+
+        cos_sim = torch.nn.functional.cosine_similarity(
+            ref.flatten().float().unsqueeze(0),
+            out.flatten().float().unsqueeze(0),
+        ).item()
+        self.assertGreater(
+            cos_sim, 0.998, f"AITER GEMM M={M} N={N} K={K}: cos_sim={cos_sim}"
+        )
+        self.assertEqual(out.shape, (M, N))
+
+    def test_decode_small(self):
+        self._test_shape(1, 2560, 2560)
+
+    def test_decode_large(self):
+        self._test_shape(1, 4096, 4096)
+
+    def test_batch_4(self):
+        self._test_shape(4, 4096, 4096)
+
+    def test_batch_32(self):
+        self._test_shape(32, 4096, 4096)
+
+    def test_non_square(self):
+        self._test_shape(1, 14336, 4096)
+
+    def test_output_buffer(self):
+        """Test scaled_fp8_quant with pre-allocated output buffer."""
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            fp8_dtype,
+            scaled_fp8_quant,
+        )
+
+        x = torch.randn(4, 2560, device="cuda", dtype=torch.bfloat16)
+        buf = torch.empty(4, 2560, device="cuda", dtype=fp8_dtype)
+
+        out, scale = scaled_fp8_quant(x, use_per_token_if_dynamic=True, output=buf)
+        self.assertTrue(out.data_ptr() == buf.data_ptr(), "Output should reuse buffer")
+        self.assertEqual(out.dtype, fp8_dtype)
+
+
 if __name__ == "__main__":
     unittest.main()
