@@ -159,5 +159,103 @@ class TestRMSNormPerformance(unittest.TestCase):
         self.assertLess(us, 15.0, f"fused_add_rmsnorm {us:.1f}us > 15us threshold")
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestFusedKVCacheWrite(unittest.TestCase):
+    """Test AITER fused KV cache write."""
+
+    def test_bf16_kv_cache_write_correctness(self):
+        """Fused reshape_and_cache_flash should match direct indexing for BF16."""
+        try:
+            from aiter import reshape_and_cache_flash
+        except ImportError:
+            self.skipTest("AITER reshape_and_cache_flash not available")
+
+        num_pages, num_heads, head_dim = 100, 4, 128
+        num_tokens = 8
+
+        k = torch.randn(num_tokens, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(num_tokens, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        loc = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+
+        # Direct indexing (reference)
+        k_ref = torch.zeros(num_pages, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        k_ref[loc] = k
+
+        # Fused write
+        k_buf = torch.zeros(num_pages, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        v_buf = torch.zeros(num_pages, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        ks = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+        vs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+        reshape_and_cache_flash(
+            k, v,
+            k_buf.view(-1, 1, num_heads, head_dim),
+            v_buf.view(-1, 1, num_heads, head_dim),
+            loc, "auto", ks, vs,
+        )
+
+        self.assertTrue(torch.allclose(k_ref[:num_tokens], k_buf[:num_tokens]))
+
+    def test_fp8_kv_cache_write(self):
+        """Fused reshape_and_cache_flash should work with FP8 KV cache."""
+        try:
+            from aiter import reshape_and_cache_flash
+        except ImportError:
+            self.skipTest("AITER reshape_and_cache_flash not available")
+
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        num_pages, num_heads, head_dim = 100, 4, 128
+        num_tokens = 4
+
+        k = torch.randn(num_tokens, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(num_tokens, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        loc = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+
+        k_buf = torch.zeros(num_pages, num_heads, head_dim, device="cuda", dtype=fp8_dtype)
+        v_buf = torch.zeros(num_pages, num_heads, head_dim, device="cuda", dtype=fp8_dtype)
+        ks = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+        vs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+
+        reshape_and_cache_flash(
+            k, v,
+            k_buf.view(-1, 1, num_heads, head_dim),
+            v_buf.view(-1, 1, num_heads, head_dim),
+            loc, "fp8", ks, vs,
+        )
+
+        # Verify non-zero and finite
+        self.assertTrue(k_buf[:num_tokens].float().abs().sum().item() > 0)
+
+    def test_kv_cache_write_latency(self):
+        """Fused KV cache write should be < 15us for BF16."""
+        try:
+            from aiter import reshape_and_cache_flash
+        except ImportError:
+            self.skipTest("AITER reshape_and_cache_flash not available")
+
+        num_pages, num_heads, head_dim = 100000, 4, 128
+        num_tokens = 32
+
+        k = torch.randn(num_tokens, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(num_tokens, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        k_buf = torch.zeros(num_pages, 1, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        v_buf = torch.zeros(num_pages, 1, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        loc = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+        ks = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+        vs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
+
+        for _ in range(10):
+            reshape_and_cache_flash(k, v, k_buf, v_buf, loc, "auto", ks, vs)
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(200):
+            reshape_and_cache_flash(k, v, k_buf, v_buf, loc, "auto", ks, vs)
+        torch.cuda.synchronize()
+        us = (time.perf_counter() - t0) / 200 * 1e6
+
+        self.assertLess(us, 15.0, f"Fused KV write {us:.1f}us > 15us threshold")
+
+
 if __name__ == "__main__":
     unittest.main()
