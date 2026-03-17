@@ -366,8 +366,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             )[0]
             return StandardCombineInput(hidden_states=output)
         else:
-            if _use_aiter:
-                assert not moe_runner_config.no_combine, "unsupported"
+            if _use_aiter and not moe_runner_config.no_combine:
                 topk_weights, topk_ids, _ = topk_output
                 if moe_runner_config.apply_router_weight_on_input:
                     assert (
