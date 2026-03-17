@@ -1838,7 +1838,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
             )
-            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+            and forward_batch.attn_backend.data_type in (torch.float8_e4m3fn, fp8_dtype)
         )
 
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
@@ -1967,7 +1967,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     torch.bfloat16,
                     q_nope_out,
                 )
-            elif _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
+            elif _use_aiter_gfx95 and self.w_kc.dtype in (torch.float8_e4m3fn, fp8_dtype):
                 q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                     X=q_nope,
                     WQ=self.w_kc.transpose(-1, -2),
@@ -1984,7 +1984,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     q_nope.to(torch.bfloat16).transpose(0, 1), self.w_kc
                 )
 
-        elif self.w_kc.dtype == torch.float8_e4m3fn:
+        elif self.w_kc.dtype in (torch.float8_e4m3fn, fp8_dtype):
             # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
                 q_nope.transpose(0, 1),
@@ -2152,7 +2152,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     torch.bfloat16,
                     attn_bmm_output,
                 )
-            elif _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
+            elif _use_aiter_gfx95 and self.w_kc.dtype in (torch.float8_e4m3fn, fp8_dtype):
                 attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                     X=attn_output,
                     WQ=self.w_vc.transpose(-1, -2),
@@ -2172,7 +2172,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             if self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+            elif _use_aiter_gfx95 and self.o_proj.weight.dtype in (torch.float8_e4m3fn, fp8_dtype):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_fp8_group_quant(
                     attn_bmm_output, group_size=128, dtype_quant=torch.float8_e4m3fn
@@ -2180,7 +2180,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
-        elif self.w_vc.dtype == torch.float8_e4m3fn:
+        elif self.w_vc.dtype in (torch.float8_e4m3fn, fp8_dtype):
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
                 attn_output.transpose(0, 1),
                 (
@@ -2254,11 +2254,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = torch.bmm(
                 q_nope.to(torch.bfloat16).transpose(0, 1), self.w_kc
             )
-        elif self.w_kc.dtype == torch.float8_e4m3fn:
+        elif self.w_kc.dtype in (torch.float8_e4m3fn, fp8_dtype):
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
                 q_nope.transpose(0, 1),
                 zero_allocator.allocate(1),
-                dtype=torch.float8_e4m3fn,
             )
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
@@ -2438,11 +2437,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1), self.w_vc
             )
-        elif self.w_vc.dtype == torch.float8_e4m3fn:
+        elif self.w_vc.dtype in (torch.float8_e4m3fn, fp8_dtype):
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
                 attn_output.transpose(0, 1),
                 zero_allocator.allocate(1),
-                dtype=torch.float8_e4m3fn,
             )
             attn_bmm_output = bmm_fp8(
                 attn_output_val,
@@ -2879,7 +2877,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     )
                     is not None
                     and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype
-                    == getattr(torch, "float8_e4m3fn", None)
+                    in (getattr(torch, "float8_e4m3fn", None), fp8_dtype)
                 )
                 else ""
             )
