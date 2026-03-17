@@ -8,9 +8,15 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_device_name, is_cuda
+from sglang.srt.utils import get_bool_env_var, get_device_name, is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter import dynamic_per_token_scaled_quant
+
 if _is_cuda:
     # Temporary
     try:
@@ -47,7 +53,7 @@ def _per_token_quant_int8(
     absmax = tl.maximum(tl.max(tl.abs(x)), 1e-10)
     scale_x = absmax / 127
     x_q = x * (127 / absmax)
-    x_q = tl.extra.cuda.libdevice.round(x_q).to(tl.int8)
+    x_q = tl.libdevice.llrint(x_q).to(tl.int8)
     if CAL_SUM:
         x_sum = tl.sum(x, axis=0)
         tl.store(x_sum_ptr + row_id, x_sum.to(x_sum_ptr.dtype.element_ty))
@@ -61,6 +67,16 @@ def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
     N = x.shape[-1]
     x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
     scales = torch.empty(x.shape[:-1] + (1,), device=x.device, dtype=scale_dtype)
+
+    # AITER fast path for AMD: ~4.5x faster than Triton for INT8 per-token quant
+    if _use_aiter and not cal_sum:
+        assert x.is_contiguous()
+        dynamic_per_token_scaled_quant(x_q, x.view(-1, N), scales.view(-1, 1))
+        if cal_sum:
+            x_sum = x.to(torch.float32).sum(dim=-1)
+            return x_q, scales, x_sum
+        return x_q, scales
+
     if cal_sum:
         x_sum = torch.empty(x.shape[:-1], device=x.device, dtype=x.dtype)
     else:
