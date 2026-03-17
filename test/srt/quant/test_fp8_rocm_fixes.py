@@ -497,6 +497,56 @@ class TestFP8EdgeCases(unittest.TestCase):
 
 
 @unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestINT8AITERGemm(unittest.TestCase):
+    """Test AITER INT8 GEMM on AMD MI300X."""
+
+    def test_int8_gemm_correctness(self):
+        """AITER gemm_a8w8 INT8 should produce correct results."""
+        try:
+            from aiter import gemm_a8w8
+        except ImportError:
+            self.skipTest("AITER gemm_a8w8 not available")
+
+        M, N, K = 4, 2560, 2560
+        A = torch.randint(-127, 127, (M, K), device="cuda", dtype=torch.int8)
+        W = torch.randint(-127, 127, (N, K), device="cuda", dtype=torch.int8)
+        a_scale = torch.ones(M, 1, device="cuda", dtype=torch.float32) * 0.01
+        w_scale = torch.ones(N, 1, device="cuda", dtype=torch.float32) * 0.01
+
+        out = gemm_a8w8(A, W, a_scale, w_scale, dtype=torch.bfloat16)
+        self.assertEqual(out.shape, (M, N))
+        self.assertTrue(out.isfinite().all().item())
+
+    def test_int8_per_token_quant_aiter(self):
+        """INT8 per-token quant should use AITER fast path."""
+        from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+
+        x = torch.randn(32, 4096, device="cuda", dtype=torch.bfloat16)
+        q, s = per_token_quant_int8(x)
+        self.assertEqual(q.dtype, torch.int8)
+        self.assertEqual(q.shape, (32, 4096))
+        self.assertEqual(s.shape, (32, 1))
+        # Verify dequant accuracy
+        dq = q.float() * s
+        cos = torch.nn.functional.cosine_similarity(
+            x.float().flatten().unsqueeze(0), dq.flatten().unsqueeze(0)
+        ).item()
+        self.assertGreater(cos, 0.999)
+
+    def test_int8_group_quant_aiter(self):
+        """INT8 group quant should use AITER fast path."""
+        from sglang.srt.layers.quantization.int8_kernel import (
+            per_token_group_quant_int8,
+        )
+
+        x = torch.randn(32, 4096, device="cuda", dtype=torch.bfloat16)
+        q, s = per_token_group_quant_int8(x, group_size=128)
+        self.assertEqual(q.dtype, torch.int8)
+        self.assertEqual(q.shape, (32, 4096))
+        self.assertEqual(s.shape, (32, 32))  # 4096/128 = 32 groups
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
 class TestFP8PerformanceSanity(unittest.TestCase):
     """Sanity check FP8 performance on AMD to catch regressions."""
 
