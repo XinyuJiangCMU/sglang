@@ -17,7 +17,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
     is_blackwell,
-    is_cuda, is_cuda_alike,
+    is_cuda,
     is_hip,
     is_npu,
     print_info_once,
@@ -27,7 +27,7 @@ from sglang.srt.utils.multi_stream_utils import (
     with_multi_stream,
 )
 
-_is_cuda = is_cuda_alike()
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
 

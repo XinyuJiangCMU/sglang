@@ -4,9 +4,9 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_cuda_alike, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
-_is_cuda = is_cuda_alike()
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 

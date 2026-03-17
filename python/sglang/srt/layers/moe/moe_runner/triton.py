@@ -19,7 +19,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_cuda_alike, is_hip
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 
 _is_hip = is_hip()
-_is_cuda = is_cuda_alike()
+_is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = bool(int(os.getenv("SGLANG_MOE_USE_AITER", "0")))

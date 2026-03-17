@@ -2,9 +2,9 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import direct_register_custom_op, is_cuda, is_cuda_alike
+from sglang.srt.utils import direct_register_custom_op, is_cuda
 
-_is_cuda = is_cuda_alike()
+_is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce, silu_and_mul

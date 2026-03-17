@@ -5,9 +5,9 @@ from typing import Tuple
 import torch
 import triton
 
-from sglang.srt.utils import is_cuda, is_cuda_alike, is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
-_is_cuda = is_cuda_alike()
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 
 if _is_cuda or _is_hip:

@@ -3,11 +3,11 @@ import logging
 import torch
 import triton
 
-from sglang.srt.utils import ceil_div, is_cuda, is_cuda_alike
+from sglang.srt.utils import ceil_div, is_cuda
 
 logger = logging.getLogger(__name__)
 
-_is_cuda = is_cuda_alike()
+_is_cuda = is_cuda()
 if _is_cuda:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8 as per_token_group_quant_fp8,
