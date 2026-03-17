@@ -23,8 +23,10 @@ from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_hip,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -34,8 +36,13 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter import gemm_a8w8 as aiter_gemm_a8w8
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
@@ -216,14 +223,27 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
         output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
 
-        output = int8_scaled_mm(
-            x_q_2d,
-            layer.weight,
-            x_scale_2d,
-            layer.weight_scale,
-            out_dtype=x.dtype,
-            bias=bias,
-        )
+        if _use_aiter:
+            # AITER gemm_a8w8: XQ=[M,K], WQ=[N,K], x_scale=[M,1], w_scale=[N,1]
+            # layer.weight is [K,N] (transposed), so .T gives [N,K]
+            output = aiter_gemm_a8w8(
+                x_q_2d,
+                layer.weight.T,
+                x_scale_2d,
+                layer.weight_scale.T.contiguous(),
+                dtype=x.dtype,
+            )
+            if bias is not None:
+                output = output + bias
+        else:
+            output = int8_scaled_mm(
+                x_q_2d,
+                layer.weight,
+                x_scale_2d,
+                layer.weight_scale,
+                out_dtype=x.dtype,
+                bias=bias,
+            )
 
         return output.view(output_shape)
 
