@@ -568,11 +568,17 @@ class Fp8LinearMethod(LinearMethodBase):
         if _use_aiter and not self.block_quant:
             # AITER per-channel path: weight is pre-shuffled [N, K],
             # weight_scale is per-channel [1, N].
+            # If x is a tuple (fp8_tensor, scale) from fused RMSNorm+Quant,
+            # pass the pre-quantized input directly.
+            if isinstance(x, tuple):
+                inp, inp_scale = x
+            else:
+                inp, inp_scale = x, layer.input_scale
             return apply_fp8_ptpc_linear(
-                input=x,
+                input=inp,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
-                input_scale=layer.input_scale,
+                input_scale=inp_scale,
                 bias=bias,
                 use_per_token_if_dynamic=True,
             )
