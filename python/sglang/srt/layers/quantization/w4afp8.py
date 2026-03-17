@@ -65,7 +65,10 @@ class W4AFp8Config(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.bfloat16, torch.float8_e4m3fn]
+        dtypes = [torch.bfloat16, torch.float8_e4m3fn]
+        if hasattr(torch, "float8_e4m3fnuz"):
+            dtypes.append(torch.float8_e4m3fnuz)
+        return dtypes
 
     @classmethod
     def get_min_capability(cls) -> int:
