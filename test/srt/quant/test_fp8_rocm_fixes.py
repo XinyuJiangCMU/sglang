@@ -213,6 +213,60 @@ class TestScaledFP8Quant(unittest.TestCase):
 
 
 @unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestNormalizeE4M3FnToFnuz(unittest.TestCase):
+    """Test e4m3fn to e4m3fnuz normalization."""
+
+    def test_normalization_doubles_scale(self):
+        from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+
+        weight = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = torch.tensor([0.5], device="cuda", dtype=torch.float32)
+
+        w_out, ws_out, _ = normalize_e4m3fn_to_e4m3fnuz(weight, weight_scale)
+        self.assertEqual(w_out.dtype, torch.float8_e4m3fnuz)
+        self.assertAlmostEqual(ws_out.item(), 1.0, places=5)  # 0.5 * 2 = 1.0
+
+    def test_normalization_removes_nan_pattern(self):
+        from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+
+        # Create weight with the -128 bit pattern (NaN in fnuz)
+        weight = torch.zeros(4, 4, device="cuda", dtype=torch.float8_e4m3fn)
+        w_int8 = weight.view(torch.int8)
+        w_int8[0, 0] = -128  # This is NaN in fnuz
+        weight = w_int8.view(torch.float8_e4m3fn)
+
+        weight_scale = torch.tensor([1.0], device="cuda", dtype=torch.float32)
+        w_out, _, _ = normalize_e4m3fn_to_e4m3fnuz(weight, weight_scale)
+
+        # Check no NaN in output
+        self.assertFalse(
+            w_out.to(torch.float32).isnan().any().item(),
+            "Normalized weight should not contain NaN",
+        )
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestShuffleWeight(unittest.TestCase):
+    """Test shuffle_weight preserves shape and data integrity."""
+
+    def test_shape_preservation(self):
+        try:
+            from aiter.ops.shuffle import shuffle_weight
+        except ImportError:
+            self.skipTest("AITER not available")
+
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        for N, K in [(256, 256), (4096, 4096), (19456, 2560)]:
+            W = torch.randn(N, K, device="cuda", dtype=torch.bfloat16).to(fp8_dtype)
+            W_shuffled = shuffle_weight(W.contiguous(), (16, 16))
+            self.assertEqual(W_shuffled.shape, (N, K))
+            self.assertEqual(W_shuffled.dtype, fp8_dtype)
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
 class TestAITERPerChannelGEMM(unittest.TestCase):
     """Test AITER per-channel FP8 GEMM via apply_fp8_ptpc_linear."""
 
