@@ -262,6 +262,7 @@ def _per_token_group_quant_8bit_raw(
         _use_aiter
         and not column_major_scales
         and not scale_ue8m0
+        and dtype != torch.int8
     ):
         dynamic_per_token_scaled_quant(
             x_q,
