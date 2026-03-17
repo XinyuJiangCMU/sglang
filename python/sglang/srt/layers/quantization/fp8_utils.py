@@ -1103,10 +1103,16 @@ def apply_fp8_ptpc_linear(
         # weight is in (N, K) shuffled layout
         output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = scaled_fp8_quant(input_2d, use_per_token_if_dynamic=True)
+    if input_scale is not None:
+        # Input is already quantized (e.g., from fused RMSNorm+Quant)
+        q_input = input_2d
+        x_scale = input_scale
+    else:
+        q_input, x_scale = scaled_fp8_quant(input_2d, use_per_token_if_dynamic=True)
 
+    out_dtype = torch.bfloat16 if input_scale is not None else input.dtype
     output = aiter.gemm_a8w8_bpreshuffle(
-        q_input, weight, x_scale, weight_scale, None, input.dtype
+        q_input, weight, x_scale, weight_scale, None, out_dtype
     )
     if bias is not None:
         output = output + bias
