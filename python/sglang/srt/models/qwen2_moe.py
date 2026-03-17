@@ -75,14 +75,14 @@ from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
     is_cpu,
-    is_cuda,
+    is_cuda, is_cuda_alike,
     make_layers,
     use_intel_amx_backend,
 )
 
 logger = logging.getLogger(__name__)
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 

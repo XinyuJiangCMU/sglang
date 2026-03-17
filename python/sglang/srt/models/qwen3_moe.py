@@ -69,13 +69,13 @@ from sglang.srt.models.utils import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
-    is_cuda,
+    is_cuda, is_cuda_alike,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
     is_npu,
 )
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 
 if _is_cuda:
     from sgl_kernel import fused_qk_norm_rope
@@ -87,7 +87,7 @@ Qwen3MoeConfig = None
 _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_npu = is_npu()
 
 if _is_npu:
