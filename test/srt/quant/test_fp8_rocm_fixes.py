@@ -370,5 +370,56 @@ class TestAITERPerChannelGEMM(unittest.TestCase):
         self.assertTrue(out.isfinite().all().item())
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestFP8DtypeConsistency(unittest.TestCase):
+    """Verify FP8 dtype is consistent across all quantization backends on AMD."""
+
+    def test_compressed_tensors_w8a8_fp8_dtype(self):
+        """compressed_tensors_w8a8_fp8 should use platform-aware fp8_dtype."""
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
+            fp8_dtype as ct_fp8_dtype,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        self.assertEqual(ct_fp8_dtype, fp8_dtype)
+        self.assertEqual(ct_fp8_dtype, torch.float8_e4m3fnuz)
+
+    def test_compressed_tensors_w8a16_fp8_dtype(self):
+        """compressed_tensors_w8a16_fp8 should use platform-aware fp8_dtype."""
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (
+            fp8_dtype as ct_fp8_dtype,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        self.assertEqual(ct_fp8_dtype, fp8_dtype)
+        self.assertEqual(ct_fp8_dtype, torch.float8_e4m3fnuz)
+
+    def test_quark_w8a8_fp8_dtype(self):
+        """Quark w8a8_fp8 should use platform-aware fp8_dtype."""
+        from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
+            fp8_dtype as q_fp8_dtype,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        self.assertEqual(q_fp8_dtype, fp8_dtype)
+        self.assertEqual(q_fp8_dtype, torch.float8_e4m3fnuz)
+
+    def test_fpgemm_fp8_dtype(self):
+        """FBGEMM FP8 should use platform-aware fp8_dtype."""
+        from sglang.srt.layers.quantization.fpgemm_fp8 import fp8_dtype as fb_fp8_dtype
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        self.assertEqual(fb_fp8_dtype, fp8_dtype)
+        self.assertEqual(fb_fp8_dtype, torch.float8_e4m3fnuz)
+
+    def test_deepseek_v2_fp8_dtype(self):
+        """DeepSeek V2 model should import fp8_dtype."""
+        from sglang.srt.models.deepseek_v2 import fp8_dtype as ds_fp8_dtype
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        self.assertEqual(ds_fp8_dtype, fp8_dtype)
+        self.assertEqual(ds_fp8_dtype, torch.float8_e4m3fnuz)
+
+
 if __name__ == "__main__":
     unittest.main()
