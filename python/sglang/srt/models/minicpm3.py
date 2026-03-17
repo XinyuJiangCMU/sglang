@@ -83,12 +83,15 @@ class MiniCPM3MLP(nn.Module):
         return x
 
 
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _fp8_dtype
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 
 
-def input_to_float8(x, dtype=torch.float8_e4m3fn):
+def input_to_float8(x, dtype=None):
+    if dtype is None:
+        dtype = _fp8_dtype
     finfo = torch.finfo(dtype)
     min_val, max_val = x.aminmax()
     amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
