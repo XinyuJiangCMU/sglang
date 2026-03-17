@@ -888,7 +888,6 @@ class MHATokenToKVPool(KVCache):
         # Up to 1.8x faster for BF16 (fuses scatter write).
         if (
             _has_aiter_cache
-            and self.store_dtype == self.dtype
             and cache_k.dim() == 2  # [num_tokens, num_heads * head_dim]
         ):
             import torch
@@ -909,7 +908,10 @@ class MHATokenToKVPool(KVCache):
             k_4d = k_buf.view(-1, 1, num_heads, head_dim)
             v_4d = v_buf.view(-1, 1, num_heads, v_3d.shape[-1])
 
-            kv_dtype_str = "fp8" if self.dtype != cache_k.dtype else "auto"
+            # Determine kv_cache_dtype for the fused kernel
+            is_fp8_cache = cache_k.dtype != self.dtype
+            kv_dtype_str = "fp8" if is_fp8_cache else "auto"
+
             ks = torch.tensor(
                 k_scale if k_scale is not None else 1.0,
                 device=cache_k.device,
