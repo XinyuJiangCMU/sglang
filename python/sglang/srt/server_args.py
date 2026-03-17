@@ -1793,6 +1793,10 @@ class ServerArgs:
     def _handle_amd_specifics(self):
         if is_hip():
             self.triton_attention_num_kv_splits = 16
+            # MI300X has 192GB HBM3 with 5.3 TB/s bandwidth
+            # Larger chunked prefill benefits from wider memory bus
+            if self.chunked_prefill_size < 16384:
+                self.chunked_prefill_size = 16384
 
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
