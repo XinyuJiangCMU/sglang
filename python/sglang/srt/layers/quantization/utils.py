@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
 import numpy
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, fp8_min, scaled_fp8_quant
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -145,7 +145,7 @@ def requantize_with_max_scale(
     # we already are quantized with the single scale.
     # * Sample Model: nm-testing/Phi-3-mini-128k-instruct-FP8
     unfused_module_in_checkpoint = (
-        weight_scale[-1] > torch.finfo(torch.float8_e4m3fn).min
+        weight_scale[-1] > fp8_min
     )
 
     # If unfused checkpoint, need requanize with the single scale.
@@ -192,7 +192,7 @@ def replace_parameter(
 
 def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
     assert a.shape == b.shape
-    assert a.dtype == b.dtype == torch.float8_e4m3fn
+    assert a.dtype == b.dtype == fp8_dtype
 
     a_u8 = a.view(torch.uint8)
     b_u8 = b.view(torch.uint8)

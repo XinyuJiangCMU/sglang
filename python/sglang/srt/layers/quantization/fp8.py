@@ -39,6 +39,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    apply_fp8_ptpc_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
@@ -398,9 +399,10 @@ class Fp8LinearMethod(LinearMethodBase):
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.quant_config.is_checkpoint_fp8_serialized:
-                if self.cutlass_fp8_supported or self.use_marlin:
-                    # apply per-channel quantization default as
-                    # cutlass sgl-kernel and marlin only support per-channel scale
+                if self.cutlass_fp8_supported or self.use_marlin or _use_aiter:
+                    # Per-channel quantization: cutlass/marlin require it,
+                    # and on AMD with AITER it enables the fast
+                    # gemm_a8w8_bpreshuffle kernel with better accuracy.
                     qweight, weight_scale = per_token_group_quant_fp8(
                         layer.weight, layer.weight.shape[-1]
                     )
@@ -410,7 +412,17 @@ class Fp8LinearMethod(LinearMethodBase):
                     qweight, weight_scale = input_to_float8(layer.weight)
 
                 # Update the layer with the new values.
-                layer.weight = Parameter(qweight.t(), requires_grad=False)
+                if _use_aiter and not (
+                    self.cutlass_fp8_supported or self.use_marlin
+                ):
+                    # AITER gemm_a8w8_bpreshuffle requires pre-shuffled
+                    # weights in [N, K] layout for optimal CK kernel dispatch.
+                    layer.weight = Parameter(
+                        shuffle_weight(qweight.contiguous(), (16, 16)),
+                        requires_grad=False,
+                    )
+                else:
+                    layer.weight = Parameter(qweight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 layer.input_scale = None
 
@@ -432,11 +444,26 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
 
                 # cutlass sgl-kernel and marlin only support per-channel scale
-                if self.cutlass_fp8_supported or self.use_marlin:
+                if self.cutlass_fp8_supported or self.use_marlin or _use_aiter:
                     weight = layer.weight
                     weight_scale = convert_to_channelwise(
                         layer.weight_scale, layer.logical_widths
                     )
+                    # If ROCm, normalize e4m3fn weights to e4m3fnuz
+                    if _is_fp8_fnuz:
+                        weight, weight_scale, input_scale = (
+                            normalize_e4m3fn_to_e4m3fnuz(
+                                weight=weight,
+                                weight_scale=weight_scale,
+                                input_scale=getattr(
+                                    layer, "input_scale", None
+                                ),
+                            )
+                        )
+                        if input_scale is not None:
+                            layer.input_scale = Parameter(
+                                input_scale, requires_grad=False
+                            )
                 else:
                     # Dequant -> Quant with max scale so we can run per tensor.
                     weight = layer.weight
@@ -462,7 +489,15 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
 
                 # Update layer with new values.
-                layer.weight = Parameter(weight.t(), requires_grad=False)
+                if _use_aiter and not (
+                    self.cutlass_fp8_supported or self.use_marlin
+                ):
+                    layer.weight = Parameter(
+                        shuffle_weight(weight.contiguous(), (16, 16)),
+                        requires_grad=False,
+                    )
+                else:
+                    layer.weight = Parameter(weight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 if (
                     hasattr(self.quant_config, "activation_scheme")
@@ -530,6 +565,23 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        if _use_aiter and not self.block_quant:
+            # AITER per-channel path: weight is pre-shuffled [N, K],
+            # weight_scale is per-channel [1, N].
+            # If x is a tuple (fp8_tensor, scale) from fused RMSNorm+Quant,
+            # pass the pre-quantized input directly.
+            if isinstance(x, tuple):
+                inp, inp_scale = x
+            else:
+                inp, inp_scale = x, layer.input_scale
+            return apply_fp8_ptpc_linear(
+                input=inp,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=inp_scale,
+                bias=bias,
+                use_per_token_if_dynamic=True,
+            )
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
@@ -1444,7 +1496,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         topk_weights, topk_ids, _ = topk_output
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
-            assert not no_combine, f"{no_combine=} is not supported."
+            if no_combine:
+                return None
             return fused_moe(
                 x,
                 layer.w13_weight,
@@ -1460,7 +1513,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
         if _use_aiter:
-            assert not no_combine, f"{no_combine=} is not supported."
+            if no_combine:
+                # AITER fused_moe doesn't support no_combine; fall through to Triton
+                return None
             if self.block_quant:
                 return fused_moe(
                     x,

@@ -793,8 +793,11 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
         moe_runner_config = self.moe_runner_config
 
-        if _use_aiter and self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
-            assert not moe_runner_config.no_combine, "unsupported"
+        if (
+            _use_aiter
+            and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and not moe_runner_config.no_combine
+        ):
             topk_weights, topk_ids, _ = topk_output
             if moe_runner_config.apply_router_weight_on_input:
                 assert (

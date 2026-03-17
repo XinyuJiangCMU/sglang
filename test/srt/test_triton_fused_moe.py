@@ -66,7 +66,7 @@ class TestFusedMOE(CustomTestCase):
         topk_weight = topk_weight.view(-1)
         topk_ids = topk_ids.view(-1)
 
-        if w1.dtype == torch.float8_e4m3fn:
+        if w1.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             w1_compute = w1.to(a.dtype)
             w2_compute = w2.to(a.dtype)
         else:

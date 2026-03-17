@@ -111,10 +111,9 @@ def is_hip() -> bool:
 
 
 if is_hip():
-    HIP_FP8_E4M3_FNUZ_MAX = 224.0
-    FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
+    FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fnuz).max  # 240.0
 else:
-    FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+    FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 
 FP8_E4M3_MIN = -FP8_E4M3_MAX
 
@@ -1826,7 +1825,20 @@ def print_info_once(msg: str) -> None:
 
 def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
-        return torch.cuda.get_device_name(device_id)
+        name = torch.cuda.get_device_name(device_id)
+        if not name and is_hip():
+            # Fallback: on some ROCm setups, get_device_name() returns empty.
+            # Use gcnArchName to identify the device.
+            props = torch.cuda.get_device_properties(device_id)
+            arch = getattr(props, "gcnArchName", "")
+            if "gfx942" in arch:
+                return "AMD Instinct MI300X"
+            elif "gfx950" in arch:
+                return "AMD Instinct MI355"
+            elif "gfx1100" in arch:
+                return "AMD Radeon RX 7900 XTX"
+            return f"AMD GPU ({arch.split(':')[0]})" if arch else ""
+        return name
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_name(device_id)

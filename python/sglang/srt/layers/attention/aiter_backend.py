@@ -1108,9 +1108,14 @@ class AiterAttnBackend(AttentionBackend):
                     else:
                         o = torch.empty_like(q)
 
+                    # mla_prefill_asm_fwd only supports BF16 Q/KV
+                    kv_for_prefill = K_Buffer
+                    if self.kv_cache_dtype == fp8_dtype:
+                        kv_for_prefill = K_Buffer.to(q.dtype)
+
                     mla_prefill_fwd(
                         q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                        K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                        kv_for_prefill.view(-1, 1, 1, layer.qk_head_dim),
                         o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         qo_indptr,
                         kv_indptr,
@@ -1290,6 +1295,14 @@ class AiterAttnBackend(AttentionBackend):
                 dtype = q.dtype
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
+                # set_kv_buffer divides by k_scale/v_scale before FP8 cast,
+                # so we must multiply back when scales are non-trivial
+                k_sf = getattr(layer, "k_scale_float", None)
+                v_sf = getattr(layer, "v_scale_float", None)
+                if k_sf is not None and k_sf != 1.0:
+                    k_cache = k_cache * layer.k_scale
+                if v_sf is not None and v_sf != 1.0:
+                    v_cache = v_cache * layer.v_scale
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1392,12 +1405,17 @@ class AiterAttnBackend(AttentionBackend):
                 layer.layer_id
             )
 
-            # TODO kkhuang-amd need to remove it when paged_attention_ragged support fp8-kv
-            if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
+            # paged_attention_ragged natively supports FP8 KV cache
+            # via kv_cache_dtype="fp8" with k_scale/v_scale dequantization
+            kv_dtype_str = (
+                "fp8" if self.kv_cache_dtype == fp8_dtype else "auto"
+            )
 
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
+            # Use layer-level scales for correct FP8 dequantization.
+            # set_kv_buffer divides by k_scale before FP8 cast;
+            # paged_attention_ragged multiplies by k_scale to dequantize.
+            k_scale = layer.k_scale if layer.k_scale is not None else self.k_scale
+            v_scale = layer.v_scale if layer.v_scale is not None else self.v_scale
 
             paged_attention_ragged(
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1412,11 +1430,11 @@ class AiterAttnBackend(AttentionBackend):
                 1,
                 self.max_num_partitions,
                 None,
-                "auto",
+                kv_dtype_str,
                 "NHD",
                 self.logits_soft_cap,
-                self.k_scale,
-                self.v_scale,
+                k_scale,
+                v_scale,
                 None,
                 _AITER_PARTITION_SIZE_ROCM,
             )

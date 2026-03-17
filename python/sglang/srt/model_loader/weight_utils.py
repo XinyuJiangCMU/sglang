@@ -1165,9 +1165,9 @@ class KVCacheQuantSchema(BaseModel):
 
     @model_validator(mode="after")
     def check_is_fp8(self) -> "KVCacheQuantSchema":
-        assert self.dtype == "float8_e4m3fn", (
+        assert self.dtype in ("float8_e4m3fn", "float8_e4m3fnuz"), (
             "Loaded scaling factors intended for KV cache dtype = "
-            f"{self.dtype} rather than float8_e4m3fn!"
+            f"{self.dtype} rather than float8_e4m3fn/float8_e4m3fnuz!"
         )
         return self
 

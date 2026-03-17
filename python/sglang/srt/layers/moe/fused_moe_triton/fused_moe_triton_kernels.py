@@ -619,8 +619,9 @@ def invoke_fused_moe_kernel(
     if use_fp8_w8a8:
         assert B_scale is not None
         if block_shape is None:
-            # activation tensor-wise fp8 quantization, dynamic or static
-            padded_size = padding_size
+            # Infer actual padding from dimensions rather than global padding_size,
+            # because AITER path and tests may not pad weights.
+            padded_size = B.shape[2] - A.shape[1]
             # activations apply per-token quantization when weights apply per-channel quantization by default
             A, A_scale = scaled_fp8_quant(
                 A, A_scale, use_per_token_if_dynamic=per_channel_quant

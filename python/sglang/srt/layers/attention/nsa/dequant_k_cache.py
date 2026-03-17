@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.nsa.utils import NSA_DEQUANT_K_CACHE_FAST
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
 
 def dequantize_k_cache(quant_k_cache):
@@ -81,7 +82,7 @@ def _dequantize_k_cache_fast_wrapped(
 def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
     num_tokens, dim_quant = quant_k_cache.shape
 
-    assert quant_k_cache.dtype == torch.float8_e4m3fn
+    assert quant_k_cache.dtype == fp8_dtype
     dim_nope = 512
     dim_rope = 64
     num_tiles = dim_nope // group_size
@@ -192,7 +193,7 @@ def dequantize_k_cache_paged(
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
     # Index bounds validated in nsa_backend.init_forward_metadata
     num_tokens = page_table_1_flattened.shape[0]
-    assert quant_k_cache.dtype == torch.float8_e4m3fn
+    assert quant_k_cache.dtype == fp8_dtype
     dim_nope = 512
     dim_rope = 64
     num_tiles = dim_nope // group_size  # 512 // 128 = 4

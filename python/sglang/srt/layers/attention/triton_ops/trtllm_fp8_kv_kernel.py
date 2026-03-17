@@ -462,7 +462,9 @@ def _naive_fp8_set_kv_buffer(
     store_dtype = k_cache.dtype
     if store_dtype == torch.uint8:
         # Cache is stored as uint8 for FP8 (due to index_put limitation)
-        dtype = torch.float8_e4m3fn  # Logical dtype
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        dtype = fp8_dtype  # Logical dtype (e4m3fn on CUDA, e4m3fnuz on MI300X)
     else:
         dtype = store_dtype  # Cache dtype is the logical dtype
 
@@ -482,7 +484,7 @@ def _naive_fp8_set_kv_buffer(
         v = v.to(dtype)
 
     # View FP8 as uint8 if needed (for index_put compatibility)
-    if store_dtype == torch.uint8 and dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+    if store_dtype == torch.uint8 and dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
         k = k.view(torch.uint8)
         v = v.view(torch.uint8)
 

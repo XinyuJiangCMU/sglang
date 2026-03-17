@@ -1105,9 +1105,12 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             if "embed_tokens" in name or "lm_head" in name:
                 old_fp8_data.copy_(new_param.data)
                 new_param.data = old_fp8_data
-            elif (
-                new_param.dtype == torch.float8_e4m3fn
-                and old_fp8_data.dtype == torch.float8_e4m3fn
+            elif new_param.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ) and old_fp8_data.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
             ):
                 # FP8: Use strided view for transposed storage
                 strided_data = torch.as_strided(

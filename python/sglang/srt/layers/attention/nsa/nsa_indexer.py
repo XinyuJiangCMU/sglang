@@ -8,6 +8,7 @@ from einops import rearrange
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 global _use_multi_stream
@@ -412,7 +413,7 @@ class Indexer(CustomOp):
             q_offset += extend_seq_len
             k_offset += seq_len
 
-        k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
+        k_fp8 = torch.cat(k_fp8_list, dim=0).view(fp8_dtype)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
         ks = torch.cat(ks_list, dim=0)
@@ -647,7 +648,7 @@ class Indexer(CustomOp):
                 actual_seq_q_list.append(actual_seq_q)
                 batch_idx_list.append(batch_idx)
 
-            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
+            k_fp8 = torch.cat(k_fp8_list, dim=0).view(fp8_dtype)
             k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
             kv_fp8 = (k_fp8, k_scale)
             ks = torch.cat(ks_list, dim=0)
@@ -687,7 +688,7 @@ class Indexer(CustomOp):
                 block_tables[0],
             )
 
-            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+            k_fp8 = k_fp8.view(fp8_dtype)
             k_scale = k_scale.view(torch.float32).squeeze(-1)
             kv_fp8 = (k_fp8, k_scale)
             ks = torch.full((actual_seq_q,), offset, dtype=torch.int32, device="cuda")
@@ -779,7 +780,7 @@ class Indexer(CustomOp):
                 block_tables[i],
             )
 
-            k_fp8 = k_fp8.view(torch.float8_e4m3fn).unsqueeze(0).contiguous()
+            k_fp8 = k_fp8.view(fp8_dtype).unsqueeze(0).contiguous()
             k_scale = k_scale.view(torch.float32).squeeze(-1).unsqueeze(0).contiguous()
 
             index_score = fp8_index(

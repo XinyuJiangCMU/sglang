@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
@@ -356,7 +358,7 @@ def _set_k_and_s_triton(
 
     assert buf.dtype == torch.uint8
     assert loc.dtype == torch.int64, f"{loc.dtype=}"  # can be int32
-    assert index_k.dtype == torch.float8_e4m3fn
+    assert index_k.dtype == fp8_dtype
     assert index_k_scale.dtype == torch.float32
 
     assert buf.is_contiguous()
@@ -364,7 +366,7 @@ def _set_k_and_s_triton(
     assert index_k.is_contiguous()
     assert index_k_scale.is_contiguous()
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    buf_fp8 = buf.view(fp8_dtype)
     buf_fp32 = buf.view(torch.float32)
 
     _set_k_and_s_triton_kernel[(num_tokens_to_write,)](

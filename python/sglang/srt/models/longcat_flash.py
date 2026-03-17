@@ -756,12 +756,17 @@ class LongcatFlashForCausalLM(nn.Module):
                         )
                         if _is_hip:
                             self_attn.w_scale *= 2.0
+                    # Pre-dequantize FP8 weights to bf16 on ROCm and CPU to avoid
+                    # runtime cast+scale overhead in the BMM hot path.
+                    if _is_hip and w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+                        self_attn.w_kc = (
+                            self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
+                        )
+                        self_attn.w_vc = (
+                            self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
+                        )
                     # TODO: remove this after adding FP8 support in bmm cpu kernel
-                    if (
-                        _is_cpu
-                        and _is_cpu_amx_available
-                        and w.dtype == torch.float8_e4m3fn
-                    ):
+                    if _is_cpu and _is_cpu_amx_available and w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
                         self_attn.w_kc = (
                             self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
                         )

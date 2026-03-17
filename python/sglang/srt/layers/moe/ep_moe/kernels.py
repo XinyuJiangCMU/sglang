@@ -3,15 +3,19 @@ import logging
 import torch
 import triton
 
-from sglang.srt.utils import ceil_div, is_cuda
+from sglang.srt.utils import ceil_div, is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 if _is_cuda:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8 as per_token_group_quant_fp8,
     )
+
+# Use platform-appropriate FP8 dtype for finfo queries
+_fp8_dtype = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 import triton.language as tl
 
@@ -378,7 +382,7 @@ def silu_and_mul_masked_post_quant_fwd(
     """
 
     assert input.is_contiguous()
-    assert output.dtype == torch.float8_e4m3fn
+    assert output.dtype == _fp8_dtype
     assert output.is_contiguous()
     assert len(input.shape) == 3
     assert input.shape[0] == masked_m.shape[0]
@@ -406,7 +410,7 @@ def silu_and_mul_masked_post_quant_fwd(
         expert_num,
     )
 
-    finfo = torch.finfo(torch.float8_e4m3fn)
+    finfo = torch.finfo(_fp8_dtype)
     fp8_max = finfo.max
     fp8_min = -fp8_max
 
@@ -1347,7 +1351,7 @@ def silu_and_mul_masked_post_per_tensor_quant_fwd(
     """
     assert input.is_contiguous()
     assert output.is_contiguous()
-    assert output.dtype == torch.float8_e4m3fn
+    assert output.dtype == _fp8_dtype
     assert input.ndim == 3
     assert input.shape[0] == masked_m.shape[0]
     assert input.shape[-1] % 2 == 0
@@ -1363,7 +1367,7 @@ def silu_and_mul_masked_post_per_tensor_quant_fwd(
     hidden_dim_split_block_num = triton.cdiv(inner_dim, BLOCK_N)
 
     grid = (hidden_dim_split_block_num, BLOCK_M, expert_num)
-    finfo = torch.finfo(torch.float8_e4m3fn)
+    finfo = torch.finfo(_fp8_dtype)
     fp8_max = finfo.max
     fp8_min = -fp8_max
 

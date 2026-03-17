@@ -6,7 +6,12 @@ import torch
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype,
+    fp8_max as FP8_MAX,
+    fp8_min as FP8_MIN,
+    scaled_fp8_quant,
+)
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
@@ -108,20 +113,19 @@ class TestW8A8FP8FusedMoE(CustomTestCase):
         torch.manual_seed(seed)
         # Initialize int8 quantization parameters
         factor_for_scale = 1e-2
-        finfo = torch.finfo(torch.float8_e4m3fn)
-        fp8_max = finfo.max
-        fp8_min = finfo.min
+        fp8_max = FP8_MAX
+        fp8_min = FP8_MIN
 
         # Input tensor
         # M * K
         a = torch.randn((M, K), dtype=dtype) / 10
 
-        # Generate int8 weights
+        # Generate fp8 weights
         w1_fp32 = (torch.rand((E, 2 * N, K), dtype=torch.float32) - 0.5) * 2
-        w1 = (w1_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+        w1 = (w1_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(fp8_dtype)
 
         w2_fp32 = (torch.rand((E, K, N), dtype=torch.float32) - 0.5) * 2
-        w2 = (w2_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+        w2 = (w2_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(fp8_dtype)
 
         # Generate scale for each column (per-column quantization)
         w1_s = torch.rand(E, 2 * N, device=w1_fp32.device) * factor_for_scale

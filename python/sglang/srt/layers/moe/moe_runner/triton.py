@@ -300,16 +300,27 @@ class TritonRunnerCore(MoeRunnerCore):
                         routed_scaling_factor,
                     )
         elif _is_hip:
-            if _use_aiter:
-                moe_sum(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states,
-                )
+            if topk_ids.shape[1] == 1 and routed_scaling_factor == 1.0:
+                pass  # we write directly into out_hidden_states
+            elif topk_ids.shape[1] == 2 and routed_scaling_factor == 1.0:
+                torch.add(
+                    intermediate_cache3[:, 0],
+                    intermediate_cache3[:, 1],
+                    out=out_hidden_states,
+                ).squeeze(dim=1)
             else:
-                vllm_ops.moe_sum(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states,
-                )
+                if _use_aiter:
+                    moe_sum(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states,
+                    )
+                else:
+                    vllm_ops.moe_sum(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states,
+                    )
+                if routed_scaling_factor != 1.0:
+                    out_hidden_states.mul_(routed_scaling_factor)
         else:
             vllm_ops.moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),

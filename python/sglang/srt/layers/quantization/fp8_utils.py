@@ -622,11 +622,7 @@ def block_quant_to_tensor_quant(
         for j in range(n_tiles):
             x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
 
-    x_q_tensor, scale = (
-        scaled_fp8_quant(x_dq_block)
-        if _is_cuda
-        else input_to_float8(x_dq_block, dtype=x_q_block.dtype)
-    )
+    x_q_tensor, scale = scaled_fp8_quant(x_dq_block)
     return x_q_tensor, scale
 
 
@@ -844,11 +840,7 @@ def channel_quant_to_tensor_quant(
     x_s: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     x_dq_channel = x_q_channel.to(torch.float32) * x_s
-    x_q_tensor, scale = (
-        scaled_fp8_quant(x_dq_channel)
-        if _is_cuda
-        else input_to_float8(x_dq_channel, dtype=x_q_channel.dtype)
-    )
+    x_q_tensor, scale = scaled_fp8_quant(x_dq_channel)
     return x_q_tensor, scale
 
 
@@ -1102,20 +1094,25 @@ def apply_fp8_ptpc_linear(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
 
-    # weight is transposed (K, N)
-    output_shape = [*input.shape[:-1], weight.shape[1]]
-
-    q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
-
     per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
-    per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
 
-    if not (per_tensor_weights and per_tensor_activations):
-        # weight is in (N, K)
+    if per_tensor_weights:
+        # weight is transposed (K, N)
+        output_shape = [*input.shape[:-1], weight.shape[1]]
+    else:
+        # weight is in (N, K) shuffled layout
         output_shape = [*input.shape[:-1], weight.shape[0]]
 
+    if input_scale is not None:
+        # Input is already quantized (e.g., from fused RMSNorm+Quant)
+        q_input = input_2d
+        x_scale = input_scale
+    else:
+        q_input, x_scale = scaled_fp8_quant(input_2d, use_per_token_if_dynamic=True)
+
+    out_dtype = torch.bfloat16 if input_scale is not None else input.dtype
     output = aiter.gemm_a8w8_bpreshuffle(
-        q_input, weight, x_scale, weight_scale, None, input.dtype
+        q_input, weight, x_scale, weight_scale, None, out_dtype
     )
     if bias is not None:
         output = output + bias
