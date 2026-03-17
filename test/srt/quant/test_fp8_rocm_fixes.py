@@ -496,5 +496,77 @@ class TestFP8EdgeCases(unittest.TestCase):
         self.assertEqual(out.shape, (M, N))
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestFP8PerformanceSanity(unittest.TestCase):
+    """Sanity check FP8 performance on AMD to catch regressions."""
+
+    def test_aiter_gemm_latency(self):
+        """AITER per-channel GEMM should complete in < 50us for M=1."""
+        import time
+
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            per_token_group_quant_fp8,
+        )
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
+
+        try:
+            from aiter.ops.shuffle import shuffle_weight
+        except ImportError:
+            self.skipTest("AITER shuffle_weight not available")
+
+        M, N, K = 1, 2560, 2560
+        W = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        qW, ws = per_token_group_quant_fp8(W, K)
+        ws = ws.t().contiguous()
+        W_s = shuffle_weight(qW.contiguous(), (16, 16))
+
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+
+        # Warmup
+        for _ in range(20):
+            apply_fp8_ptpc_linear(
+                x, W_s, ws, None, None, use_per_token_if_dynamic=True
+            )
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(100):
+            apply_fp8_ptpc_linear(
+                x, W_s, ws, None, None, use_per_token_if_dynamic=True
+            )
+        torch.cuda.synchronize()
+        us = (time.perf_counter() - t0) / 100 * 1e6
+
+        self.assertLess(
+            us,
+            50.0,
+            f"AITER GEMM latency {us:.1f}us exceeds 50us threshold",
+        )
+
+    def test_quant_latency(self):
+        """FP8 per-token quant should complete in < 20us for M=1."""
+        import time
+
+        from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+
+        x = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16)
+
+        for _ in range(20):
+            scaled_fp8_quant(x, use_per_token_if_dynamic=True)
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(200):
+            scaled_fp8_quant(x, use_per_token_if_dynamic=True)
+        torch.cuda.synchronize()
+        us = (time.perf_counter() - t0) / 200 * 1e6
+
+        self.assertLess(
+            us,
+            20.0,
+            f"FP8 quant latency {us:.1f}us exceeds 20us threshold",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
