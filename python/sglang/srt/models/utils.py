@@ -26,7 +26,7 @@ from sglang.jit_kernel.utils import register_jit_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_cuda_alike
 
 if TYPE_CHECKING:
     from sglang.srt.layers.layernorm import RMSNorm
