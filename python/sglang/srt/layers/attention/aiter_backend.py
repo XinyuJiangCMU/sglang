@@ -1284,11 +1284,43 @@ class AiterAttnBackend(AttentionBackend):
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
         else:
+            # Non-MLA (standard MHA) prefill path
+            bs0 = forward_batch.batch_size + 1
+
+            # Fast path: for pure prefill (no prefix cache), use flash_attn_varlen_func
+            # which is 1.5-1.7x faster than mha_batch_prefill_func on MI300X.
+            extend_no_prefix = (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
+                and not any(forward_batch.extend_prefix_lens_cpu)
+                and k is not None
+                and self.kv_cache_dtype != fp8_dtype
+            )
+
+            if extend_no_prefix:
+                q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                k_3d = k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_3d = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
+
+                o = flash_attn_varlen_func(
+                    q_3d,
+                    k_3d,
+                    v_3d,
+                    self.qo_indptr[:bs0],
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_q_len,
+                    causal=True,
+                    softmax_scale=layer.scaling,
+                    logits_soft_cap=self.logits_soft_cap or 0.0,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+            # Fallback: paged KV cache attention (for prefix-cached or FP8 KV)
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
-
-            bs0 = forward_batch.batch_size + 1
 
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
