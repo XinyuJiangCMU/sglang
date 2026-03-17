@@ -33,7 +33,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
-    is_cuda,
+    is_cuda, is_cuda_alike,
     is_hip,
     is_npu,
     is_xpu,

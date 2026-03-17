@@ -17,7 +17,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
     is_blackwell,
-    is_cuda,
+    is_cuda, is_cuda_alike,
     is_hip,
     is_npu,
     print_info_once,

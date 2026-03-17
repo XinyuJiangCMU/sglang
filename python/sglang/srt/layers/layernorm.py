@@ -30,7 +30,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
-    is_cuda,
+    is_cuda, is_cuda_alike,
     is_flashinfer_available,
     is_hip,
     is_npu,

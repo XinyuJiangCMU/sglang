@@ -54,7 +54,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_compiler_backend,
     is_cpu,
-    is_cuda,
+    is_cuda, is_cuda_alike,
     is_hip,
     is_npu,
 )

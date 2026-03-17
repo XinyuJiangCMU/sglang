@@ -52,7 +52,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
-    is_cuda,
+    is_cuda, is_cuda_alike,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,

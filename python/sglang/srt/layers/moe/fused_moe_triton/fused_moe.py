@@ -19,7 +19,7 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     is_cpu,
-    is_cuda,
+    is_cuda, is_cuda_alike,
     is_hip,
 )
 
