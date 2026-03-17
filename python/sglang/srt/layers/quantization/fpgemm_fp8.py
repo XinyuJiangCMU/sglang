@@ -10,6 +10,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
@@ -127,7 +128,7 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition,
-                dtype=torch.float8_e4m3fn,
+                dtype=fp8_dtype,
             ),
             input_dim=1,
             output_dim=0,
