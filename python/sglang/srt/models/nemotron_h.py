@@ -69,7 +69,7 @@ from sglang.srt.utils import (
 )
 from sglang.utils import logger
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 
 
 class NemotronHMLP(nn.Module):

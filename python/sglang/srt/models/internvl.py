@@ -38,10 +38,10 @@ from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_cuda_alike
 from sglang.utils import logger
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 
 
 class InternAttention(nn.Module):

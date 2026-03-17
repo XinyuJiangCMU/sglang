@@ -16,9 +16,9 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
 )
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.utils import is_cuda, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_cuda_alike, is_npu, is_xpu
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 if not (_is_npu or _is_xpu):

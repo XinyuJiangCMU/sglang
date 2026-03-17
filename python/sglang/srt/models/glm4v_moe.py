@@ -23,10 +23,10 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
+from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, is_cuda_alike, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _device_sm = get_device_sm()
 
 logger = logging.getLogger(__name__)

@@ -25,7 +25,7 @@ from sglang.srt.layers.quantization.utils import (
     pack_cols,
     unpack_cols,
 )
-from sglang.srt.utils import get_device_capability, is_cuda
+from sglang.srt.utils import get_device_capability, is_cuda, is_cuda_alike
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
@@ -40,7 +40,7 @@ except ImportError:
 
 from sglang.srt.utils import direct_register_custom_op
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 
 if _is_cuda:
     from sgl_kernel import gptq_marlin_gemm

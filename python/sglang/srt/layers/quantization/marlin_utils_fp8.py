@@ -13,9 +13,9 @@ from sglang.srt.layers.quantization.marlin_utils import (
     should_use_atomic_add_reduce,
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_cuda_alike
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 if _is_cuda:
     from sgl_kernel import gptq_marlin_gemm, gptq_marlin_repack
 

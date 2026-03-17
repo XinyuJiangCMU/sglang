@@ -15,14 +15,14 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttn
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_cuda_alike
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 if _is_cuda:
     from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
 

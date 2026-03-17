@@ -38,7 +38,7 @@ from sglang.srt.utils import (
     supports_custom_op,
 )
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
 _is_npu = is_npu()

@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()

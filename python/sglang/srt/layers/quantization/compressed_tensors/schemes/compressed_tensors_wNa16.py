@@ -38,9 +38,9 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_cuda_alike
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 
 if _is_cuda:
     from sgl_kernel import gptq_marlin_repack

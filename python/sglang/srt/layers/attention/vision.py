@@ -27,7 +27,7 @@ from sglang.srt.utils.multi_stream_utils import (
     with_multi_stream,
 )
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_npu = is_npu()
 _is_hip = is_hip()
 

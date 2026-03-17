@@ -4,11 +4,11 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_cuda_alike, is_hip
 
 logger = logging.getLogger(__name__)
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_hip = is_hip()
 
 IS_CUSTOM_AR_AVAILABLE = _is_cuda or _is_hip

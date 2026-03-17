@@ -87,7 +87,6 @@ Qwen3MoeConfig = None
 _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
-_is_cuda = is_cuda_alike()
 _is_npu = is_npu()
 
 if _is_npu:

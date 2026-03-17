@@ -17,9 +17,9 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_cuda_alike
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 

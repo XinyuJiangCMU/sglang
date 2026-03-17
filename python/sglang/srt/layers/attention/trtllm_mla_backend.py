@@ -25,7 +25,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda, is_flashinfer_available, is_float4_e2m1fn_x2
+from sglang.srt.utils import is_cuda, is_cuda_alike, is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
     import flashinfer
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 
 if _is_cuda:
     from sgl_kernel import concat_mla_absorb_q

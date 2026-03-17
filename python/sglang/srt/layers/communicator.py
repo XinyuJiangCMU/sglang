@@ -61,7 +61,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
 )
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()

@@ -85,7 +85,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 
 _is_hip = is_hip()
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()

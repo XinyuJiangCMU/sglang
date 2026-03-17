@@ -8,9 +8,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_device_name, is_cuda
+from sglang.srt.utils import get_device_name, is_cuda, is_cuda_alike
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 if _is_cuda:
     # Temporary
     try:

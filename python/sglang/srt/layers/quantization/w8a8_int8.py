@@ -33,7 +33,7 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 

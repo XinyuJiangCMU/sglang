@@ -5,9 +5,9 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
-from sglang.srt.utils import is_cuda, is_sm90_supported
+from sglang.srt.utils import is_cuda, is_cuda_alike, is_sm90_supported
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 if _is_cuda:
     from sgl_kernel import (
         apply_shuffle_mul_sum,
