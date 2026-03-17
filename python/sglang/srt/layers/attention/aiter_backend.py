@@ -1289,13 +1289,15 @@ class AiterAttnBackend(AttentionBackend):
 
             # Fast path: for pure prefill (no prefix cache), use flash_attn_varlen_func
             # which is 1.5-1.7x faster than mha_batch_prefill_func on MI300X.
+            # This also avoids the expensive FP8 KV cache dequant workaround
+            # when kv_cache_dtype is FP8, since K/V here are fresh BF16 tensors
+            # from the QKV projection (not yet written to FP8 cache).
             extend_no_prefix = (
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
                 and not any(forward_batch.extend_prefix_lens_cpu)
                 and k is not None
-                and self.kv_cache_dtype != fp8_dtype
             )
 
             if extend_no_prefix:
