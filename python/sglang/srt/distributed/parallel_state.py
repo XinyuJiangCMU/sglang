@@ -371,10 +371,12 @@ class GroupCoordinator:
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
+                tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
                 CAClass = dispatch_custom_allreduce()
                 self.ca_comm = CAClass(
                     group=self.cpu_group,
                     device=self.device,
+                    enable_register_for_capturing=not tms_cudagraph,
                 )
             except Exception as e:
                 logger.warning(
