@@ -28,9 +28,9 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.utils import get_bool_env_var, is_cuda
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_cuda_alike
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 logger = logging.getLogger(__name__)

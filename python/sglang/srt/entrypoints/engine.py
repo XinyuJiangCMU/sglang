@@ -75,6 +75,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_zmq_socket,
     is_cuda,
+    is_cuda_alike,
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
@@ -88,7 +89,7 @@ from sglang.version import __version__
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 
 
 def init_tokenizer_manager(

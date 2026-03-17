@@ -55,7 +55,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_cuda_alike, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 _is_npu = is_npu()
 
 
