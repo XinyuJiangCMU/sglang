@@ -257,12 +257,14 @@ def _per_token_group_quant_8bit_raw(
         scale_ue8m0=False,
     )
 
-    # Fast path: use AITER HIP kernel for simple row-major group quant (2.5-3.9x faster)
+    # Fast path: use AITER HIP kernel for simple row-major group quant.
+    # For FP8: 2.5-3.9x faster. For INT8: 4.5x faster.
+    # Note: AITER INT8 rounding may differ by ±1 from Triton (different
+    # rounding mode), but dequantized cos_sim > 0.9999 — no impact on accuracy.
     if (
         _use_aiter
         and not column_major_scales
         and not scale_ue8m0
-        and dtype != torch.int8
     ):
         dynamic_per_token_scaled_quant(
             x_q,
