@@ -31,7 +31,7 @@ from sglang.srt.utils import is_cuda
 if TYPE_CHECKING:
     from sglang.srt.layers.layernorm import RMSNorm
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""

@@ -55,12 +55,12 @@ from sglang.srt.utils import (
     add_prefix,
     fast_topk,
     get_compiler_backend,
-    is_cuda,
+    is_cuda, is_cuda_alike,
     make_layers,
 )
 from sglang.srt.utils.common import get_current_device_stream_fast
 
-_is_cuda = is_cuda()
+_is_cuda = is_cuda_alike()
 
 logger = logging.getLogger(__name__)
 
