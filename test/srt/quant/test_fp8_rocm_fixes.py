@@ -330,6 +330,45 @@ class TestAITERPerChannelGEMM(unittest.TestCase):
         self.assertTrue(out.data_ptr() == buf.data_ptr(), "Output should reuse buffer")
         self.assertEqual(out.dtype, fp8_dtype)
 
+    def test_pre_quantized_input(self):
+        """Test apply_fp8_ptpc_linear with pre-quantized FP8 input."""
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            fp8_dtype,
+            per_token_group_quant_fp8,
+            scaled_fp8_quant,
+        )
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
+
+        try:
+            from aiter import rmsnorm2d_fwd_with_dynamicquant
+            from aiter.ops.shuffle import shuffle_weight
+        except ImportError:
+            self.skipTest("AITER not available")
+
+        M, N, K = 4, 2560, 2560
+        W = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        qw, ws = per_token_group_quant_fp8(W, W.shape[-1])
+        ws_stored = ws.t().contiguous()
+        qw_shuffled = shuffle_weight(qw.contiguous(), (16, 16))
+        rms_weight = torch.ones(K, device="cuda", dtype=torch.bfloat16)
+
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+
+        # Fused RMSNorm + FP8 Quant
+        x_fp8 = torch.empty(M, K, device="cuda", dtype=fp8_dtype)
+        x_scale = torch.empty(M, 1, device="cuda", dtype=torch.float32)
+        rmsnorm2d_fwd_with_dynamicquant(x_fp8, x, x_scale, rms_weight, 1e-6)
+
+        # Pre-quantized path
+        out = apply_fp8_ptpc_linear(
+            x_fp8, qw_shuffled, ws_stored,
+            input_scale=x_scale,
+            use_per_token_if_dynamic=True,
+        )
+        self.assertEqual(out.shape, (M, N))
+        self.assertFalse(out.isnan().any().item())
+        self.assertTrue(out.isfinite().all().item())
+
 
 if __name__ == "__main__":
     unittest.main()
