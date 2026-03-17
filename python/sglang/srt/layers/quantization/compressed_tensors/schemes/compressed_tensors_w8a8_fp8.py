@@ -183,7 +183,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 layer.weight = Parameter(weight.t(), requires_grad=False)
 
             # required by torch.compile to be torch.nn.Parameter
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            # .data to strip custom Parameter subclass (e.g. ChannelQuantScaleParameter)
+            layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False

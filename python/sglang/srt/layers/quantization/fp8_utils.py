@@ -118,6 +118,10 @@ def normalize_e4m3fn_to_e4m3fnuz(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    # If weight is already e4m3fnuz (e.g. allocated with fp8_dtype on AMD),
+    # no conversion needed — just return as-is.
+    if weight.dtype == torch.float8_e4m3fnuz:
+        return weight, weight_scale, input_scale
     assert weight.dtype == torch.float8_e4m3fn
     # The bits pattern 10000000(-128) represents zero in e4m3fn
     # but NaN in e4m3fnuz. So here we set it to 0.
