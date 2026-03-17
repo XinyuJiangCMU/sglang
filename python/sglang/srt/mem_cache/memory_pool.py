@@ -55,7 +55,20 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu, next_power_of_2
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    try:
+        from aiter import reshape_and_cache_flash as _aiter_reshape_and_cache
+
+        _has_aiter_cache = True
+    except ImportError:
+        _has_aiter_cache = False
+else:
+    _has_aiter_cache = False
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -870,6 +883,49 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        # AITER fast path: fused reshape_and_cache_flash for KV cache write.
+        # Up to 5x faster for FP8 (fuses BF16->FP8 quant + scale + write).
+        # Up to 1.8x faster for BF16 (fuses scatter write).
+        if (
+            _has_aiter_cache
+            and self.store_dtype == self.dtype
+            and cache_k.dim() == 2  # [num_tokens, num_heads * head_dim]
+        ):
+            import torch
+
+            layer_idx = layer_id - self.start_layer
+            k_buf = self.k_buffer[layer_idx]
+            v_buf = self.v_buffer[layer_idx]
+
+            # reshape_and_cache_flash expects:
+            #   key/value: [num_tokens, num_heads, head_dim]
+            #   cache: [num_blocks, block_size, num_heads, head_dim]
+            num_heads = k_buf.shape[-2] if k_buf.dim() >= 2 else 1
+            head_dim = k_buf.shape[-1]
+            num_tokens = cache_k.shape[0]
+
+            k_3d = cache_k.view(num_tokens, num_heads, head_dim)
+            v_3d = cache_v.view(num_tokens, num_heads, -1)
+            k_4d = k_buf.view(-1, 1, num_heads, head_dim)
+            v_4d = v_buf.view(-1, 1, num_heads, v_3d.shape[-1])
+
+            kv_dtype_str = "fp8" if self.dtype != cache_k.dtype else "auto"
+            ks = torch.tensor(
+                k_scale if k_scale is not None else 1.0,
+                device=cache_k.device,
+                dtype=torch.float32,
+            )
+            vs = torch.tensor(
+                v_scale if v_scale is not None else 1.0,
+                device=cache_v.device,
+                dtype=torch.float32,
+            )
+
+            _aiter_reshape_and_cache(
+                k_3d, v_3d, k_4d, v_4d, loc.long(), kv_dtype_str, ks, vs
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
