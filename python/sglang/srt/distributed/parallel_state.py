@@ -373,11 +373,12 @@ class GroupCoordinator:
             try:
                 tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
                 CAClass = dispatch_custom_allreduce()
-                self.ca_comm = CAClass(
-                    group=self.cpu_group,
-                    device=self.device,
-                    enable_register_for_capturing=not tms_cudagraph,
-                )
+                # AiterCustomAllreduce doesn't support enable_register_for_capturing
+                import inspect
+                ca_kwargs = {"group": self.cpu_group, "device": self.device}
+                if "enable_register_for_capturing" in inspect.signature(CAClass.__init__).parameters:
+                    ca_kwargs["enable_register_for_capturing"] = not tms_cudagraph
+                self.ca_comm = CAClass(**ca_kwargs)
             except Exception as e:
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "
