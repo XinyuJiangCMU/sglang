@@ -2385,7 +2385,16 @@ class ServerArgs:
                     "Cuda graph bs is set to [1] because of using diffusion LLM inference"
                 )
                 self.cuda_graph_bs = [1]
-            if self.attention_backend != "flashinfer":
+            if is_hip():
+                # On AMD/ROCm, flashinfer is not available.
+                # Use aiter backend which supports CUDA graph for DLLM.
+                if self.attention_backend != "aiter":
+                    logger.warning(
+                        "Attention backend is set to aiter for DLLM on ROCm "
+                        "(flashinfer is not available on AMD)"
+                    )
+                    self.attention_backend = "aiter"
+            elif self.attention_backend != "flashinfer":
                 logger.warning(
                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
                 )

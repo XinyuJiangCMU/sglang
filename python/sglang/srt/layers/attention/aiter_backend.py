@@ -118,6 +118,7 @@ class AiterAttnBackend(AttentionBackend):
             get_attention_tp_size()
         )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.server_args = model_runner.server_args
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -906,6 +907,107 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
             )
+        elif forward_mode.is_dllm_extend():
+            # DLLM extend: similar to prefill but with prefix from KV cache.
+            # Each request processes block_size new tokens attending to
+            # seq_lens total tokens (prefix from cache + new tokens).
+            from sglang.srt.dllm.config import DllmConfig
+
+            dllm_config = DllmConfig.from_server_args(
+                self.server_args if hasattr(self, "server_args") else None
+            )
+            block_size = dllm_config.block_size if dllm_config else 32
+
+            # qo_indptr: each request contributes block_size query tokens
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                bs * block_size + 1,
+                step=block_size,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+            max_q_len = block_size
+
+            if self.use_mla:
+                if _use_mla_ps_kernel:
+                    num_kv_splits = self.max_split_per_batch
+                    self.make_mla_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        self.work_metadata,
+                        self.work_info_set,
+                        self.work_indptr,
+                        self.reduce_indptr,
+                        self.reduce_final_map,
+                        self.reduce_partial_map,
+                        max_q_len,
+                        fast_mode=fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=intra_batch_mode,
+                    )
+                    work_metadata = self.work_metadata
+                    work_info_set = self.work_info_set
+                    work_indptr = self.work_indptr
+                    reduce_indptr = self.reduce_indptr
+                    reduce_final_map = self.reduce_final_map
+                    reduce_partial_map = self.reduce_partial_map
+                else:
+                    work_metadata = None
+                    work_info_set = None
+                    work_indptr = None
+                    reduce_indptr = None
+                    reduce_final_map = None
+                    reduce_partial_map = None
+                    num_kv_splits = None
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    kv_indptr[-1].item(),
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                )
+            else:
+                # Non-MLA: use standard prefill metadata
+                prefix_lens = seq_lens - block_size
+                self.indices_updater_prefill.update(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens.sum().item(),
+                    prefix_lens,
+                    encoder_lens=encoder_lens,
+                    spec_info=spec_info,
+                )
+                self.forward_metadata = ForwardMetadata(
+                    self.indices_updater_prefill.kv_indptr,
+                    self.indices_updater_prefill.kv_indices,
+                    None,
+                    None,
+                    self.indices_updater_prefill.max_q_len,
+                    self.indices_updater_prefill.max_kv_len,
+                )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -969,6 +1071,36 @@ class AiterAttnBackend(AttentionBackend):
             accept_lens = spec_info.accept_length[:bs]
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+        elif forward_mode.is_dllm_extend():
+            from sglang.srt.dllm.config import DllmConfig
+
+            dllm_config = DllmConfig.from_server_args(
+                self.server_args if hasattr(self, "server_args") else None
+            )
+            block_size = dllm_config.block_size if dllm_config else 32
+
+            seq_lens = seq_lens[:bs]
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                bs * block_size + 1,
+                step=block_size,
+                dtype=torch.int32,
+                device=self.device,
+            )
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
