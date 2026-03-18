@@ -463,6 +463,13 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             assert gate == 1
             residual_output = residual + x
         elif isinstance(gate, torch.Tensor):
+            # Cast gate to x.dtype if they differ to avoid a large [B,S,C] FP32
+            # intermediate when gate is FP32 and x is BF16 (~2.3x faster residual
+            # op on MI300X). Keeping gate in BF16 also enables the AITER BF16
+            # layernorm path in FP32LayerNorm, saving ~0.28ms/block × 300 blocks
+            # ≈ 83ms per request for Wan2.1 at S=32760.
+            if gate.dtype != x.dtype:
+                gate = gate.to(x.dtype)
             if gate.dim() == 4:
                 # gate.shape: [batch_size, num_frames, 1, inner_dim]
                 num_frames = gate.shape[1]
