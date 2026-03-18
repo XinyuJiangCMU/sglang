@@ -863,7 +863,16 @@ class ServerArgs:
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
         if current_platform.is_rocm():
-            default_backend = AttentionBackendEnum.AITER.name.lower()
+            try:
+                import aiter  # noqa: F401
+
+                default_backend = AttentionBackendEnum.AITER.name.lower()
+            except ImportError:
+                logger.warning(
+                    "'aiter' package not found on ROCm. "
+                    "Defaulting to torch_sdpa backend instead of aiter."
+                )
+                default_backend = AttentionBackendEnum.TORCH_SDPA.name.lower()
             self.attention_backend = default_backend
             logger.info(
                 "Attention backend not specified. Using '%s' by default on ROCm "

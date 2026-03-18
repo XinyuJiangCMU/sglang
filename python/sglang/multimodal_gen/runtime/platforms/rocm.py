@@ -112,7 +112,15 @@ class RocmPlatform(Platform):
                     "Falling back to Torch SDPA backend.",
                     dtype,
                 )
-                # TODO: need to compare triton with sdpa as an alternative backend
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+
+            try:
+                import aiter  # noqa: F401
+            except ImportError:
+                logger.warning(
+                    "AITer backend requested but 'aiter' package is not installed. "
+                    "Falling back to Torch SDPA backend."
+                )
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
             logger.info("Using AITer backend on ROCm.")
