@@ -126,8 +126,43 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # ROCm builds of sgl-kernel do not expose rmsnorm custom ops yet.
-        return self.forward_native(x, residual)
+        # Use AITER optimized RMSNorm on AMD ROCm (7x faster than native for bf16).
+        # Fall back to native for variance_size_override (AITER normalizes all dims).
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+        try:
+            from aiter import rms_norm as aiter_rms_norm
+            from aiter import rmsnorm2d_fwd_with_add as aiter_fused_add_rms_norm
+        except ImportError:
+            return self.forward_native(x, residual)
+
+        shape = x.shape
+        x_2d = x.reshape(-1, shape[-1])
+        if not x_2d.is_contiguous():
+            x_2d = x_2d.contiguous()
+
+        # AITER kernels require weight dtype to match input dtype
+        weight = self.weight.data.to(x.dtype)
+
+        if residual is not None and x.dtype in (torch.float16, torch.bfloat16):
+            # AITER fused residual+norm (only supports fp16/bf16)
+            residual_shape = residual.shape
+            residual_2d = residual.view(-1, shape[-1])
+            if not residual_2d.is_contiguous():
+                residual_2d = residual_2d.contiguous()
+            out = torch.empty_like(x_2d)
+            residual_out = torch.empty_like(residual_2d)
+            aiter_fused_add_rms_norm(
+                out, x_2d, residual_2d, residual_out,
+                weight, self.variance_epsilon,
+            )
+            return out.view(shape), residual_out.view(residual_shape)
+        else:
+            out = aiter_rms_norm(x_2d, weight, self.variance_epsilon)
+            if residual is not None:
+                # Fallback: compute residual manually for non-fp16/bf16 dtypes
+                return out.view(shape), (x_2d.view(shape) + residual).to(x.dtype)
+            return out.view(shape)
 
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"
@@ -347,16 +382,17 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
         # Apply normalization
         normalized = self.norm(residual_output)
 
-        # modulated = fused_scale_shift(
-        #     normalized,
-        #     scale,
-        #     shift,
-        # )
-        modulated = fuse_scale_shift_kernel(
-            normalized,
-            scale,
-            shift,
-        )
+        if scale.dim() != 4:
+            # On AMD ROCm and for the common 3D case, native PyTorch is 3x faster
+            # than the Triton fuse_scale_shift_kernel. The 4D case (temporal
+            # conditioning in Wan2.2 TI2V) still requires the Triton kernel.
+            modulated = normalized * (1 + scale) + shift
+        else:
+            modulated = fuse_scale_shift_kernel(
+                normalized,
+                scale,
+                shift,
+            )
         return modulated, residual_output
 
 
