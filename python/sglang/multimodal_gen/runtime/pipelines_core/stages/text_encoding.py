@@ -7,6 +7,10 @@ Prompt encoding stages for diffusion pipelines.
 This module contains implementations of prompt encoding stages for diffusion pipelines.
 """
 
+import hashlib
+from collections import OrderedDict
+from typing import Optional
+
 import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
@@ -36,6 +40,10 @@ class TextEncodingStage(PipelineStage):
     expected by the diffusion model.
     """
 
+    # LRU cache sizes
+    _MAX_PROMPT_CACHE = 32
+    _MAX_NEG_CACHE = 8
+
     def __init__(self, text_encoders, tokenizers) -> None:
         """
         Initialize the prompt encoding stage.
@@ -44,6 +52,27 @@ class TextEncodingStage(PipelineStage):
         super().__init__()
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
+        # LRU caches for prompt/negative embeddings to avoid re-encoding
+        # identical text across requests. Keys are MD5 hashes of the text.
+        self._prompt_cache: OrderedDict = OrderedDict()
+        self._neg_cache: OrderedDict = OrderedDict()
+
+    def _text_hash(self, text: str) -> str:
+        return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+    def _lru_get(self, cache: OrderedDict, key: str) -> Optional[tuple]:
+        if key not in cache:
+            return None
+        cache.move_to_end(key)
+        return cache[key]
+
+    def _lru_put(self, cache: OrderedDict, key: str, value: tuple, max_size: int) -> None:
+        if key in cache:
+            cache.move_to_end(key)
+        else:
+            if len(cache) >= max_size:
+                cache.popitem(last=False)
+            cache[key] = value
 
     @torch.no_grad()
     def forward(
@@ -72,12 +101,35 @@ class TextEncodingStage(PipelineStage):
 
         all_indices: list[int] = list(range(len(self.text_encoders)))
 
-        prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
-            prompt_text,
-            server_args,
-            encoder_index=all_indices,
-            return_attention_mask=True,
+        # Check prompt embedding cache
+        prompt_key = self._text_hash(
+            prompt_text if isinstance(prompt_text, str) else str(prompt_text)
         )
+        cached_prompt = self._lru_get(self._prompt_cache, prompt_key)
+        if cached_prompt is not None:
+            logger.debug("Text encoding cache hit for positive prompt.")
+            prompt_embeds_list, prompt_masks_list, pooler_embeds_list = cached_prompt
+            # Clone tensors to avoid mutations from downstream stages
+            prompt_embeds_list = [t.clone() for t in prompt_embeds_list]
+            prompt_masks_list = [t.clone() for t in prompt_masks_list]
+            pooler_embeds_list = [t.clone() for t in pooler_embeds_list]
+        else:
+            prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
+                prompt_text,
+                server_args,
+                encoder_index=all_indices,
+                return_attention_mask=True,
+            )
+            self._lru_put(
+                self._prompt_cache,
+                prompt_key,
+                (
+                    [t.clone() for t in prompt_embeds_list],
+                    [t.clone() for t in prompt_masks_list],
+                    [t.clone() for t in pooler_embeds_list],
+                ),
+                self._MAX_PROMPT_CACHE,
+            )
 
         for pe in prompt_embeds_list:
             batch.prompt_embeds.append(pe)
@@ -91,12 +143,33 @@ class TextEncodingStage(PipelineStage):
         # Encode negative prompt if CFG is enabled
         if batch.do_classifier_free_guidance:
             assert isinstance(batch.negative_prompt, str)
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
-                batch.negative_prompt,
-                server_args,
-                encoder_index=all_indices,
-                return_attention_mask=True,
-            )
+
+            # Check negative prompt embedding cache
+            neg_key = self._text_hash(batch.negative_prompt)
+            cached_neg = self._lru_get(self._neg_cache, neg_key)
+            if cached_neg is not None:
+                logger.debug("Text encoding cache hit for negative prompt.")
+                neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = cached_neg
+                neg_embeds_list = [t.clone() for t in neg_embeds_list]
+                neg_masks_list = [t.clone() for t in neg_masks_list]
+                neg_pooler_embeds_list = [t.clone() for t in neg_pooler_embeds_list]
+            else:
+                neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
+                    batch.negative_prompt,
+                    server_args,
+                    encoder_index=all_indices,
+                    return_attention_mask=True,
+                )
+                self._lru_put(
+                    self._neg_cache,
+                    neg_key,
+                    (
+                        [t.clone() for t in neg_embeds_list],
+                        [t.clone() for t in neg_masks_list],
+                        [t.clone() for t in neg_pooler_embeds_list],
+                    ),
+                    self._MAX_NEG_CACHE,
+                )
 
             assert batch.negative_prompt_embeds is not None
 
