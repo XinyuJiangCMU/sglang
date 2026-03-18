@@ -54,6 +54,7 @@ sources = [
     "csrc/speculative/eagle_utils.cu",
     "csrc/kvcacheio/transfer.cu",
     "csrc/elementwise/pos_enc.cu",
+    "csrc/elementwise/rope.hip",
 ]
 
 cxx_flags = ["-O3"]

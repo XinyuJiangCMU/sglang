@@ -215,6 +215,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
    * From csrc/elementwise
    */
   m.def(
+      "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor cos_sin_cache, "
+      "Tensor pos_ids, bool interleave, bool enable_pdl, "
+      "Tensor? v, Tensor? k_buffer, Tensor? v_buffer, Tensor? kv_cache_loc) -> ()");
+  m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
+
+  m.def(
       "rotary_embedding(Tensor positions, Tensor! query,"
       "                 Tensor!? key, int head_size,"
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
