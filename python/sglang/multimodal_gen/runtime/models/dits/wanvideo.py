@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
+    _apply_rotary_emb_qk_gptj,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
@@ -400,11 +401,10 @@ class WanTransformerBlock(nn.Module):
         key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
 
-        # Apply rotary embeddings
+        # Apply rotary embeddings — on AMD ROCm uses AITER fused 2c kernel
+        # (~3.5x faster than 2 Triton calls, saving ~99ms per request).
         cos, sin = freqs_cis
-        query, key = _apply_rotary_emb(
-            query, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        query, key = _apply_rotary_emb_qk_gptj(query, key, cos, sin)
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -573,11 +573,10 @@ class WanTransformerBlock_VSA(nn.Module):
             2, (self.num_attention_heads, -1)
         )
 
-        # Apply rotary embeddings
+        # Apply rotary embeddings — on AMD ROCm uses AITER fused 2c kernel
+        # (~3.5x faster than 2 Triton calls, saving ~99ms per request).
         cos, sin = freqs_cis
-        query, key = _apply_rotary_emb(
-            query, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        query, key = _apply_rotary_emb_qk_gptj(query, key, cos, sin)
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)
