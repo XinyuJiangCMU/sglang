@@ -138,6 +138,22 @@ class RocmPlatform(Platform):
                 f"Invalid attention backend for {cls.device_name}: {selected_backend}"
             )
 
+        # On ROCm, prefer AITER for fp16/bf16 — benchmarked 1.39x faster than
+        # flash_attn for Wan2.1 seq_len=32760 (saves ~1.7s per 5-step request).
+        if dtype in (torch.float16, torch.bfloat16):
+            try:
+                import aiter  # noqa: F401
+
+                logger.info(
+                    "Using AITer backend on ROCm (default for fp16/bf16, "
+                    "1.39x faster than flash_attn at Wan2.1 sequence lengths)."
+                )
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+            except ImportError:
+                logger.info(
+                    "aiter package not found, falling back to FlashAttention/SDPA."
+                )
+
         target_backend = AttentionBackendEnum.FA
         if dtype not in (torch.float16, torch.bfloat16):
             logger.info(
