@@ -176,6 +176,23 @@ class DenoisingStage(PipelineStage):
             )
             return
 
+        # Use SGLANG_CACHE_DIT_INIT_STEPS to override the step count used for
+        # cache-dit initialization. This ensures optimal caching configuration
+        # regardless of which request first triggers initialization.
+        # Without this, the first qualifying request's step count locks in the
+        # cache-dit config, which may be suboptimal for subsequent requests with
+        # different step counts.
+        init_steps = envs.SGLANG_CACHE_DIT_INIT_STEPS
+        if init_steps is not None:
+            if num_inference_steps != init_steps:
+                logger.info(
+                    "Overriding num_inference_steps=%d with SGLANG_CACHE_DIT_INIT_STEPS=%d "
+                    "for cache-dit initialization.",
+                    num_inference_steps,
+                    init_steps,
+                )
+            num_inference_steps = init_steps
+
         from sglang.multimodal_gen.runtime.distributed import (
             get_sp_group,
             get_tp_group,

@@ -49,6 +49,13 @@ if TYPE_CHECKING:
     # For low step counts (e.g., 5), cache-dit overhead exceeds savings.
     # Default: 10 (skip CACHE_DIT for steps < 10)
     SGLANG_CACHE_DIT_MIN_STEPS: int = 10
+    # Override the num_inference_steps used to initialize cache-dit.
+    # By default, cache-dit is initialized with the first request's step count,
+    # and subsequent requests with different step counts use that configuration.
+    # Set this to match the expected deployment step count (e.g., 50) to ensure
+    # optimal cache-dit configuration regardless of which request initializes it.
+    # None means use the first qualifying request's step count (default behavior).
+    SGLANG_CACHE_DIT_INIT_STEPS: int | None = None
     # cache-dit env vars (secondary transformer, e.g., Wan2.2 low-noise expert)
     SGLANG_CACHE_DIT_SECONDARY_FN: int = 1
     SGLANG_CACHE_DIT_SECONDARY_BN: int = 0
@@ -276,6 +283,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # For low step counts (e.g., 5), cache-dit overhead exceeds savings.
     # Set to 0 to disable this guard. Default: 10.
     "SGLANG_CACHE_DIT_MIN_STEPS": _lazy_int("SGLANG_CACHE_DIT_MIN_STEPS", 10),
+    # Override num_inference_steps for cache-dit initialization.
+    # Ensures optimal caching config regardless of first request's step count.
+    # Set to expected deployment step count (e.g., 50 for 50-step inference).
+    "SGLANG_CACHE_DIT_INIT_STEPS": _lazy_int("SGLANG_CACHE_DIT_INIT_STEPS"),
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
