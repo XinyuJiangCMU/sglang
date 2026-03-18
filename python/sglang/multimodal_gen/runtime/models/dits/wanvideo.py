@@ -354,6 +354,7 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        crossattn_cache: dict | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -416,9 +417,10 @@ class WanTransformerBlock(nn.Module):
             orig_dtype
         ), hidden_states.to(orig_dtype)
 
-        # 2. Cross-attention
+        # 2. Cross-attention (text KV cached after first step to skip redundant projections)
         attn_output = self.attn2(
-            norm_hidden_states, context=encoder_hidden_states, context_lens=None
+            norm_hidden_states, context=encoder_hidden_states, context_lens=None,
+            crossattn_cache=crossattn_cache,
         )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
@@ -531,6 +533,7 @@ class WanTransformerBlock_VSA(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        crossattn_cache: dict | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -583,9 +586,10 @@ class WanTransformerBlock_VSA(nn.Module):
             orig_dtype
         ), hidden_states.to(orig_dtype)
 
-        # 2. Cross-attention
+        # 2. Cross-attention (text KV cached after first step to skip redundant projections)
         attn_output = self.attn2(
-            norm_hidden_states, context=encoder_hidden_states, context_lens=None
+            norm_hidden_states, context=encoder_hidden_states, context_lens=None,
+            crossattn_cache=crossattn_cache,
         )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
@@ -695,6 +699,17 @@ class WanTransformer3DModel(CachableDiT):
         self.cnt = 0
         self.__post_init__()
 
+        # Per-block KV caches for cross-attention: text conditioning is constant
+        # across denoising steps, so we skip to_k/to_v projections after step 0.
+        # Two cache sets: one for positive CFG pass, one for negative CFG pass.
+        num_blocks = len(self.blocks)
+        self._crossattn_caches_pos = [
+            {"is_init": False, "k": None, "v": None} for _ in range(num_blocks)
+        ]
+        self._crossattn_caches_neg = [
+            {"is_init": False, "k": None, "v": None} for _ in range(num_blocks)
+        ]
+
         # misc
         self.sp_size = get_sp_world_size()
 
@@ -799,6 +814,19 @@ class WanTransformer3DModel(CachableDiT):
             timestep_proj=timestep_proj, temb=temb
         )
 
+        # Select cross-attention KV cache set (positive vs negative CFG pass).
+        # Reset both caches at the start of each new request (timestep 0).
+        forward_ctx = get_forward_context()
+        if forward_ctx.current_timestep == 0:
+            for c in self._crossattn_caches_pos:
+                c["is_init"] = False
+            for c in self._crossattn_caches_neg:
+                c["is_init"] = False
+        is_cfg_negative = getattr(forward_ctx.forward_batch, "is_cfg_negative", False)
+        crossattn_caches = (
+            self._crossattn_caches_neg if is_cfg_negative else self._crossattn_caches_pos
+        )
+
         if should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
         else:
@@ -819,11 +847,13 @@ class WanTransformer3DModel(CachableDiT):
                             encoder_hidden_states,
                             timestep_proj,
                             freqs_cis,
+                            crossattn_cache=crossattn_caches[i],
                         )
             else:
-                for block in self.blocks:
+                for i, block in enumerate(self.blocks):
                     hidden_states = block(
-                        hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                        hidden_states, encoder_hidden_states, timestep_proj, freqs_cis,
+                        crossattn_cache=crossattn_caches[i],
                     )
             # if teacache is enabled, we need to cache the original hidden states
             if enable_teacache:
