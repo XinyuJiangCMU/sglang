@@ -990,23 +990,30 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
             else:
-                # Non-MLA: use standard prefill metadata
-                prefix_lens = seq_lens - block_size
-                self.indices_updater_prefill.update(
+                # Non-MLA DLLM: set up metadata using the same tensors
+                # that init_forward_metadata_replay_cuda_graph will update.
+                # This ensures CUDA graph capture and replay use the same
+                # underlying tensor references.
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
                     req_pool_indices,
                     seq_lens,
-                    seq_lens.sum().item(),
-                    prefix_lens,
-                    encoder_lens=encoder_lens,
-                    spec_info=spec_info,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
                 )
+
                 self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
                     None,
-                    None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    block_size,
+                    kv_indptr[-1].item(),
                 )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
