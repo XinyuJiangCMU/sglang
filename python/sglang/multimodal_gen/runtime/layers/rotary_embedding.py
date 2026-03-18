@@ -67,14 +67,6 @@ def apply_flashinfer_rope_qk_inplace(
     if head_size != d:
         raise ValueError(f"head_size mismatch: inferred {d}, but head_size={head_size}")
 
-    try:
-        from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
-    except Exception as e:
-        raise RuntimeError(
-            "flashinfer is required for apply_flashinfer_rope_qk_inplace. "
-            "Please install flashinfer or disable this optimization."
-        ) from e
-
     if positions is None:
         pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
         positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
@@ -92,17 +84,33 @@ def apply_flashinfer_rope_qk_inplace(
 
     positions = positions.to(q.device, non_blocking=True)
 
-    q_flat = q.reshape(bsz * seqlen, nheads * d).contiguous()
-    k_flat = k.reshape(bsz * seqlen, nheads * d).contiguous()
-    apply_rope_with_cos_sin_cache_inplace(
-        positions=positions,
-        query=q_flat,
-        key=k_flat,
-        head_size=d,
-        cos_sin_cache=cos_sin_cache,
-        is_neox=is_neox,
+    try:
+        from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+        q_flat = q.reshape(bsz * seqlen, nheads * d).contiguous()
+        k_flat = k.reshape(bsz * seqlen, nheads * d).contiguous()
+        apply_rope_with_cos_sin_cache_inplace(
+            positions=positions,
+            query=q_flat,
+            key=k_flat,
+            head_size=d,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=is_neox,
+        )
+        return q_flat.view(bsz, seqlen, nheads, d), k_flat.view(bsz, seqlen, nheads, d)
+    except Exception:
+        pass
+
+    # AMD ROCm fallback: FlashInfer not available; use AITER fused RoPE or Triton.
+    # cos_sin_cache is [max_S, D] with cos in [:, :D//2] and sin in [:, D//2:].
+    cos = cos_sin_cache[positions, : d // 2].view(bsz, seqlen, d // 2)  # [B, S, D//2]
+    sin = cos_sin_cache[positions, d // 2 :].view(bsz, seqlen, d // 2)  # [B, S, D//2]
+    # _apply_rotary_emb_qk_gptj handles BSHD layout with AITER on ROCm.
+    return _apply_rotary_emb_qk_gptj(q, k, cos[0], sin[0]) if bsz == 1 else (
+        apply_rotary_embedding(q.flatten(0, 1), cos.flatten(0, 1), sin.flatten(0, 1),
+                               interleaved=not is_neox).view(bsz, seqlen, nheads, d),
+        apply_rotary_embedding(k.flatten(0, 1), cos.flatten(0, 1), sin.flatten(0, 1),
+                               interleaved=not is_neox).view(bsz, seqlen, nheads, d),
     )
-    return q_flat.view(bsz, seqlen, nheads, d), k_flat.view(bsz, seqlen, nheads, d)
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
