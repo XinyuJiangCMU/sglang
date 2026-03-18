@@ -1436,6 +1436,10 @@ class AiterAttnBackend(AttentionBackend):
                 if v_sf is not None and v_sf != 1.0:
                     v_cache = v_cache * layer.v_scale
 
+            # DLLM uses bidirectional attention (causal=False) for iterative
+            # parallel decoding — each iteration refines all tokens simultaneously.
+            is_causal = not forward_batch.forward_mode.is_dllm_extend()
+
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
@@ -1445,7 +1449,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata.kv_indices,
                 self.forward_metadata.max_q_len,
                 self.forward_metadata.max_kv_len,
-                causal=True,
+                causal=is_causal,
                 logits_soft_cap=self.logits_soft_cap,
                 alibi_slopes=None,
                 return_lse=False,
