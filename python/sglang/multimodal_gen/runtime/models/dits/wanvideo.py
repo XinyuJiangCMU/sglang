@@ -385,9 +385,10 @@ class WanTransformerBlock(nn.Module):
         # 1. Self-attention
         # Pass hidden_states directly (without .float()) so FP32LayerNorm can
         # use AITER BF16 layernorm on AMD ROCm (~5x faster than FP32 path).
-        # scale_msa/shift_msa are FP32, so type promotion gives FP32 product.
+        # Cast FP32 scale_msa/shift_msa to BF16 before the large [B,S,C]
+        # multiply to avoid a 200MB FP32 intermediate (~2.4x faster).
         norm1 = self.norm1(hidden_states)
-        norm_hidden_states = (norm1 * (1 + scale_msa) + shift_msa).to(orig_dtype)
+        norm_hidden_states = norm1 * (1 + scale_msa).to(orig_dtype) + shift_msa.to(orig_dtype)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
@@ -552,10 +553,11 @@ class WanTransformerBlock_VSA(nn.Module):
         # 1. Self-attention
         # Pass hidden_states directly (without .float()) so FP32LayerNorm can
         # use AITER BF16 layernorm on AMD ROCm (~5x faster than FP32 path).
-        # scale_msa/shift_msa are FP32, so type promotion gives FP32 product.
+        # Cast FP32 scale_msa/shift_msa to BF16 before the large [B,S,C]
+        # multiply to avoid a 200MB FP32 intermediate (~2.4x faster).
         norm_hidden_states = (
-            self.norm1(hidden_states) * (1 + scale_msa) + shift_msa
-        ).to(orig_dtype)
+            self.norm1(hidden_states) * (1 + scale_msa).to(orig_dtype) + shift_msa.to(orig_dtype)
+        )
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)

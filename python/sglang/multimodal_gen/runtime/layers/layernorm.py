@@ -480,7 +480,15 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             # On AMD ROCm and for the common 3D case, native PyTorch is 3x faster
             # than the Triton fuse_scale_shift_kernel. The 4D case (temporal
             # conditioning in Wan2.2 TI2V) still requires the Triton kernel.
-            modulated = normalized * (1 + scale) + shift
+            #
+            # When normalized is BF16 (from AITER layernorm) and scale/shift are
+            # FP32, cast to normalized.dtype first to avoid a large [B,S,C] FP32
+            # intermediate (~2x faster; saves ~50ms per request on MI300X).
+            if normalized.dtype != scale.dtype:
+                modulated = (normalized * (1 + scale).to(normalized.dtype)
+                             + shift.to(normalized.dtype))
+            else:
+                modulated = normalized * (1 + scale) + shift
         else:
             modulated = fuse_scale_shift_kernel(
                 normalized,
