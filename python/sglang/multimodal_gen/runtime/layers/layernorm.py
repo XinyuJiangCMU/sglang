@@ -8,6 +8,24 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Module-level AITER layer_norm cache to avoid repeated import overhead.
+# Shared by FP32LayerNorm and LayerNorm to resolve the forward-declaration order.
+_aiter_layer_norm_fn = None
+_aiter_layer_norm_checked: bool = False
+
+
+def _get_aiter_layer_norm_fn():
+    """Lazily import and return aiter.layer_norm, or None if unavailable."""
+    global _aiter_layer_norm_fn, _aiter_layer_norm_checked
+    if not _aiter_layer_norm_checked:
+        _aiter_layer_norm_checked = True
+        try:
+            import aiter
+            _aiter_layer_norm_fn = aiter.layer_norm
+        except (ImportError, AttributeError):
+            _aiter_layer_norm_fn = None
+    return _aiter_layer_norm_fn
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
@@ -246,6 +264,40 @@ class LayerNorm(CustomOp):
             x = x + self.bias
         return x.to(input_dtype)
 
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # On AMD ROCm, prefer AITER BF16 layernorm over Triton for bf16 inputs.
+        # AITER is ~5x faster than F.layer_norm FP32 and also faster than Triton.
+        if x.dtype == torch.bfloat16:
+            aiter_fn = _get_aiter_layer_norm_fn()
+            if aiter_fn is not None:
+                shape = x.shape
+                x_2d = x.view(-1, self.hidden_size)
+                if not x_2d.is_contiguous():
+                    x_2d = x_2d.contiguous()
+                if self.weight is not None:
+                    w = self.weight.to(x.dtype)
+                    b = self.bias.to(x.dtype) if self.bias is not None else None
+                    if b is None:
+                        b = torch.zeros(self.hidden_size, dtype=x.dtype, device=x.device)
+                else:
+                    w, b = self._get_aiter_id_params(x_2d)
+                return aiter_fn(x_2d, w, b, self.eps).view(shape)
+        return self.forward_cuda(x)
+
+    def _get_aiter_id_params(self, x_2d: torch.Tensor):
+        """Return cached identity weight/bias for elementwise_affine=False."""
+        cache = getattr(self, "_hip_id_cache", None)
+        dev, dtype = x_2d.device, x_2d.dtype
+        if cache is None or cache[0] != dev or cache[1] != dtype:
+            w = torch.ones(self.hidden_size, dtype=dtype, device=dev)
+            b = torch.zeros(self.hidden_size, dtype=dtype, device=dev)
+            self._hip_id_cache = (dev, dtype, w, b)
+            return w, b
+        return cache[2], cache[3]
+
     def forward_cpu(
         self,
         x: torch.Tensor,
@@ -288,22 +340,6 @@ class ScaleResidual(nn.Module):
 # NOTE(will): Needed to match behavior of diffusers and wan2.1 even while using
 # FSDP's MixedPrecisionPolicy
 class FP32LayerNorm(nn.LayerNorm):
-    # Lazily resolved on first call — None means "not yet checked", False means
-    # "aiter unavailable".  Shared across all instances (class-level cache).
-    _aiter_layer_norm_fn = None
-    _aiter_checked: bool = False
-
-    @classmethod
-    def _get_aiter_layer_norm(cls):
-        if not cls._aiter_checked:
-            cls._aiter_checked = True
-            try:
-                import aiter
-                cls._aiter_layer_norm_fn = aiter.layer_norm
-            except (ImportError, AttributeError):
-                cls._aiter_layer_norm_fn = None
-        return cls._aiter_layer_norm_fn
-
     def _get_aiter_identity_params(
         self, n: int, device: torch.device, dtype: torch.dtype
     ):
@@ -327,7 +363,7 @@ class FP32LayerNorm(nn.LayerNorm):
         # Benchmarked: 0.060 ms vs 0.314 ms at [32760, 1536] on MI300X (5.2x).
         # Saves ~152 ms total for 300 blocks (5 steps × 2 CFG × 30 blocks).
         if origin_dtype == torch.bfloat16:
-            aiter_ln = self._get_aiter_layer_norm()
+            aiter_ln = _get_aiter_layer_norm_fn()
             if aiter_ln is not None:
                 shape = inputs.shape
                 n = self.normalized_shape[-1]
