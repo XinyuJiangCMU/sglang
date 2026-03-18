@@ -382,7 +382,10 @@ class WanTransformerBlock(nn.Module):
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm1 = self.norm1(hidden_states.float())
+        # Pass hidden_states directly (without .float()) so FP32LayerNorm can
+        # use AITER BF16 layernorm on AMD ROCm (~5x faster than FP32 path).
+        # scale_msa/shift_msa are FP32, so type promotion gives FP32 product.
+        norm1 = self.norm1(hidden_states)
         norm_hidden_states = (norm1 * (1 + scale_msa) + shift_msa).to(orig_dtype)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
@@ -547,8 +550,11 @@ class WanTransformerBlock_VSA(nn.Module):
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
+        # Pass hidden_states directly (without .float()) so FP32LayerNorm can
+        # use AITER BF16 layernorm on AMD ROCm (~5x faster than FP32 path).
+        # scale_msa/shift_msa are FP32, so type promotion gives FP32 product.
         norm_hidden_states = (
-            self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa
+            self.norm1(hidden_states) * (1 + scale_msa) + shift_msa
         ).to(orig_dtype)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
