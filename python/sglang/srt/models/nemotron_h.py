@@ -65,6 +65,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
     is_cuda,
+    is_cuda_alike,
     make_layers_non_pp,
 )
 from sglang.utils import logger
