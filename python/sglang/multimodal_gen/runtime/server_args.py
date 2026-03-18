@@ -262,7 +262,30 @@ class ServerArgs:
         """
         return self.host is None or self.port is None
 
+    def _has_high_vram(self, threshold_gb: float = 100.0) -> bool:
+        """Returns True if the current GPU has more VRAM than threshold_gb.
+
+        On high-VRAM GPUs (e.g. AMD MI300X at 192 GB), CPU offloading of the
+        text encoder is unnecessary and adds significant latency (~12 s per
+        request for Wan2.1's 21 GB UMT5 encoder).
+        """
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                total_gb = torch.cuda.get_device_properties(0).total_memory / (
+                    1024**3
+                )
+                return total_gb > threshold_gb
+        except Exception:
+            pass
+        return False
+
     def adjust_offload(self):
+        # On high-VRAM GPUs (e.g. AMD MI300X 192 GB), keep the text encoder in
+        # VRAM to avoid repeated CPU↔GPU parameter transfers (~12 s per request).
+        # Users can still force offload via --text-encoder-cpu-offload.
+        high_vram = self._has_high_vram()
         if self.pipeline_config.task_type.is_image_gen():
             logger.info(
                 "Disabling some offloading (except dit, text_encoder) for image generation model"
@@ -277,7 +300,18 @@ class ServerArgs:
                 self.vae_cpu_offload = False
         else:
             self.dit_cpu_offload = True
-            self.text_encoder_cpu_offload = True
+            if self.text_encoder_cpu_offload is None:
+                # On high-VRAM GPUs, keep text encoder in VRAM to avoid
+                # re-loading overhead (saves ~12 s per Wan2.1 request).
+                if high_vram:
+                    logger.info(
+                        "High-VRAM GPU detected (>100 GB). "
+                        "Keeping text encoder in VRAM (disabling CPU offload). "
+                        "Use --text-encoder-cpu-offload to override."
+                    )
+                    self.text_encoder_cpu_offload = False
+                else:
+                    self.text_encoder_cpu_offload = True
             self.image_encoder_cpu_offload = True
             self.vae_cpu_offload = True
 
