@@ -45,6 +45,10 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SCM_COMPUTE_BINS: str | None = None
     SGLANG_CACHE_DIT_SCM_CACHE_BINS: str | None = None
     SGLANG_CACHE_DIT_SCM_POLICY: str = "dynamic"
+    # Minimum number of inference steps required to enable cache-dit.
+    # For low step counts (e.g., 5), cache-dit overhead exceeds savings.
+    # Default: 10 (skip CACHE_DIT for steps < 10)
+    SGLANG_CACHE_DIT_MIN_STEPS: int = 10
     # cache-dit env vars (secondary transformer, e.g., Wan2.2 low-noise expert)
     SGLANG_CACHE_DIT_SECONDARY_FN: int = 1
     SGLANG_CACHE_DIT_SECONDARY_BN: int = 0
@@ -268,6 +272,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_CACHE_DIT_SCM_CACHE_BINS": _lazy_str("SGLANG_CACHE_DIT_SCM_CACHE_BINS"),
     # SCM policy: dynamic or static
     "SGLANG_CACHE_DIT_SCM_POLICY": _lazy_str("SGLANG_CACHE_DIT_SCM_POLICY", "dynamic"),
+    # Minimum number of inference steps required to enable cache-dit.
+    # For low step counts (e.g., 5), cache-dit overhead exceeds savings.
+    # Set to 0 to disable this guard. Default: 10.
+    "SGLANG_CACHE_DIT_MIN_STEPS": _lazy_int("SGLANG_CACHE_DIT_MIN_STEPS", 10),
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"

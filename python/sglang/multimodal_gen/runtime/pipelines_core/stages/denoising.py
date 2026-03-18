@@ -163,6 +163,19 @@ class DenoisingStage(PipelineStage):
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             return
 
+        # Skip cache-dit for low step counts where overhead exceeds savings.
+        # With WARMUP=4, only steps beyond warmup can be cached; at 5 steps
+        # this yields at most 1 cached step while still paying caching overhead.
+        min_steps = envs.SGLANG_CACHE_DIT_MIN_STEPS
+        if min_steps is not None and num_inference_steps < min_steps:
+            logger.info(
+                "Skipping cache-dit: num_inference_steps=%d < SGLANG_CACHE_DIT_MIN_STEPS=%d. "
+                "Set SGLANG_CACHE_DIT_MIN_STEPS=0 to force enable.",
+                num_inference_steps,
+                min_steps,
+            )
+            return
+
         from sglang.multimodal_gen.runtime.distributed import (
             get_sp_group,
             get_tp_group,
