@@ -346,6 +346,9 @@ class RotaryEmbedding(CustomOp):
                 fused_set_kv_buffer_arg is None
             ), "save kv cache is not supported for fallback_rotary_embedding."
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+            # sgl_kernel.rotary_embedding requires int64 positions on ROCm
+            if positions.dtype != torch.int64:
+                positions = positions.to(torch.int64)
             self.fallback_rotary_embedding(
                 positions,
                 query,
