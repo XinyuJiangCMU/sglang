@@ -82,7 +82,9 @@ class WanT2V480PConfig(PipelineConfig):
 
     # Precision for each component
     precision: str = "bf16"
-    vae_precision: str = "fp32"
+    # Use bf16 for VAE decode for ~2x speedup vs fp32 with negligible quality loss.
+    # On MI300X, fp32 VAE decode takes ~7 s; bf16 takes ~3.5 s.
+    vae_precision: str = "bf16"
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
 
     # WanConfig-specific added parameters

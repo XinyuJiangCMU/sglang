@@ -313,7 +313,20 @@ class ServerArgs:
                 else:
                     self.text_encoder_cpu_offload = True
             self.image_encoder_cpu_offload = True
-            self.vae_cpu_offload = True
+            if self.vae_cpu_offload is None:
+                # On high-VRAM GPUs, keep VAE in VRAM too (VAE is ~0.5 GB for Wan2.1).
+                # CPU offload adds ~1-2 s per request for the CPU↔GPU transfer.
+                if high_vram:
+                    logger.info(
+                        "High-VRAM GPU detected (>100 GB). "
+                        "Keeping VAE in VRAM (disabling CPU offload). "
+                        "Use --vae-cpu-offload to override."
+                    )
+                    self.vae_cpu_offload = False
+                else:
+                    self.vae_cpu_offload = True
+            else:
+                pass  # user explicitly set vae_cpu_offload
 
     def __post_init__(self):
         # configure logger before use
