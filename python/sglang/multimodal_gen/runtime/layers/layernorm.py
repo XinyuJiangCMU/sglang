@@ -324,6 +324,11 @@ class ScaleResidual(nn.Module):
     ) -> torch.Tensor:
         """Apply gated residual connection."""
         # x.shape: [batch_size, seq_len, inner_dim]
+        # When gate is FP32 and x/residual are BF16, cast gate to x.dtype to
+        # avoid a large [B,S,C] FP32 intermediate (~2.6x faster on MI300X).
+        # Saves ~70ms per request (300 mlp_residual calls at Wan2.1 seq length).
+        if gate.dtype != x.dtype:
+            gate = gate.to(x.dtype)
         if gate.dim() == 4:
             # gate.shape: [batch_size, num_frames, 1, inner_dim]
             num_frames = gate.shape[1]
