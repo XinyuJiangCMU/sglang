@@ -27,11 +27,11 @@ class TestLLaDA2Mini(CustomTestCase):
             "0.9",
             "--max-running-requests",
             "1",
-            "--attention-backend",
-            "flashinfer",
             "--dllm-algorithm",
             "LowConfidence",  # TODO: Add dLLM configurations
         ]
+        # DLLM attention backend is auto-selected:
+        # flashinfer on NVIDIA, aiter on AMD (set in server_args.py)
 
         cls.process = popen_launch_server(
             cls.model,
