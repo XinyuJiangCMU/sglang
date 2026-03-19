@@ -92,7 +92,7 @@ def _quantize_k_cache_ref(
             )
             .max(dim=-1)
             .values
-            / 448.0
+            / fp8_max
         )  # [num_blocks, block_size]
         result_k_scale_factor[:, :, tile_idx] = cur_scale_factors_inv
 
