@@ -102,6 +102,22 @@ class ArceeMLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """MLP forward with pre-quantized FP8 input for AMD AITER path.
+
+        Uses fp8_input/fp8_scale from the fused RMSNorm+FP8 kernel to call
+        up_proj without redundant per_token_quant (~13µs savings on MI300X).
+        """
+        x, _ = self.up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        x = self.act_fn(x)
+        x, _ = self.down_proj(x)
+        return x
+
 
 class ArceeAttention(nn.Module):
     def __init__(
@@ -293,10 +309,12 @@ class ArceeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Arcee decoder forward with fused add+RMSNorm+FP8 for attention (AMD AITER).
+        """Arcee decoder forward with fused add+RMSNorm+FP8 for attn and MLP (AMD AITER).
 
-        Fuses the input_layernorm add+norm+per_token_quant into a single kernel
-        (~13µs savings per layer on MI300X).
+        Fuses both input_layernorm and post_attention_layernorm add+norm+per_token_quant
+        into single AITER kernels (~13µs savings per norm call on MI300X).
+        ArceeMLP uses ReLU2 activation with a single up_proj (not gated), so
+        FP8 quantization applies directly to the up_proj input.
         """
         # Attention: fused add+RMSNorm+FP8 into qkv_proj
         if residual is None:
@@ -313,10 +331,12 @@ class ArceeDecoderLayer(nn.Module):
             skip_o_reduce=True,
         )
 
-        # MLP: allreduce (TP>1) + standard RMSNorm + MLP
+        # MLP: allreduce (TP>1) + fused add+RMSNorm+FP8 into mlp.up_proj
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        fp8_hs, fp8_scale, residual = self.post_attention_layernorm.forward_aiter_fp8_out(
+            hidden_states, residual
+        )
+        hidden_states = self.mlp._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
         return hidden_states, residual
 
     def forward(

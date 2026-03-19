@@ -2436,7 +2436,7 @@ class TestArceeFusedFP8Path(unittest.TestCase):
         )
 
     def test_arcee_aiter_fp8_fuses_input_layernorm(self):
-        """_forward_aiter_fp8 must call forward_aiter_fp8_out for fused norm+quant."""
+        """_forward_aiter_fp8 must call forward_aiter_fp8_out for both norms."""
         import inspect
         import importlib
         mod = importlib.import_module("sglang.srt.models.arcee")
@@ -2445,6 +2445,32 @@ class TestArceeFusedFP8Path(unittest.TestCase):
             "forward_aiter_fp8_out",
             src,
             "_forward_aiter_fp8 must use forward_aiter_fp8_out for fused norm+FP8",
+        )
+        self.assertIn(
+            "post_attention_layernorm.forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must fuse post_attention_layernorm too",
+        )
+
+    def test_arcee_mlp_has_forward_with_fp8_input(self):
+        """ArceeMLP must have _forward_with_fp8_input for full-layer FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.arcee")
+        self.assertTrue(
+            hasattr(mod.ArceeMLP, "_forward_with_fp8_input"),
+            "ArceeMLP must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_arcee_aiter_fp8_fuses_mlp_via_forward_with_fp8_input(self):
+        """_forward_aiter_fp8 must also fuse the MLP norm and pass FP8 to up_proj."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.arcee")
+        src = inspect.getsource(mod.ArceeDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "_forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must call mlp._forward_with_fp8_input for MLP FP8",
         )
 
     def test_arcee_module_has_use_aiter_flag(self):
