@@ -2113,8 +2113,12 @@ class AiterAttnBackend(AttentionBackend):
                     True,  # causal
                     self.forward_metadata.mask_indptr,
                     self.forward_metadata.max_extend_len,
-                    1.0,  # k_scale
-                    1.0,  # v_scale
+                    layer.k_scale_float
+                    if layer.k_scale_float is not None
+                    else 1.0,
+                    layer.v_scale_float
+                    if layer.v_scale_float is not None
+                    else 1.0,
                     layer.scaling,
                     logit_cap=layer.logit_cap,
                 )
