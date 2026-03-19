@@ -127,6 +127,61 @@ def use_rowwise_torch_scaled_mm():
 
 USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
 
+# Common FP8 per-channel-weight x per-token-activation GEMM shapes (N, K) for
+# popular models that require tuned configs in AITER's bpreshuffle kernel.
+# These shapes cannot use the K%512==0 heuristic path (K mod 512 != 0), so
+# a tuned entry in a8w8_bpreshuffle_tuned_gemm.csv with a K%256==0 kernel is
+# required.  Missing entries fall back to a slow heuristic (~3x slower).
+_AITER_FP8_EXPECTED_GEMM_SHAPES = [
+    # (N, K, description)
+    (3584, 9472, "Qwen2.5-7B/14B down_proj"),
+    (9472, 3584, "Qwen2.5-7B/14B gate_up (TP=2)"),
+    (28672, 4096, "Llama3-8B fused gate_up (TP=1)"),
+    (4096, 28672, "Llama3-8B down_proj (TP=1)"),
+]
+
+
+@lru_cache(maxsize=1)
+def _check_aiter_fp8_gemm_coverage() -> None:
+    """Warn if AITER bpreshuffle GEMM configs are missing for common shapes.
+
+    Shapes with K not divisible by 512 (e.g. K=9472 for Qwen2.5-7B) require
+    an explicit tuned config entry or they fall back to a 3x slower heuristic
+    kernel.  Logs a one-time WARNING for each missing shape and instructs users
+    to run the tune script or set AITER_REBUILD=1 after updating AITER.
+    """
+    if not _use_aiter:
+        return
+    try:
+        import pandas as pd
+        from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE
+
+        df = pd.read_csv(AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE)
+        logger = logging.getLogger(__name__)
+        missing = []
+        for N, K, desc in _AITER_FP8_EXPECTED_GEMM_SHAPES:
+            if len(df[(df["N"] == N) & (df["K"] == K)]) == 0:
+                missing.append((N, K, desc))
+        if missing:
+            msg_lines = [
+                "AITER FP8 GEMM tuned config missing for the following shapes",
+                "(these shapes will use a slower heuristic kernel, ~3x slower):",
+            ]
+            for N, K, desc in missing:
+                msg_lines.append(f"  N={N} K={K}  ({desc})")
+            msg_lines += [
+                "To fix: update AITER's a8w8_bpreshuffle_tuned_gemm.csv with tuned",
+                "configs for these shapes and set AITER_REBUILD=1 before restarting.",
+                "See: python/sglang/srt/layers/quantization/aiter_gemm_tune.py",
+            ]
+            logger.warning("\n".join(msg_lines))
+    except Exception:
+        pass  # Non-fatal: config check is best-effort
+
+
+# Trigger the check once at import time (no-op unless _use_aiter is True).
+_check_aiter_fp8_gemm_coverage()
+
 
 @lru_cache(maxsize=1)
 def cutlass_fp8_supported():
