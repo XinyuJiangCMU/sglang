@@ -976,5 +976,116 @@ class TestFp8LinearMethodPrequantized(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestFBGEMMFp8PrequantizedFix(unittest.TestCase):
+    """Test that FBGEMMFp8LinearMethod.apply() accepts prequantized_fp8 params."""
+
+    def test_apply_signature_has_prequantized_params(self):
+        """FBGEMMFp8LinearMethod.apply() must accept prequantized_fp8 params."""
+        import inspect
+        from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+
+        sig = inspect.signature(FBGEMMFp8LinearMethod.apply)
+        params = list(sig.parameters.keys())
+        self.assertIn(
+            "prequantized_fp8", params,
+            "FBGEMMFp8LinearMethod.apply must accept prequantized_fp8 for fused RMSNorm+FP8 path",
+        )
+        self.assertIn(
+            "prequantized_fp8_scale", params,
+            "FBGEMMFp8LinearMethod.apply must accept prequantized_fp8_scale",
+        )
+
+    def test_apply_forwards_prequantized_to_ptpc(self):
+        """FBGEMMFp8LinearMethod.apply() must forward prequantized args to apply_fp8_ptpc_linear."""
+        import inspect
+        from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+
+        src = inspect.getsource(FBGEMMFp8LinearMethod.apply)
+        self.assertIn(
+            "prequantized_fp8=prequantized_fp8", src,
+            "FBGEMMFp8LinearMethod.apply must pass prequantized_fp8 to apply_fp8_ptpc_linear",
+        )
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestLayerCommunicatorFP8Methods(unittest.TestCase):
+    """Test LayerCommunicator FP8 fused-norm methods."""
+
+    def test_prepare_mlp_fp8_out_exists(self):
+        """LayerCommunicator must have prepare_mlp_fp8_out method."""
+        from sglang.srt.layers.communicator import LayerCommunicator
+
+        self.assertTrue(
+            hasattr(LayerCommunicator, "prepare_mlp_fp8_out"),
+            "LayerCommunicator must have prepare_mlp_fp8_out for Qwen3/DeepSeek fused FP8 path",
+        )
+
+    def test_prepare_attn_fp8_out_exists(self):
+        """LayerCommunicator must have prepare_attn_fp8_out method."""
+        from sglang.srt.layers.communicator import LayerCommunicator
+
+        self.assertTrue(
+            hasattr(LayerCommunicator, "prepare_attn_fp8_out"),
+            "LayerCommunicator must have prepare_attn_fp8_out for Qwen3/DeepSeek fused FP8 path",
+        )
+
+    def test_prepare_mlp_fp8_out_signature(self):
+        """prepare_mlp_fp8_out should accept (hidden_states, residual, forward_batch)."""
+        import inspect
+        from sglang.srt.layers.communicator import LayerCommunicator
+
+        sig = inspect.signature(LayerCommunicator.prepare_mlp_fp8_out)
+        params = list(sig.parameters.keys())
+        self.assertIn("hidden_states", params)
+        self.assertIn("residual", params)
+        self.assertIn("forward_batch", params)
+
+    def test_prepare_attn_fp8_out_signature(self):
+        """prepare_attn_fp8_out should accept (hidden_states, residual, forward_batch, ...)."""
+        import inspect
+        from sglang.srt.layers.communicator import LayerCommunicator
+
+        sig = inspect.signature(LayerCommunicator.prepare_attn_fp8_out)
+        params = list(sig.parameters.keys())
+        self.assertIn("hidden_states", params)
+        self.assertIn("residual", params)
+        self.assertIn("forward_batch", params)
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestQwen3FusedFP8Path(unittest.TestCase):
+    """Test Qwen3DecoderLayer fused FP8 path detection."""
+
+    def test_qwen3_aiter_fp8_check_includes_w8a8fp8(self):
+        """Qwen3DecoderLayer._aiter_fp8 check must include W8A8Fp8LinearMethod."""
+        import inspect
+        import importlib
+        qwen3_mod = importlib.import_module("sglang.srt.models.qwen3")
+        src = inspect.getsource(qwen3_mod.Qwen3DecoderLayer.__init__)
+        self.assertIn(
+            "W8A8Fp8LinearMethod", src,
+            "Qwen3DecoderLayer must check W8A8Fp8LinearMethod for _aiter_fp8",
+        )
+
+    def test_qwen3_has_forward_aiter_fp8(self):
+        """Qwen3DecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        qwen3_mod = importlib.import_module("sglang.srt.models.qwen3")
+        self.assertTrue(
+            hasattr(qwen3_mod.Qwen3DecoderLayer, "_forward_aiter_fp8"),
+            "Qwen3DecoderLayer must have _forward_aiter_fp8 for AMD AITER optimization",
+        )
+
+    def test_qwen3_attention_has_forward_with_fp8_input(self):
+        """Qwen3Attention must have _forward_with_fp8_input method."""
+        import importlib
+        qwen3_mod = importlib.import_module("sglang.srt.models.qwen3")
+        self.assertTrue(
+            hasattr(qwen3_mod.Qwen3Attention, "_forward_with_fp8_input"),
+            "Qwen3Attention must have _forward_with_fp8_input for AMD AITER optimization",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
