@@ -4251,5 +4251,146 @@ class TestSarvamMoEFusedFP8Path(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestGemma3FP8AiterPath(unittest.TestCase):
+    """Verify Gemma3 FP8 AITER path implementation structure."""
+
+    def test_gemma3rmsnorm_has_forward_aiter_fp8_out(self):
+        """Gemma3RMSNorm must have forward_aiter_fp8_out method."""
+        from sglang.srt.layers.layernorm import Gemma3RMSNorm
+
+        self.assertTrue(
+            hasattr(Gemma3RMSNorm, "forward_aiter_fp8_out"),
+            "Gemma3RMSNorm must have forward_aiter_fp8_out method",
+        )
+
+    def test_gemma3rmsnorm_fp8_out_no_residual(self):
+        """Gemma3RMSNorm.forward_aiter_fp8_out should return (fp8, scale, None) without residual."""
+        try:
+            from aiter import rmsnorm2d_fwd_with_dynamicquant
+        except ImportError:
+            self.skipTest("AITER not available")
+
+        from sglang.srt.layers.layernorm import Gemma3RMSNorm
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        dim = 2048
+        norm = Gemma3RMSNorm(dim=dim, eps=1e-6).cuda().to(torch.bfloat16)
+        x = torch.randn(8, dim, device="cuda", dtype=torch.bfloat16)
+
+        fp8_out, fp8_scale, residual = norm.forward_aiter_fp8_out(x)
+
+        self.assertEqual(fp8_out.dtype, fp8_dtype)
+        self.assertEqual(fp8_out.shape, (8, dim))
+        self.assertEqual(fp8_scale.shape, (8, 1))
+        self.assertIsNone(residual)
+        self.assertFalse(fp8_out.to(torch.float32).isnan().any().item())
+
+    def test_gemma3rmsnorm_fp8_out_correctness(self):
+        """Gemma3RMSNorm.forward_aiter_fp8_out output should match reference BF16 norm."""
+        try:
+            from aiter import rmsnorm2d_fwd_with_dynamicquant
+        except ImportError:
+            self.skipTest("AITER not available")
+
+        from sglang.srt.layers.layernorm import Gemma3RMSNorm
+
+        torch.manual_seed(42)
+        dim = 2048
+        norm = Gemma3RMSNorm(dim=dim, eps=1e-6).cuda().to(torch.bfloat16)
+        x = torch.randn(16, dim, device="cuda", dtype=torch.bfloat16)
+
+        # Reference: BF16 norm output
+        ref = norm.forward_native(x)
+
+        # FP8 output + dequantize
+        fp8_out, fp8_scale, _ = norm.forward_aiter_fp8_out(x)
+        dequant = fp8_out.to(torch.float32) * fp8_scale
+
+        cos_sim = torch.nn.functional.cosine_similarity(
+            ref.float().flatten().unsqueeze(0),
+            dequant.flatten().unsqueeze(0),
+        ).item()
+        self.assertGreater(
+            cos_sim, 0.999,
+            f"Gemma3RMSNorm fp8_out cosine_similarity={cos_sim} vs BF16 ref",
+        )
+
+    def test_gemma3_decoder_layer_has_aiter_fp8_attr(self):
+        """Gemma3DecoderLayer must have _aiter_fp8 attribute."""
+        import inspect
+        from sglang.srt.models.gemma3_causal import Gemma3DecoderLayer
+
+        src = inspect.getsource(Gemma3DecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "Gemma3DecoderLayer.__init__ must set self._aiter_fp8",
+        )
+
+    def test_gemma3_decoder_layer_has_forward_aiter_fp8(self):
+        """Gemma3DecoderLayer must have _forward_aiter_fp8 method."""
+        from sglang.srt.models.gemma3_causal import Gemma3DecoderLayer
+
+        self.assertTrue(
+            hasattr(Gemma3DecoderLayer, "_forward_aiter_fp8"),
+            "Gemma3DecoderLayer must have _forward_aiter_fp8 method",
+        )
+
+    def test_gemma3_attention_has_forward_with_fp8_input(self):
+        """Gemma3Attention must have _forward_with_fp8_input method."""
+        from sglang.srt.models.gemma3_causal import Gemma3Attention
+
+        self.assertTrue(
+            hasattr(Gemma3Attention, "_forward_with_fp8_input"),
+            "Gemma3Attention must have _forward_with_fp8_input method",
+        )
+
+    def test_gemma3_mlp_has_forward_with_fp8_input(self):
+        """Gemma3MLP must have _forward_with_fp8_input method."""
+        from sglang.srt.models.gemma3_causal import Gemma3MLP
+
+        self.assertTrue(
+            hasattr(Gemma3MLP, "_forward_with_fp8_input"),
+            "Gemma3MLP must have _forward_with_fp8_input method",
+        )
+
+    def test_gemma3_forward_dispatches_to_aiter_fp8(self):
+        """Gemma3DecoderLayer.forward must dispatch to _forward_aiter_fp8 when _aiter_fp8 is set."""
+        import inspect
+        from sglang.srt.models.gemma3_causal import Gemma3DecoderLayer
+
+        src = inspect.getsource(Gemma3DecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "Gemma3DecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_gemma3_aiter_fp8_uses_forward_aiter_fp8_out(self):
+        """_forward_aiter_fp8 must use input_layernorm.forward_aiter_fp8_out."""
+        import inspect
+        from sglang.srt.models.gemma3_causal import Gemma3DecoderLayer
+
+        src = inspect.getsource(Gemma3DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must call forward_aiter_fp8_out",
+        )
+
+    def test_gemma3_uses_fp8_utils_use_aiter(self):
+        """gemma3_causal.py must import _use_aiter from fp8_utils."""
+        import inspect
+        import sglang.srt.models.gemma3_causal as m
+
+        src = inspect.getsource(m)
+        self.assertIn(
+            "_use_aiter",
+            src,
+            "gemma3_causal.py must import and use _use_aiter",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

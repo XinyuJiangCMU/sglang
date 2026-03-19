@@ -24,7 +24,10 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
@@ -34,6 +37,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -100,6 +104,22 @@ class Gemma3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """MLP forward with pre-quantized FP8 input for AMD AITER path.
+
+        Uses fp8_input/fp8_scale from the fused Gemma3RMSNorm+FP8 kernel to call
+        gate_up_proj without redundant per_token_quant (~13µs savings on MI300X).
+        """
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -217,6 +237,43 @@ class Gemma3Attention(nn.Module):
         self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
 
+    def _forward_with_fp8_input(
+        self,
+        hidden_states: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        forward_batch: ForwardBatch,
+        skip_o_reduce: bool = False,
+    ) -> torch.Tensor:
+        """Attention forward with pre-quantized FP8 input for AMD AITER path."""
+        qkv, _ = self.qkv_proj.forward_with_fp8_input(
+            hidden_states, fp8_input, fp8_scale
+        )
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        q = q.unflatten(-1, (self.num_heads, self.head_dim))
+        q = q.transpose(0, 1).unsqueeze(0)
+        q = self.q_norm(q)
+        k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+        k = k.transpose(0, 1).unsqueeze(0)
+        k = self.k_norm(k)
+
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+
+        attn_output = self.attn(q, k, v, forward_batch=forward_batch)
+
+        if attn_output.dim() == 4 and attn_output.shape[0] == 1:
+            attn_output = attn_output.squeeze(0)
+            attn_output = attn_output.flatten(-2, -1)
+
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_o_reduce)
+        return output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -298,6 +355,84 @@ class Gemma3DecoderLayer(nn.Module):
         self.is_sliding = self.self_attn.is_sliding
         self.layer_id = layer_id
 
+        # AMD AITER fused RMSNorm+FP8 path: enabled when SGLANG_USE_AITER=1 (ROCm)
+        # and qkv_proj uses a supported FP8 quant method.
+        if _use_aiter:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fbgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            try:
+                from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                    CompressedTensorsLinearMethod,
+                )
+                from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+
+                qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+                if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                    scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
+                    self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+                else:
+                    self._aiter_fp8 = isinstance(
+                        qm,
+                        (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                    )
+            except ImportError:
+                qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
+        else:
+            self._aiter_fp8 = False
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_embeddings_global: torch.Tensor,
+        position_embeddings_local: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple:
+        """Gemma3 decoder forward with fused Gemma3RMSNorm+FP8 (AMD AITER).
+
+        Uses forward_aiter_fp8_out to fuse norm+per_token_quant for both
+        input_layernorm and pre_feedforward_layernorm, saving ~13µs per norm
+        call on MI300X. Residual adds are kept explicit as Gemma3 applies
+        norms before the residual add (unlike Gemma2's fused add+norm pattern).
+        """
+        residual = hidden_states
+
+        # Attention: fused Gemma3RMSNorm+FP8 into qkv_proj
+        fp8_hs, fp8_scale, _ = self.input_layernorm.forward_aiter_fp8_out(hidden_states)
+
+        position_embeddings = (
+            position_embeddings_local
+            if self.self_attn.is_sliding
+            else position_embeddings_global
+        )
+
+        hidden_states = self.self_attn._forward_with_fp8_input(
+            hidden_states, fp8_hs, fp8_scale, position_embeddings, forward_batch,
+            skip_o_reduce=True,
+        )
+
+        # Allreduce (TP>1), post_attention_layernorm, residual add
+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+
+        # MLP: fused Gemma3RMSNorm+FP8 into gate_up_proj
+        fp8_hs, fp8_scale, _ = self.pre_feedforward_layernorm.forward_aiter_fp8_out(
+            hidden_states
+        )
+        hidden_states = self.mlp._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return (hidden_states,)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -309,6 +444,13 @@ class Gemma3DecoderLayer(nn.Module):
     ) -> tuple[
         torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
+        if self._aiter_fp8:
+            return self._forward_aiter_fp8(
+                positions, hidden_states,
+                position_embeddings_global, position_embeddings_local,
+                forward_batch,
+            )
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 

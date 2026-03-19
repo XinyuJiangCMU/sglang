@@ -687,5 +687,49 @@ class Gemma3RMSNorm(MultiPlatformOp):
         output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
         return output
 
+    def forward_aiter_fp8_out(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Fused add+Gemma3RMSNorm+FP8 dynamic quantization for AMD AITER path.
+
+        Gemma3RMSNorm uses (1 + weight) scaling, identical to GemmaRMSNorm.
+        Returns (fp8_out, fp8_scale, residual_out) where fp8_out has dtype
+        float8_e4m3fnuz and fp8_scale has shape (M, 1) dtype float32.
+        Only valid when _use_aiter is True (set in __init__).
+        """
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        # Gemma3RMSNorm applies (1 + weight) scaling; pass the effective weight.
+        effective_weight = 1.0 + self.weight.data
+
+        num_tokens = x.shape[0] if x.dim() == 2 else x.view(-1, x.shape[-1]).shape[0]
+        x_2d = x.view(num_tokens, -1)
+        fp8_out = torch.empty_like(x_2d, dtype=fp8_dtype)
+        fp8_scale = torch.empty(num_tokens, 1, device=x.device, dtype=torch.float32)
+
+        if residual is not None:
+            residual_out = torch.empty_like(x_2d)
+            fused_add_rms_norm_fp8(
+                fp8_out,
+                x_2d,
+                residual.view(num_tokens, -1),
+                residual_out,
+                fp8_scale,
+                effective_weight,
+                self.eps,
+            )
+            return fp8_out, fp8_scale, residual_out.view_as(x)
+        else:
+            rms_norm_fp8(
+                fp8_out,
+                x_2d,
+                fp8_scale,
+                effective_weight,
+                self.eps,
+            )
+            return fp8_out, fp8_scale, None
+
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
