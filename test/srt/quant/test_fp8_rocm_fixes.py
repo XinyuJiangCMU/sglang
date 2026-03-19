@@ -2289,6 +2289,32 @@ class TestGlm4FusedFP8Path(unittest.TestCase):
             "_forward_aiter_fp8 must apply post_self_attn_layernorm (GLM4 post-attn norm)",
         )
 
+    def test_glm4_mlp_has_forward_with_fp8_input(self):
+        """Glm4MLP must have _forward_with_fp8_input for full-layer FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4")
+        self.assertTrue(
+            hasattr(mod.Glm4MLP, "_forward_with_fp8_input"),
+            "Glm4MLP must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_glm4_aiter_fp8_fuses_post_attention_layernorm_for_mlp(self):
+        """_forward_aiter_fp8 must fuse post_attention_layernorm for MLP FP8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4")
+        src = inspect.getsource(mod.Glm4DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "post_attention_layernorm.forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must fuse post_attention_layernorm for MLP FP8",
+        )
+        self.assertIn(
+            "mlp._forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must pass FP8 to mlp.gate_up_proj via _forward_with_fp8_input",
+        )
+
     def test_glm4_module_has_use_aiter_flag(self):
         """glm4 module must have _use_aiter module-level flag."""
         import importlib

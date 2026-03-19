@@ -106,6 +106,22 @@ class Glm4MLP(nn.Module):
         )
         return x
 
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """MLP forward with pre-quantized FP8 input for AMD AITER path.
+
+        Uses fp8_input/fp8_scale from the fused RMSNorm+FP8 kernel to call
+        gate_up_proj without redundant per_token_quant (~13µs savings on MI300X).
+        """
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
 
 class Glm4Attention(nn.Module):
     def __init__(
@@ -320,11 +336,12 @@ class Glm4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """GLM4 decoder forward with fused add+RMSNorm+FP8 for attention (AMD AITER).
+        """GLM4 decoder forward with fused add+RMSNorm+FP8 for attn and MLP (AMD AITER).
 
-        Fuses the input_layernorm add+norm+per_token_quant into a single kernel
-        (~13µs savings per layer on MI300X). post_self_attn_layernorm,
-        post_attention_layernorm, and post_mlp_layernorm run in standard BF16.
+        Fuses both input_layernorm and post_attention_layernorm add+norm+per_token_quant
+        into single AITER kernels (~13µs savings per norm call on MI300X).
+        post_self_attn_layernorm (applied to attention output only, no residual) and
+        post_mlp_layernorm (applied to MLP output, no residual) remain in BF16.
         """
         # Fused input_layernorm + FP8 quantization
         if residual is None:
@@ -341,11 +358,15 @@ class Glm4DecoderLayer(nn.Module):
             skip_o_reduce=True,
         )
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        # post_self_attn_layernorm: applied to attention output only (no residual add)
         hidden_states = self.post_self_attn_layernorm(hidden_states)
 
-        # MLP: standard path
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        # MLP: fused add+RMSNorm+FP8 into gate_up_proj via post_attention_layernorm
+        fp8_hs, fp8_scale, residual = self.post_attention_layernorm.forward_aiter_fp8_out(
+            hidden_states, residual
+        )
+        hidden_states = self.mlp._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
+        # post_mlp_layernorm: applied to MLP output only (no residual add)
         hidden_states = self.post_mlp_layernorm(hidden_states)
         return hidden_states, residual
 
