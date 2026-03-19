@@ -217,6 +217,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        prequantized_fp8: Optional[torch.Tensor] = None,
+        prequantized_fp8_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.weight_block_size is not None:
             return self.w8a8_block_fp8_linear(
@@ -237,6 +239,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 bias=bias,
                 use_per_token_if_dynamic=True,
                 compressed_tensor_quant=True,
+                prequantized_fp8=prequantized_fp8,
+                prequantized_fp8_scale=prequantized_fp8_scale,
             )
         else:
             return apply_fp8_linear(

@@ -39,7 +39,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 class ExaoneGatedMLP(nn.Module):
@@ -78,6 +81,18 @@ class ExaoneGatedMLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.c_proj(x)
         return x
+
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """MLP forward using pre-quantized FP8 input for gate_up_proj (AMD AITER path)."""
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        out = self.act_fn(gate_up)
+        out, _ = self.c_proj(out)
+        return out
 
 
 class ExaoneAttention(nn.Module):
@@ -171,6 +186,22 @@ class ExaoneAttention(nn.Module):
         output, _ = self.out_proj(attn_output)
         return output
 
+    def _forward_with_fp8_input(
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Attention forward using pre-quantized FP8 input for qkv_proj (AMD AITER path)."""
+        qkv, _ = self.qkv_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, forward_batch)
+        output, _ = self.out_proj(attn_output)
+        return output
+
 
 class ExaoneDecoderLayer(nn.Module):
     def __init__(
@@ -215,6 +246,45 @@ class ExaoneDecoderLayer(nn.Module):
         rms_norm_eps = config.layer_norm_epsilon
         self.ln_1 = RMSNorm(config.hidden_size, eps=rms_norm_eps)
         self.ln_2 = RMSNorm(config.hidden_size, eps=rms_norm_eps)
+        # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
+        if _use_aiter and isinstance(self.ln_1, RMSNorm):
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+            self._aiter_fp8 = isinstance(
+                qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+            )
+        else:
+            self._aiter_fp8 = False
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decoder forward with fused add+RMSNorm+FP8 quantization (AMD AITER path)."""
+        # Self Attention: fused add+norm+fp8 into qkv_proj
+        if residual is None:
+            residual = hidden_states
+            fp8_hs, fp8_scale, _ = self.ln_1.forward_aiter_fp8_out(hidden_states)
+        else:
+            fp8_hs, fp8_scale, residual = self.ln_1.forward_aiter_fp8_out(
+                hidden_states, residual
+            )
+        hidden_states = self.self_attn._forward_with_fp8_input(
+            positions, hidden_states, fp8_hs, fp8_scale, forward_batch
+        )
+
+        # Fully Connected: fused add+norm+fp8 into gate_up_proj
+        fp8_hs, fp8_scale, residual = self.ln_2.forward_aiter_fp8_out(
+            hidden_states, residual
+        )
+        hidden_states = self.mlp._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
+        return hidden_states, residual
 
     def forward(
         self,
@@ -223,6 +293,9 @@ class ExaoneDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._aiter_fp8:
+            return self._forward_aiter_fp8(positions, hidden_states, forward_batch, residual)
+
         # Self Attention
         if residual is None:
             residual = hidden_states
