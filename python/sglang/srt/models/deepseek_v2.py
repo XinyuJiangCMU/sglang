@@ -256,10 +256,24 @@ class DeepseekV2MLP(nn.Module):
         )
         return x
 
-    def _forward_with_fp8_input(self, x, fp8_input, fp8_scale):
+    def _forward_with_fp8_input(
+        self,
+        x,
+        fp8_input,
+        fp8_scale,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ):
+        """MLP forward using pre-quantized FP8 input (AMD AITER path).
+
+        Skips redundant per_token_quant_hip inside gemm_a8w8_bpreshuffle by reusing
+        the FP8 tensor already computed by the preceding fused add+RMSNorm+FP8 op.
+        """
         gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(
+            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        )
         return x
 
 
@@ -1620,12 +1634,136 @@ class DeepseekV2DecoderLayer(nn.Module):
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
 
+        # AMD AITER fused add+RMSNorm+FP8 for dense MLP layers (MI300X).
+        # MLA attention is too complex for pre-quantized FP8 input;
+        # only post_attention_layernorm+MLP FP8 fusion is applied.
+        if _use_aiter and not self.is_layer_sparse and isinstance(
+            self.mlp, DeepseekV2MLP
+        ):
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.mlp.gate_up_proj, "quant_method", None)
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                scheme = getattr(self.mlp.gate_up_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm,
+                    (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                )
+        else:
+            self._aiter_fp8 = False
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
             self.config.n_routed_experts is not None
             and layer_id >= self.config.first_k_dense_replace
             and layer_id % self.config.moe_layer_freq == 0
         )
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: BumpAllocator = None,
+    ) -> tuple:
+        """DeepseekV2 decoder forward with fused post_attention_layernorm+FP8 for dense MLP (AMD AITER).
+
+        MLA attention uses the standard path (too complex for pre-quantized FP8 input).
+        Dense MLP: fused add+RMSNorm+FP8 feeds gate_up_proj directly, saving one
+        redundant per_token_quant_hip call per dense layer on MI300X.
+        Falls back to standard MLP path when prepare_mlp_fp8_out() returns None.
+        """
+        # --- Attention sub-layer: standard MLA path (quant_format detection) ---
+        quant_format = (
+            "mxfp4"
+            if (
+                _is_gfx95_supported
+                and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
+                is not None
+                and getattr(self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None)
+                is not None
+                and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
+            )
+            else (
+                "fp8"
+                if (
+                    _is_gfx95_supported
+                    and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
+                    is not None
+                    and getattr(
+                        self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None
+                    )
+                    is not None
+                    and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype
+                    in (
+                        getattr(torch, "float8_e4m3fn", None),
+                        getattr(torch, "float8_e4m3fnuz", None),
+                    )
+                )
+                else ""
+            )
+        )
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch, quant_format
+        )
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+            layer_scatter_modes=self.layer_scatter_modes,
+        )
+
+        # --- MLP sub-layer: fused post_attention_layernorm+FP8 for dense layers ---
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        fp8_result = self.layer_communicator.prepare_mlp_fp8_out(
+            hidden_states, residual, forward_batch
+        )
+        if fp8_result is not None:
+            fp8_hs, fp8_scale, residual = fp8_result
+            hidden_states = self.mlp._forward_with_fp8_input(
+                hidden_states, fp8_hs, fp8_scale,
+                should_allreduce_fusion, use_reduce_scatter,
+            )
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+            )
+
+        if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+
+        if not should_allreduce_fusion:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+
+        return hidden_states, residual
 
     def forward(
         self,
@@ -1637,6 +1775,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # AMD AITER fused post_attention_layernorm+FP8 for dense MLP (MI300X)
+        if self._aiter_fp8 and not forward_batch.forward_mode.is_idle():
+            return self._forward_aiter_fp8(
+                positions, hidden_states, forward_batch, residual,
+                zero_allocator, gemm_output_zero_allocator,
+            )
+
         quant_format = (
             "mxfp4"
             if (

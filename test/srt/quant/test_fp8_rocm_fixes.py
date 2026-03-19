@@ -3418,6 +3418,102 @@ class TestKimiLinearFusedFP8Path(unittest.TestCase):
 
 
 @unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestDeepseekV2MLPFusedFP8Path(unittest.TestCase):
+    """Tests for fused post_attention_layernorm+FP8 MLP path in DeepseekV2DecoderLayer (AMD AITER)."""
+
+    def test_deepseek_v2_mlp_forward_with_fp8_input_has_allreduce_params(self):
+        """DeepseekV2MLP._forward_with_fp8_input must accept should_allreduce_fusion and use_reduce_scatter."""
+        import inspect
+        from sglang.srt.models.deepseek_v2 import DeepseekV2MLP
+
+        src = inspect.getsource(DeepseekV2MLP._forward_with_fp8_input)
+        self.assertIn(
+            "should_allreduce_fusion",
+            src,
+            "_forward_with_fp8_input must accept should_allreduce_fusion parameter",
+        )
+        self.assertIn(
+            "skip_all_reduce",
+            src,
+            "_forward_with_fp8_input must use skip_all_reduce in down_proj",
+        )
+
+    def test_deepseek_v2_decoder_layer_has_aiter_fp8_flag(self):
+        """DeepseekV2DecoderLayer must set _aiter_fp8 in __init__."""
+        import inspect
+        from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer
+
+        src = inspect.getsource(DeepseekV2DecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "DeepseekV2DecoderLayer.__init__ must set _aiter_fp8 flag",
+        )
+
+    def test_deepseek_v2_decoder_layer_has_forward_aiter_fp8(self):
+        """DeepseekV2DecoderLayer must implement _forward_aiter_fp8 method."""
+        from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer
+
+        self.assertTrue(
+            hasattr(DeepseekV2DecoderLayer, "_forward_aiter_fp8"),
+            "DeepseekV2DecoderLayer must have _forward_aiter_fp8 method",
+        )
+
+    def test_deepseek_v2_forward_dispatches_to_aiter_fp8(self):
+        """DeepseekV2DecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer
+
+        src = inspect.getsource(DeepseekV2DecoderLayer.forward)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "DeepseekV2DecoderLayer.forward must check _aiter_fp8 to dispatch",
+        )
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "DeepseekV2DecoderLayer.forward must call _forward_aiter_fp8",
+        )
+
+    def test_deepseek_v2_aiter_fp8_fuses_post_attention_layernorm(self):
+        """_forward_aiter_fp8 must call prepare_mlp_fp8_out for MLP sub-layer."""
+        import inspect
+        from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer
+
+        src = inspect.getsource(DeepseekV2DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "prepare_mlp_fp8_out",
+            src,
+            "_forward_aiter_fp8 must call prepare_mlp_fp8_out for fused MLP norm",
+        )
+
+    def test_deepseek_v2_aiter_fp8_passes_fp8_to_mlp(self):
+        """_forward_aiter_fp8 must call mlp._forward_with_fp8_input."""
+        import inspect
+        from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer
+
+        src = inspect.getsource(DeepseekV2DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "mlp._forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must pass FP8 to mlp._forward_with_fp8_input",
+        )
+
+    def test_deepseek_v2_aiter_fp8_only_for_dense_mlp(self):
+        """_aiter_fp8 must check DeepseekV2MLP type to guard MoE layers."""
+        import inspect
+        from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer
+
+        src = inspect.getsource(DeepseekV2DecoderLayer.__init__)
+        self.assertIn(
+            "DeepseekV2MLP",
+            src,
+            "__init__ must check isinstance(self.mlp, DeepseekV2MLP) before enabling _aiter_fp8",
+        )
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
 class TestFalconH1FusedFP8Path(unittest.TestCase):
     """Tests for fused pre_ff_layernorm+FP8 MLP path in FalconH1HybridAttentionDecoderLayer (AMD AITER)."""
 
