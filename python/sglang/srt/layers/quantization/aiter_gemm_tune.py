@@ -70,8 +70,9 @@ SHAPES_TO_TUNE: List[Tuple[int, int, str]] = [
     (55296, 5120, "Qwen2.5-32B gate_up TP=1"),
     (5120, 27648, "Qwen2.5-32B down_proj TP=1"),
     # Qwen2.5-3B: hidden=2048, intermediate=11008
-    # gate_up (N=22016, K=2048) omitted — no compatible CK bpreshuffle kernel
+    # Both K=11008 (down_proj) and K=2048 (gate_up) are divisible by 512 and tunable.
     (2048, 11008, "Qwen2.5-3B down_proj TP=1"),
+    (22016, 2048, "Qwen2.5-3B gate_up TP=1"),
     # DeepSeek-V2-Lite dense: hidden=2048, intermediate=11264
     (2048, 11264, "DeepSeek-V2-Lite down_proj TP=1"),
     # Gemma3-4B: hidden=2560, intermediate=10240
