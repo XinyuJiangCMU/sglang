@@ -18,7 +18,9 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     USE_ROWWISE_TORCH_SCALED_MM,
+    _use_aiter,
     apply_fp8_linear,
+    apply_fp8_ptpc_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -177,6 +179,21 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
                 layer.input_scale = Parameter(input_scale, requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
+        if _use_aiter and not self.quant_config.use_marlin:
+            # AITER gemm_a8w8_bpreshuffle expects weight in (N, K) preshuffled layout.
+            # Store in that layout so apply() can call apply_fp8_ptpc_linear directly.
+            # weight_scale is already (N, 1) from ChannelQuantScaleParameter.
+            from aiter.ops.shuffle import shuffle_weight
+
+            layer.weight = Parameter(
+                shuffle_weight(weight.contiguous(), (16, 16)), requires_grad=False
+            )
+            # input_scale_ub is not used by aiter.per_token_quant_hip; delete to
+            # avoid confusion and save memory.
+            if hasattr(layer, "input_scale_ub"):
+                del layer.input_scale_ub
+            return
+
         layer.weight = Parameter(weight.t(), requires_grad=False)
         if self.quant_config.use_marlin:
             prepare_fp8_layer_for_marlin(layer)
@@ -201,10 +218,20 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        # On AMD with rowwise FP8 GEMM support (torch >= 2.7, gfx942+), use
-        # per-token activation quantization + hipBLAS rowwise scaled_mm.
-        # This avoids the float32 fallback that the channel-scale + per-tensor
-        # activation path uses, giving ~1.3x speedup on MI300X.
+        # On AMD with AITER, use gemm_a8w8_bpreshuffle via apply_fp8_ptpc_linear.
+        # Weight is stored in (N, K) preshuffled layout by process_weights_after_loading.
+        # This is faster than torch._scaled_mm + manual scale reshape on MI300X.
+        if _use_aiter:
+            return apply_fp8_ptpc_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                bias=bias,
+                use_per_token_if_dynamic=True,
+            )
+
+        # On AMD without AITER but with rowwise FP8 GEMM support (torch >= 2.7,
+        # gfx942+), use per-token activation quantization + hipBLAS rowwise scaled_mm.
         # weight layout: (K, N) non-contiguous (transposed from original (N, K)).
         if _is_hip and USE_ROWWISE_TORCH_SCALED_MM:
             input_2d = x.view(-1, x.shape[-1])
