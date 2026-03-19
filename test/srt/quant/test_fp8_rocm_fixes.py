@@ -2638,5 +2638,60 @@ class TestGemma2FusedFP8Path(unittest.TestCase):
         )
 
 
+class TestErnie45VLMoeFusedFP8Path(unittest.TestCase):
+    """Tests for Ernie4.5 VL MoE fused RMSNorm+FP8 decoder path (AMD AITER)."""
+
+    def test_ernie45_vl_moe_attention_has_forward_with_fp8_input(self):
+        """Ernie4_5_VLMoeAttention must have _forward_with_fp8_input for FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.ernie45_moe_vl")
+        self.assertTrue(
+            hasattr(mod.Ernie4_5_VLMoeAttention, "_forward_with_fp8_input"),
+            "Ernie4_5_VLMoeAttention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_ernie45_vl_moe_decoder_layer_has_aiter_fp8_flag(self):
+        """Ernie4_5_VLMoeDecoderLayer.__init__ must set _aiter_fp8 flag."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.ernie45_moe_vl")
+        src = inspect.getsource(mod.Ernie4_5_VLMoeDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "Ernie4_5_VLMoeDecoderLayer.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_ernie45_vl_moe_decoder_layer_has_forward_aiter_fp8(self):
+        """Ernie4_5_VLMoeDecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.ernie45_moe_vl")
+        self.assertTrue(
+            hasattr(mod.Ernie4_5_VLMoeDecoderLayer, "_forward_aiter_fp8"),
+            "Ernie4_5_VLMoeDecoderLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_ernie45_vl_moe_handles_mixed_dense_moe(self):
+        """_forward_aiter_fp8 must handle both dense MLP (FP8-fused) and sparse MoE (standard) paths."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.ernie45_moe_vl")
+        src = inspect.getsource(mod.Ernie4_5_VLMoeDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "_is_moe_layer",
+            src,
+            "_forward_aiter_fp8 must branch on _is_moe_layer for dense vs sparse MLP",
+        )
+
+    def test_ernie45_vl_moe_module_has_use_aiter_flag(self):
+        """ernie45_moe_vl module must have _use_aiter module-level flag."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.ernie45_moe_vl")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "ernie45_moe_vl module must have _use_aiter flag for AMD AITER detection",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
