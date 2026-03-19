@@ -1435,7 +1435,7 @@ class MLATokenToKVPool(KVCache):
         self.use_nsa = use_nsa
         self.nsa_kv_cache_store_fp8 = (
             use_nsa
-            and dtype == torch.float8_e4m3fn
+            and dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
             and override_kv_cache_dim is not None
         )
         # When override_kv_cache_dim is provided with nsa model, we assume the
