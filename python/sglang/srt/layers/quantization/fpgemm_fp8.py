@@ -186,9 +186,9 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
             from aiter.ops.shuffle import shuffle_weight
 
             N, K = weight.shape
-            use_ck = K > N
-            layer._use_ck = use_ck
-            if use_ck:
+            use_scaled_mm = K > N or N * K > 200_000_000
+            layer._use_ck = use_scaled_mm
+            if use_scaled_mm:
                 layer.weight = Parameter(
                     weight.contiguous(), requires_grad=False
                 )

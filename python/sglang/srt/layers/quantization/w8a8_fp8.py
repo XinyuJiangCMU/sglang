@@ -128,11 +128,13 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
 
             if _use_aiter:
                 N, K = weight.shape
-                # gemm_a8w8_CK is ~2x faster than bpreshuffle for K > N
-                # (e.g. down_proj) on MI300X decode. Use CK for those shapes.
-                use_ck = K > N
-                layer._use_ck = use_ck
-                if use_ck:
+                # torch._scaled_mm (hipBLASLt) is 1.1-2.3x faster than
+                # bpreshuffle for large GEMMs on MI300X.  Use _scaled_mm
+                # for down_proj (K > N) and gate_up (N*K > 200M).
+                # bpreshuffle stays faster for small GEMMs (qkv, o_proj).
+                use_scaled_mm = K > N or N * K > 200_000_000
+                layer._use_ck = use_scaled_mm
+                if use_scaled_mm:
                     layer.weight = Parameter(
                         weight.contiguous(), requires_grad=False
                     )
@@ -164,9 +166,9 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             # Update the layer with the new values.
             if _use_aiter:
                 N, K = qweight.shape
-                use_ck = K > N
-                layer._use_ck = use_ck
-                if use_ck:
+                use_scaled_mm = K > N or N * K > 200_000_000
+                layer._use_ck = use_scaled_mm
+                if use_scaled_mm:
                     layer.weight = Parameter(
                         qweight.contiguous(), requires_grad=False
                     )

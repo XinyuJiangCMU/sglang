@@ -4577,7 +4577,7 @@ class TestHybridCKBpreshuffleDispatch(unittest.TestCase):
         from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
         src = inspect.getsource(W8A8Fp8LinearMethod.process_weights_after_loading)
         self.assertIn("_use_ck", src, "process_weights_after_loading must set _use_ck")
-        self.assertIn("K > N", src, "Heuristic should be K > N for CK dispatch")
+        self.assertIn("use_scaled_mm", src, "Heuristic should set use_scaled_mm")
 
     def test_w8a8_process_weights_no_ck_for_gate_up(self):
         """Gate/up proj (N > K) should use bpreshuffle (no shuffle skip)."""
