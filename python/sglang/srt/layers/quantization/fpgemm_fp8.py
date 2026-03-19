@@ -18,7 +18,6 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
-    apply_fp8_ptpc_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -29,14 +28,10 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cuda
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _use_aiter:
-    from aiter.ops.shuffle import shuffle_weight
 
 logger = logging.getLogger(__name__)
 
@@ -177,14 +172,7 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
                 layer.input_scale = Parameter(input_scale, requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
-        if _use_aiter:
-            # Store weight in (N, K) preshuffle layout for AITER per-token-per-channel GEMM.
-            # apply_fp8_ptpc_linear expects shuffle_weight((N, K), (16, 16)).
-            layer.weight = Parameter(
-                shuffle_weight(weight.contiguous(), (16, 16)), requires_grad=False
-            )
-        else:
-            layer.weight = Parameter(weight.t(), requires_grad=False)
+        layer.weight = Parameter(weight.t(), requires_grad=False)
         if self.quant_config.use_marlin:
             prepare_fp8_layer_for_marlin(layer)
             # Activations not quantized for marlin.
@@ -206,17 +194,6 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
                 bias=bias,
-            )
-
-        if _use_aiter:
-            # Use AITER per-token-per-channel FP8 GEMM for AMD MI300X.
-            # Weight is pre-shuffled (N, K) layout in process_weights_after_loading.
-            return apply_fp8_ptpc_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                bias=bias,
-                use_per_token_if_dynamic=True,
             )
 
         return apply_fp8_linear(
