@@ -256,6 +256,12 @@ class DeepseekV2MLP(nn.Module):
         )
         return x
 
+    def _forward_with_fp8_input(self, x, fp8_input, fp8_scale):
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
 
 class MoEGate(nn.Module):
     def __init__(
