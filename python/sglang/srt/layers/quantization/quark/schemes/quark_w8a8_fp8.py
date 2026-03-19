@@ -132,11 +132,16 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
         layer.logical_widths = output_partition_sizes
 
         # WEIGHT
+        # Always allocate as float8_e4m3fn so checkpoint bytes are loaded via
+        # bitwise copy (no value conversion).  On AMD we normalize to
+        # float8_e4m3fnuz in process_weights_after_loading, which correctly
+        # handles the NaN-bit pattern and doubles the scale.  Allocating as
+        # float8_e4m3fnuz directly would cause values 240-448 to become NaN.
         weight = ModelWeightParameter(
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition,
-                dtype=fp8_dtype,
+                dtype=torch.float8_e4m3fn,
             ),
             input_dim=1,
             output_dim=0,

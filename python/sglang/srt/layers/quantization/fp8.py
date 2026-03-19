@@ -284,7 +284,15 @@ class Fp8LinearMethod(LinearMethodBase):
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
-        self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
+        # On AMD with AITER, default to per-token activation quantization for
+        # Fp8LinearMethod (uses gemm_a8w8_bpreshuffle for fast per-token x per-channel
+        # GEMM). Explicitly set SGLANG_USE_AITER_FP8_PER_TOKEN=0 to opt out.
+        import os as _os
+
+        _fp8_pt_env = _os.environ.get("SGLANG_USE_AITER_FP8_PER_TOKEN")
+        self.use_aiter_fp8_per_token = (
+            _use_aiter if _fp8_pt_env is None else envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
+        )
         self.use_per_token_if_dynamic = False
 
     def validate_block_quant_shapes(
