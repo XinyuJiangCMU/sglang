@@ -2128,5 +2128,230 @@ class TestMiMoV2MTPFusedFP8Path(unittest.TestCase):
         )
 
 
+class TestStep3p5FusedFP8Path(unittest.TestCase):
+    """Tests for Step3p5 fused GemmaRMSNorm+FP8 decoder path (AMD AITER)."""
+
+    def test_step3p5_attention_has_forward_with_fp8_input(self):
+        """Step3p5Attention must have _forward_with_fp8_input for FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.step3p5")
+        self.assertTrue(
+            hasattr(mod.Step3p5Attention, "_forward_with_fp8_input"),
+            "Step3p5Attention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_step3p5_attention_has_aiter_fp8_flag(self):
+        """Step3p5Attention.__init__ must set _aiter_fp8 flag."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.step3p5")
+        src = inspect.getsource(mod.Step3p5Attention.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "Step3p5Attention.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_step3p5_decoder_layer_has_forward_aiter_fp8(self):
+        """Step3p5DecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.step3p5")
+        self.assertTrue(
+            hasattr(mod.Step3p5DecoderLayer, "_forward_aiter_fp8"),
+            "Step3p5DecoderLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_step3p5_forward_dispatches_to_aiter_fp8(self):
+        """Step3p5DecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.step3p5")
+        src = inspect.getsource(mod.Step3p5DecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "Step3p5DecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_step3p5_aiter_fp8_fuses_input_layernorm(self):
+        """_forward_aiter_fp8 must call prepare_attn_fp8_out for fused norm+quant."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.step3p5")
+        src = inspect.getsource(mod.Step3p5DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "prepare_attn_fp8_out",
+            src,
+            "_forward_aiter_fp8 must use prepare_attn_fp8_out for fused norm+FP8",
+        )
+
+    def test_step3p5_aiter_fp8_calls_forward_with_fp8_input(self):
+        """_forward_aiter_fp8 must call _forward_with_fp8_input on attention."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.step3p5")
+        src = inspect.getsource(mod.Step3p5DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "_forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must call attention._forward_with_fp8_input",
+        )
+
+    def test_step3p5_fp8_head_wise_gate_dequantizes(self):
+        """_forward_with_fp8_input must handle use_head_wise_attn_gate via dequant."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.step3p5")
+        src = inspect.getsource(mod.Step3p5Attention._forward_with_fp8_input)
+        self.assertIn(
+            "use_head_wise_attn_gate",
+            src,
+            "_forward_with_fp8_input must handle use_head_wise_attn_gate for g_proj",
+        )
+
+    def test_step3p5_module_has_use_aiter_flag(self):
+        """step3p5 module must have _use_aiter module-level flag."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.step3p5")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "step3p5 module must have _use_aiter flag for AMD AITER detection",
+        )
+
+
+class TestArceeFusedFP8Path(unittest.TestCase):
+    """Tests for Arcee (AFM) fused RMSNorm+FP8 decoder path (AMD AITER)."""
+
+    def test_arcee_attention_has_forward_with_fp8_input(self):
+        """ArceeAttention must have _forward_with_fp8_input for FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.arcee")
+        self.assertTrue(
+            hasattr(mod.ArceeAttention, "_forward_with_fp8_input"),
+            "ArceeAttention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_arcee_decoder_layer_has_aiter_fp8_flag(self):
+        """ArceeDecoderLayer.__init__ must set _aiter_fp8 flag."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.arcee")
+        src = inspect.getsource(mod.ArceeDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "ArceeDecoderLayer.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_arcee_decoder_layer_has_forward_aiter_fp8(self):
+        """ArceeDecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.arcee")
+        self.assertTrue(
+            hasattr(mod.ArceeDecoderLayer, "_forward_aiter_fp8"),
+            "ArceeDecoderLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_arcee_forward_dispatches_to_aiter_fp8(self):
+        """ArceeDecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.arcee")
+        src = inspect.getsource(mod.ArceeDecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "ArceeDecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_arcee_aiter_fp8_fuses_input_layernorm(self):
+        """_forward_aiter_fp8 must call forward_aiter_fp8_out for fused norm+quant."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.arcee")
+        src = inspect.getsource(mod.ArceeDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must use forward_aiter_fp8_out for fused norm+FP8",
+        )
+
+    def test_arcee_module_has_use_aiter_flag(self):
+        """arcee module must have _use_aiter module-level flag."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.arcee")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "arcee module must have _use_aiter flag for AMD AITER detection",
+        )
+
+
+class TestMixtralQuantFusedFP8Path(unittest.TestCase):
+    """Tests for MixtralQuant fused RMSNorm+FP8 decoder path (AMD AITER)."""
+
+    def test_mixtral_quant_attention_has_forward_with_fp8_input(self):
+        """MixtralAttention (quant) must have _forward_with_fp8_input for FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mixtral_quant")
+        self.assertTrue(
+            hasattr(mod.MixtralAttention, "_forward_with_fp8_input"),
+            "mixtral_quant MixtralAttention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_mixtral_quant_decoder_layer_has_aiter_fp8_flag(self):
+        """MixtralDecoderLayer (quant).__init__ must set _aiter_fp8 flag."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mixtral_quant")
+        src = inspect.getsource(mod.MixtralDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "mixtral_quant MixtralDecoderLayer.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_mixtral_quant_decoder_layer_has_forward_aiter_fp8(self):
+        """MixtralDecoderLayer (quant) must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mixtral_quant")
+        self.assertTrue(
+            hasattr(mod.MixtralDecoderLayer, "_forward_aiter_fp8"),
+            "mixtral_quant MixtralDecoderLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_mixtral_quant_forward_dispatches_to_aiter_fp8(self):
+        """MixtralDecoderLayer (quant).forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mixtral_quant")
+        src = inspect.getsource(mod.MixtralDecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "mixtral_quant MixtralDecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_mixtral_quant_aiter_fp8_fuses_input_layernorm(self):
+        """_forward_aiter_fp8 must call forward_aiter_fp8_out for fused norm+quant."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mixtral_quant")
+        src = inspect.getsource(mod.MixtralDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must use forward_aiter_fp8_out for fused norm+FP8",
+        )
+
+    def test_mixtral_quant_module_has_use_aiter_flag(self):
+        """mixtral_quant module must have _use_aiter module-level flag."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mixtral_quant")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "mixtral_quant module must have _use_aiter flag for AMD AITER detection",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

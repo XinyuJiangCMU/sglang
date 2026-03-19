@@ -53,12 +53,20 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_non_idle_and_non_empty,
+    make_layers,
+)
 
 Step3p5Config = None
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
 class Step3p5MLP(nn.Module):
@@ -426,6 +434,36 @@ class Step3p5Attention(nn.Module):
         )
         self.alt_stream = alt_stream
 
+        # AMD AITER fused GemmaRMSNorm+FP8 path: enabled when SGLANG_USE_AITER=1
+        # and qkv_proj uses a supported FP8 quant method.
+        if _use_aiter:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fbgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            try:
+                from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                    CompressedTensorsLinearMethod,
+                )
+                from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+
+                qm = getattr(self.qkv_proj, "quant_method", None)
+                if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                    scheme = getattr(self.qkv_proj, "scheme", None)
+                    self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+                else:
+                    self._aiter_fp8 = isinstance(
+                        qm,
+                        (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                    )
+            except ImportError:
+                qm = getattr(self.qkv_proj, "quant_method", None)
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
+        else:
+            self._aiter_fp8 = False
+
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -434,6 +472,45 @@ class Step3p5Attention(nn.Module):
         k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(k_shape)
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v
+
+    def _forward_with_fp8_input(
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        forward_batch: ForwardBatch,
+        skip_o_reduce: bool = False,
+    ) -> torch.Tensor:
+        """Attention forward with FP8 pre-quantized qkv_proj input (AMD AITER path).
+
+        x is the BF16 hidden_states (used for g_proj when use_head_wise_attn_gate=True).
+        fp8_input/fp8_scale come from the fused GemmaRMSNorm+FP8 kernel.
+        QKV output is BF16 (per-head q_norm/k_norm operate on BF16).
+        """
+        qkv, _ = self.qkv_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q_shape, k_shape = q.shape, k.shape
+        q = self.q_norm(q.reshape(-1, self.head_dim)).reshape(q_shape)
+        k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(k_shape)
+        q, k = self.rotary_emb(positions, q, k)
+        if self.use_head_wise_attn_gate:
+            # g_proj needs BF16 normalized hidden_states; dequantize from FP8.
+            bf16_hs = (fp8_input.to(torch.bfloat16) * fp8_scale).contiguous()
+            gate_states, _ = self.g_proj(bf16_hs)
+        attn_output = self.attn(q, k, v, forward_batch)
+        if self.use_head_wise_attn_gate:
+            output = (
+                attn_output.view(
+                    attn_output.shape[0],
+                    self.num_heads,
+                    self.head_dim,
+                )
+                * gate_states.unsqueeze(-1).sigmoid()
+            )
+            attn_output = output.view(*attn_output.shape)
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_o_reduce)
+        return output
 
     def forward(
         self,
@@ -606,6 +683,64 @@ class Step3p5DecoderLayer(nn.Module):
                 "Failed to dump tensor %s for layer %s", name, self.layer_id
             )
 
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Step3p5 decoder forward with fused add+GemmaRMSNorm+FP8 on MI300X.
+
+        Uses LayerCommunicator.prepare_attn_fp8_out() to fuse the input_layernorm
+        add+norm+per_token_quant into a single kernel (~13µs/layer on MI300X).
+        Falls back to standard path when fused FP8 is unavailable (e.g. DP-attn).
+        MLP uses manual residual addition (same as standard path).
+        """
+        # Fused input_layernorm + FP8 quantization
+        fp8_result = self.layer_communicator.prepare_attn_fp8_out(
+            hidden_states,
+            residual,
+            forward_batch,
+            post_residual_addition=post_residual_addition,
+        )
+        if fp8_result is not None and hidden_states.shape[0] != 0:
+            fp8_hs, fp8_scale, residual = fp8_result
+            hidden_states = self.self_attn._forward_with_fp8_input(
+                positions, hidden_states, fp8_hs, fp8_scale, forward_batch,
+                skip_o_reduce=True,
+            )
+        else:
+            # Fallback: standard prepare_attn + attention
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch,
+                post_residual_addition=post_residual_addition,
+            )
+            if hidden_states.shape[0] != 0:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+
+        # MLP: manual residual addition + post_attention_layernorm (same as standard)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        if self.use_moe:
+            share_output = self.share_expert(hidden_states)
+            moe_output = self.moe(hidden_states)
+            hidden_states = moe_output + share_output
+        else:
+            hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+        return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -614,6 +749,10 @@ class Step3p5DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.self_attn._aiter_fp8:
+            return self._forward_aiter_fp8(
+                positions, hidden_states, forward_batch, residual, post_residual_addition
+            )
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
