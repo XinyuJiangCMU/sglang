@@ -4680,6 +4680,95 @@ class TestHybridCKBpreshuffleDispatch(unittest.TestCase):
         src = inspect.getsource(Fp8LinearMethod.apply)
         self.assertIn("_use_ck", src, "Fp8LinearMethod apply() must check _use_ck")
 
+    # --- Edge-case tests for hybrid GEMM dispatch threshold ---
+
+    def test_scaled_mm_output_shape_matches_bpreshuffle(self):
+        """Both CK (scaled_mm) and bpreshuffle paths produce the same output shape."""
+        from sglang.srt.layers.quantization.w8a8_fp8 import _use_aiter
+        if not _use_aiter:
+            self.skipTest("AITER not enabled")
+
+        from sglang.srt.layers.quantization.fp8_utils import (
+            apply_fp8_ck_linear,
+            apply_fp8_ptpc_linear,
+        )
+        from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+        from aiter.ops.shuffle import shuffle_weight
+
+        N, K = 4096, 8192
+        w_bf16 = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.01
+        x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
+
+        qw, w_scale = per_token_group_quant_fp8(w_bf16, K)
+        out_ck = apply_fp8_ck_linear(x, qw, w_scale)
+
+        qw2, w_scale2 = per_token_group_quant_fp8(w_bf16, K)
+        qw2_shuffled = shuffle_weight(qw2.contiguous(), (16, 16))
+        out_bp = apply_fp8_ptpc_linear(
+            x, qw2_shuffled, w_scale2, use_per_token_if_dynamic=True
+        )
+
+        self.assertEqual(
+            out_ck.shape,
+            out_bp.shape,
+            f"CK shape {out_ck.shape} != bpreshuffle shape {out_bp.shape}",
+        )
+
+    def test_threshold_400m_correct(self):
+        """Verify that 400_000_000 is the N*K threshold in process_weights_after_loading."""
+        import inspect
+        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+        src = inspect.getsource(W8A8Fp8LinearMethod.process_weights_after_loading)
+        self.assertIn(
+            "400_000_000",
+            src,
+            "Threshold must be 400_000_000 in process_weights_after_loading",
+        )
+
+    def test_qkv_shape_uses_bpreshuffle(self):
+        """Typical QKV shapes (N=10240, K=8192) should use bpreshuffle (_use_ck=False).
+        N*K = 83,886,080 < 400M, and K < N, so use_scaled_mm is False."""
+        N, K = 10240, 8192
+        use_scaled_mm = K > N or N * K > 400_000_000
+        self.assertFalse(
+            use_scaled_mm,
+            f"QKV (N={N}, K={K}, N*K={N*K}) should use bpreshuffle, not scaled_mm",
+        )
+
+    def test_gate_up_72b_uses_scaled_mm(self):
+        """Qwen2.5-72B gate_up (N=59136, K=8192) should use scaled_mm (_use_ck=True).
+        N*K = 484,442,112 > 400M."""
+        N, K = 59136, 8192
+        use_scaled_mm = K > N or N * K > 400_000_000
+        self.assertTrue(
+            use_scaled_mm,
+            f"gate_up 72B (N={N}, K={K}, N*K={N*K}) should use scaled_mm",
+        )
+
+    def test_down_proj_uses_scaled_mm(self):
+        """Any down_proj where K > N should use scaled_mm (_use_ck=True)."""
+        shapes = [
+            (4096, 14336),   # Llama-2-70B down_proj
+            (8192, 28672),   # Llama-3-70B down_proj
+            (3584, 18944),   # Qwen-2.5 down_proj
+        ]
+        for N, K in shapes:
+            use_scaled_mm = K > N or N * K > 400_000_000
+            self.assertTrue(
+                use_scaled_mm,
+                f"down_proj (N={N}, K={K}) must use scaled_mm since K > N",
+            )
+
+    def test_gate_up_70b_uses_bpreshuffle(self):
+        """Llama3-70B gate_up (N=28672, K=8192, N*K=234,881,024) uses bpreshuffle.
+        N*K < 400M and K < N, so use_scaled_mm is False."""
+        N, K = 28672, 8192
+        use_scaled_mm = K > N or N * K > 400_000_000
+        self.assertFalse(
+            use_scaled_mm,
+            f"gate_up 70B (N={N}, K={K}, N*K={N*K}) should use bpreshuffle",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
