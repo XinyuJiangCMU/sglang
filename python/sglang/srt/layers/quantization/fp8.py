@@ -1508,6 +1508,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 dispatch_output.topk_output,
                 moe_runner_config.activation,
                 moe_runner_config.no_combine,
+                moe_runner_config.apply_router_weight_on_input,
             )
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
@@ -1719,8 +1720,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         topk_output: TopKOutput,
         activation: str = "silu",
         no_combine: bool = False,
+        apply_router_weight_on_input: bool = False,
     ) -> Optional[torch.Tensor]:
         topk_weights, topk_ids, _ = topk_output
+
+        # aiter.fused_moe does not support apply_router_weight_on_input natively.
+        # When this flag is set (e.g. DeepSeek), pre-multiply x by topk_weights
+        # and pass ones as weights so fused_moe applies no extra scaling.
+        if apply_router_weight_on_input and (_use_hip_int4 or _use_aiter):
+            _, topk = topk_weights.shape
+            assert (
+                topk == 1
+            ), "apply_router_weight_on_input only supported with topk=1 in AITER/HIP-int4 path"
+            x = x * topk_weights.to(x.dtype)
+            topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
+
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."
