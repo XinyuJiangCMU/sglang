@@ -109,7 +109,9 @@ class MiniCPM3MLP(nn.Module):
         return x
 
 
-def input_to_float8(x, dtype=torch.float8_e4m3fn):
+def input_to_float8(x, dtype=None):
+    if dtype is None:
+        dtype = fp8_dtype
     finfo = torch.finfo(dtype)
     min_val, max_val = x.aminmax()
     amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
