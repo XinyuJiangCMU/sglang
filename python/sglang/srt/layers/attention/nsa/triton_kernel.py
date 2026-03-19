@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, fp8_max, fp8_min
 
 
 # Triton implementation
@@ -17,6 +17,8 @@ def _act_quant_kernel(
     N,
     group_size: tl.constexpr,
     round_scale: tl.constexpr,
+    fp8_max_val: tl.constexpr,
+    fp8_min_val: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -29,10 +31,9 @@ def _act_quant_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    # FP8 constants
-    fp8_min = -448.0
-    fp8_max = 448.0
-    fp8_max_inv = 1.0 / fp8_max
+    # FP8 constants (passed as constexpr to support both e4m3fn (NVIDIA, max=448) and
+    # e4m3fnuz (AMD MI300X, max=240))
+    fp8_max_inv = 1.0 / fp8_max_val
 
     # Calculate row and column offsets
     row_start = pid_m * BLOCK_M
@@ -69,10 +70,10 @@ def _act_quant_kernel(
     else:
         scale = amax * fp8_max_inv
 
-    # Quantize: y = clamp(x / scale, fp8_min, fp8_max)
+    # Quantize: y = clamp(x / scale, fp8_min_val, fp8_max_val)
     scale_broadcast = scale[:, None]
     y = x / scale_broadcast
-    y = tl.minimum(tl.maximum(y, fp8_min), fp8_max)
+    y = tl.minimum(tl.maximum(y, fp8_min_val), fp8_max_val)
 
     # Store quantized output
     y_ptrs = Y_ptr + rows[:, None] * N + cols[None, :]
@@ -97,7 +98,7 @@ def act_quant(
         scale_fmt (Optional[str], optional): The format of the scale. Default is None.
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - The quantized tensor with dtype `torch.float8_e4m3fn`.
+            - The quantized tensor with dtype `fp8_dtype` (platform-aware: e4m3fn on NVIDIA, e4m3fnuz on AMD MI300X).
             - A tensor of scaling factors with dtype `torch.float32`.
     """
     assert x.is_contiguous(), "Input tensor must be contiguous"
@@ -130,6 +131,8 @@ def act_quant(
         N,
         group_size=block_size,
         round_scale=round_scale,
+        fp8_max_val=fp8_max,
+        fp8_min_val=fp8_min,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         num_stages=0 if round_scale else 2,
