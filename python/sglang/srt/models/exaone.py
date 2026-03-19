@@ -248,14 +248,22 @@ class ExaoneDecoderLayer(nn.Module):
         self.ln_2 = RMSNorm(config.hidden_size, eps=rms_norm_eps)
         # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
         if _use_aiter and isinstance(self.ln_1, RMSNorm):
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
             from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
             from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
             from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
 
             qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
-            self._aiter_fp8 = isinstance(
-                qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
-            )
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
         else:
             self._aiter_fp8 = False
 
@@ -293,7 +301,7 @@ class ExaoneDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self._aiter_fp8:
+        if self._aiter_fp8 and isinstance(self.ln_1, RMSNorm):
             return self._forward_aiter_fp8(positions, hidden_states, forward_batch, residual)
 
         # Self Attention
