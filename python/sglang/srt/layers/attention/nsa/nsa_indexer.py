@@ -14,7 +14,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
@@ -556,7 +556,7 @@ class Indexer(MultiPlatformOp):
         if _is_fp8_fnuz:
             k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
         else:
-            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+            k_fp8 = k_fp8.view(fp8_dtype)
 
         k_scale = k_scale.view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
@@ -785,7 +785,7 @@ class Indexer(MultiPlatformOp):
                 actual_seq_q_list.append(actual_seq_q)
                 batch_idx_list.append(batch_idx)
 
-            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
+            k_fp8 = torch.cat(k_fp8_list, dim=0).view(fp8_dtype)
             k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
             kv_fp8 = (k_fp8, k_scale)
             ks = torch.cat(ks_list, dim=0)
@@ -826,7 +826,7 @@ class Indexer(MultiPlatformOp):
                 block_tables[0],
             )
 
-            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+            k_fp8 = k_fp8.view(fp8_dtype)
             k_scale = k_scale.view(torch.float32).squeeze(-1)
             kv_fp8 = (k_fp8, k_scale)
             ks = torch.full((actual_seq_q,), offset, dtype=torch.int32, device="cuda")
@@ -919,7 +919,7 @@ class Indexer(MultiPlatformOp):
                 block_tables[i],
             )
 
-            k_fp8 = k_fp8.view(torch.float8_e4m3fn).unsqueeze(0).contiguous()
+            k_fp8 = k_fp8.view(fp8_dtype).unsqueeze(0).contiguous()
             k_scale = k_scale.view(torch.float32).squeeze(-1).unsqueeze(0).contiguous()
 
             index_score = fp8_index(

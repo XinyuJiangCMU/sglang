@@ -31,6 +31,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -244,9 +245,9 @@ class MiniCPM3AttentionMLA(nn.Module):
             )
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        if self.w_kc.dtype == torch.float8_e4m3fn:
+        if self.w_kc.dtype == fp8_dtype:
             q_nope_val, q_nope_scale = input_to_float8(
-                q_nope.transpose(0, 1), torch.float8_e4m3fn
+                q_nope.transpose(0, 1), fp8_dtype
             )
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
@@ -275,9 +276,9 @@ class MiniCPM3AttentionMLA(nn.Module):
         attn_output = self.attn(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        if self.w_vc.dtype == torch.float8_e4m3fn:
+        if self.w_vc.dtype == fp8_dtype:
             attn_output_val, attn_output_scale = input_to_float8(
-                attn_output.transpose(0, 1), torch.float8_e4m3fn
+                attn_output.transpose(0, 1), fp8_dtype
             )
             attn_bmm_output = bmm_fp8(
                 attn_output_val,
