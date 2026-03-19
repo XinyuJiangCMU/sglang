@@ -358,8 +358,15 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         # Create the weight
+        # For checkpoint FP8, always allocate as float8_e4m3fn so weights are
+        # loaded via bitwise copy (no value conversion).  On AMD we call
+        # normalize_e4m3fn_to_e4m3fnuz in process_weights_after_loading to do a
+        # safe bitcast to float8_e4m3fnuz.  Allocating directly as
+        # float8_e4m3fnuz would cause values 240-448 to silently become NaN on
+        # copy_.  For non-checkpoint (BF16/FP16 → online quant), use fp8_dtype
+        # so quantization targets the correct native format.
         weight_dtype = (
-            fp8_dtype if self.is_checkpoint_fp8_serialized else params_dtype
+            torch.float8_e4m3fn if self.is_checkpoint_fp8_serialized else params_dtype
         )
         weight = ModelWeightParameter(
             data=torch.empty(
@@ -776,7 +783,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            params_dtype = torch.uint32 if _use_hip_int4 else fp8_dtype
+            # Always use float8_e4m3fn for checkpoint loading so bits are copied
+            # verbatim.  normalize_e4m3fn_to_e4m3fnuz in process_weights_after_loading
+            # converts to float8_e4m3fnuz on AMD without value-conversion clamping.
+            params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (

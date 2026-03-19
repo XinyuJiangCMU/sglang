@@ -16,7 +16,7 @@ from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz, scaled_fp8_quant
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
@@ -92,7 +92,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        params_dtype = fp8_dtype
+        # Always allocate as float8_e4m3fn so checkpoint weights are loaded via
+        # bitwise copy (no value conversion).  On AMD we normalize bits to
+        # float8_e4m3fnuz in process_weights_after_loading via
+        # normalize_e4m3fn_to_e4m3fnuz (which zeros the NaN pattern -128 and
+        # reinterprets the same bits as fnuz, then doubles the scale).
+        params_dtype = torch.float8_e4m3fn
 
         if self.block_quant:
             assert self.weight_block_size is not None
