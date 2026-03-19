@@ -37,6 +37,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter
 from sglang.srt.models.llama import LlamaAttention, LlamaMLP
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import logger
@@ -125,6 +126,64 @@ class DeciLMDecoderLayer(nn.Module):
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
+        # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
+        # Requires both attention and FFN to be present (no no-op layers).
+        if _use_aiter and not self._is_no_op_attention and not self._is_no_op_ffn:
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
+        else:
+            self._aiter_fp8 = False
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fused RMSNorm+FP8 path for AMD MI300X via AITER kernels."""
+        from sglang.srt.distributed import tensor_model_parallel_all_reduce
+
+        if residual is None:
+            residual = hidden_states
+            fp8_hs, fp8_scale, _ = self.input_layernorm.forward_aiter_fp8_out(
+                hidden_states
+            )
+        else:
+            fp8_hs, fp8_scale, residual = self.input_layernorm.forward_aiter_fp8_out(
+                hidden_states, residual
+            )
+        hidden_states = self.self_attn._forward_with_fp8_input(
+            positions, hidden_states, fp8_hs, fp8_scale, forward_batch,
+            skip_o_reduce=True,
+        )
+        fused = self.post_attention_layernorm.forward_with_allreduce_fusion_fp8_out(
+            hidden_states, residual
+        )
+        if fused is not None:
+            fp8_hs, residual, fp8_scale = fused
+        else:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            fp8_hs, fp8_scale, residual = self.post_attention_layernorm.forward_aiter_fp8_out(
+                hidden_states, residual
+            )
+        hidden_states = self.mlp._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
+        return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -132,6 +191,9 @@ class DeciLMDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._aiter_fp8:
+            return self._forward_aiter_fp8(positions, hidden_states, forward_batch, residual)
+
         # Self Attention
 
         if self._is_no_op_attention:
