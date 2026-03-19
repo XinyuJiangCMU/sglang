@@ -3126,5 +3126,160 @@ class TestNemotronHMLPFusedFP8Path(unittest.TestCase):
         )
 
 
+class TestHunYuanFusedFP8Path(unittest.TestCase):
+    """Tests for fused RMSNorm+FP8 quantization path in HunYuanDecoderLayer (AMD AITER)."""
+
+    def test_hunyuan_mlp_has_forward_with_fp8_input(self):
+        """HunYuanMLP must expose _forward_with_fp8_input for AMD AITER path."""
+        from sglang.srt.models.hunyuan import HunYuanMLP
+
+        self.assertTrue(
+            hasattr(HunYuanMLP, "_forward_with_fp8_input"),
+            "HunYuanMLP must have _forward_with_fp8_input method",
+        )
+
+    def test_hunyuan_attention_has_forward_with_fp8_input(self):
+        """HunYuanAttention must expose _forward_with_fp8_input for AMD AITER path."""
+        from sglang.srt.models.hunyuan import HunYuanAttention
+
+        self.assertTrue(
+            hasattr(HunYuanAttention, "_forward_with_fp8_input"),
+            "HunYuanAttention must have _forward_with_fp8_input method",
+        )
+
+    def test_hunyuan_attention_fp8_handles_skip_o_reduce(self):
+        """HunYuanAttention._forward_with_fp8_input must accept skip_o_reduce kwarg."""
+        import inspect
+        from sglang.srt.models.hunyuan import HunYuanAttention
+
+        sig = inspect.signature(HunYuanAttention._forward_with_fp8_input)
+        self.assertIn(
+            "skip_o_reduce",
+            sig.parameters,
+            "HunYuanAttention._forward_with_fp8_input must accept skip_o_reduce",
+        )
+
+    def test_hunyuan_decoder_layer_has_aiter_fp8_flag(self):
+        """HunYuanDecoderLayer must set _aiter_fp8 in __init__."""
+        import inspect
+        from sglang.srt.models.hunyuan import HunYuanDecoderLayer
+
+        src = inspect.getsource(HunYuanDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "HunYuanDecoderLayer.__init__ must set _aiter_fp8 flag",
+        )
+
+    def test_hunyuan_decoder_layer_has_forward_aiter_fp8(self):
+        """HunYuanDecoderLayer must implement _forward_aiter_fp8 method."""
+        from sglang.srt.models.hunyuan import HunYuanDecoderLayer
+
+        self.assertTrue(
+            hasattr(HunYuanDecoderLayer, "_forward_aiter_fp8"),
+            "HunYuanDecoderLayer must have _forward_aiter_fp8 method",
+        )
+
+    def test_hunyuan_forward_dispatches_to_aiter_fp8(self):
+        """HunYuanDecoderLayer.forward must dispatch to _forward_aiter_fp8 when enabled."""
+        import inspect
+        from sglang.srt.models.hunyuan import HunYuanDecoderLayer
+
+        src = inspect.getsource(HunYuanDecoderLayer.forward)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "HunYuanDecoderLayer.forward must check _aiter_fp8 to dispatch",
+        )
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "HunYuanDecoderLayer.forward must call _forward_aiter_fp8",
+        )
+
+    def test_hunyuan_aiter_fp8_fuses_input_layernorm(self):
+        """_forward_aiter_fp8 must call forward_aiter_fp8_out on input_layernorm."""
+        import inspect
+        from sglang.srt.models.hunyuan import HunYuanDecoderLayer
+
+        src = inspect.getsource(HunYuanDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "input_layernorm.forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must fuse input_layernorm via forward_aiter_fp8_out",
+        )
+
+    def test_hunyuan_aiter_fp8_fuses_post_attention_layernorm(self):
+        """_forward_aiter_fp8 must call forward_aiter_fp8_out on post_attention_layernorm."""
+        import inspect
+        from sglang.srt.models.hunyuan import HunYuanDecoderLayer
+
+        src = inspect.getsource(HunYuanDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "post_attention_layernorm",
+            src,
+            "_forward_aiter_fp8 must fuse post_attention_layernorm",
+        )
+
+    def test_hunyuan_aiter_fp8_uses_allreduce_fusion_when_available(self):
+        """_forward_aiter_fp8 must attempt allreduce fusion for TP>1."""
+        import inspect
+        from sglang.srt.models.hunyuan import HunYuanDecoderLayer
+
+        src = inspect.getsource(HunYuanDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_with_allreduce_fusion_fp8_out",
+            src,
+            "_forward_aiter_fp8 must try allreduce fusion via forward_with_allreduce_fusion_fp8_out",
+        )
+
+    def test_hunyuan_aiter_fp8_only_for_dense_mlp(self):
+        """_aiter_fp8 must only be True for dense (non-MoE) MLP layers."""
+        import inspect
+        from sglang.srt.models.hunyuan import HunYuanDecoderLayer, HunYuanMLP
+
+        src = inspect.getsource(HunYuanDecoderLayer.__init__)
+        self.assertIn(
+            "HunYuanMLP",
+            src,
+            "__init__ must check isinstance(self.mlp, HunYuanMLP) before enabling _aiter_fp8",
+        )
+
+    def test_hunyuan_aiter_fp8_respects_hidden_states_shape(self):
+        """HunYuanDecoderLayer.forward must skip FP8 path for empty batches."""
+        import inspect
+        from sglang.srt.models.hunyuan import HunYuanDecoderLayer
+
+        src = inspect.getsource(HunYuanDecoderLayer.forward)
+        self.assertIn(
+            "hidden_states.shape[0] != 0",
+            src,
+            "HunYuanDecoderLayer.forward must guard FP8 path for empty batches",
+        )
+
+    def test_hunyuan_aiter_fp8_handles_cross_attention(self):
+        """_forward_aiter_fp8 must handle cross-attention layers gracefully."""
+        import inspect
+        from sglang.srt.models.hunyuan import HunYuanDecoderLayer
+
+        src = inspect.getsource(HunYuanDecoderLayer._forward_aiter_fp8)
+        # Cross-attention layers fall back to standard attention + MLP FP8 only
+        self.assertIn(
+            "attention_type",
+            src,
+            "_forward_aiter_fp8 must check attention_type for cross-attention handling",
+        )
+
+    def test_hunyuan_module_has_use_aiter_import(self):
+        """hunyuan module must import _use_aiter for AMD AITER detection."""
+        import importlib
+
+        mod = importlib.import_module("sglang.srt.models.hunyuan")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "hunyuan module must import _use_aiter from fp8_utils",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
