@@ -3,8 +3,9 @@
 
 This script identifies and tunes missing kernel configurations in AITER's
 a8w8_bpreshuffle_tuned_gemm.csv.  Shapes with K not divisible by 512
-(e.g. K=9472 for Qwen2.5-7B down_proj) cannot use the default CK heuristic
-path and must have explicit tuned configs or they run ~3x slower.
+(e.g. K=9472 for Qwen2.5-7B down_proj, K=7392/3696 for Qwen2.5-72B at TP=4/8)
+cannot use the default CK heuristic path and must have explicit tuned configs
+or they run ~3x slower.
 
 Usage:
     python -m sglang.srt.layers.quantization.aiter_gemm_tune [--dry-run] [--mp N]
@@ -31,12 +32,22 @@ logger = logging.getLogger(__name__)
 # Shapes known to be slow without explicit AITER tuning.
 # Format: (N, K, description)
 # These shapes have K that is not divisible by 512, so the CK heuristic
-# dispatcher picks a sub-optimal kernel.
+# dispatcher picks a sub-optimal kernel.  A tuned entry with KPerThread=256
+# (or other K%256==0 kernel) must be present in a8w8_bpreshuffle_tuned_gemm.csv.
 SHAPES_TO_TUNE: List[Tuple[int, int, str]] = [
-    (3584, 9472, "Qwen2.5-7B/14B down_proj"),
+    # Qwen2.5-7B/14B: intermediate_size=18944 -> K=9472 at TP=2
+    (3584, 9472, "Qwen2.5-7B/14B down_proj TP=2"),
     (9472, 3584, "Qwen2.5-7B/14B gate_up TP=2"),
+    # Llama3-8B: intermediate_size=14336 -- K divisible by 512, included for
+    # benchmarking since shape is large and default kernel may not be optimal.
     (28672, 4096, "Llama3-8B fused gate_up TP=1"),
     (4096, 28672, "Llama3-8B down_proj TP=1"),
+    # Qwen2.5-72B: intermediate_size=29568, hidden_size=8192.
+    # down_proj K=29568/tp is never divisible by 512 at any TP level.
+    (8192, 29568, "Qwen2.5-72B down_proj TP=1"),
+    (8192, 14784, "Qwen2.5-72B down_proj TP=2"),
+    (8192, 7392, "Qwen2.5-72B down_proj TP=4"),
+    (8192, 3696, "Qwen2.5-72B down_proj TP=8"),
 ]
 
 # Batch sizes (M) to tune for each shape.

@@ -134,10 +134,19 @@ USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
 # required.  Missing entries fall back to a slow heuristic (~3x slower).
 _AITER_FP8_EXPECTED_GEMM_SHAPES = [
     # (N, K, description)
-    (3584, 9472, "Qwen2.5-7B/14B down_proj"),
+    # All shapes below have K not divisible by 512, so the CK heuristic
+    # dispatcher picks a sub-optimal kernel (K%256==0 variant is faster).
+    # Missing entries in a8w8_bpreshuffle_tuned_gemm.csv cause ~3x slowdown.
+    (3584, 9472, "Qwen2.5-7B/14B down_proj (TP=2)"),
     (9472, 3584, "Qwen2.5-7B/14B gate_up (TP=2)"),
     (28672, 4096, "Llama3-8B fused gate_up (TP=1)"),
     (4096, 28672, "Llama3-8B down_proj (TP=1)"),
+    # Qwen2.5-72B (intermediate_size=29568, hidden_size=8192): all TP sizes
+    # have K not divisible by 512 for down_proj (K=29568/tp).
+    (8192, 29568, "Qwen2.5-72B down_proj (TP=1)"),
+    (8192, 14784, "Qwen2.5-72B down_proj (TP=2)"),
+    (8192, 7392, "Qwen2.5-72B down_proj (TP=4)"),
+    (8192, 3696, "Qwen2.5-72B down_proj (TP=8)"),
 ]
 
 

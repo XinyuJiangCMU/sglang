@@ -1606,6 +1606,43 @@ class TestAiterGemmCoverage(unittest.TestCase):
             "SHAPES_TO_TUNE must include N=3584 K=9472 (Qwen2.5-7B down_proj)",
         )
 
+    def test_aiter_gemm_tune_shapes_include_qwen25_72b(self):
+        """aiter_gemm_tune.SHAPES_TO_TUNE must include Qwen2.5-72B shapes."""
+        import importlib
+
+        mod = importlib.import_module(
+            "sglang.srt.layers.quantization.aiter_gemm_tune"
+        )
+        nk_pairs = {(N, K) for N, K, _ in mod.SHAPES_TO_TUNE}
+        # Qwen2.5-72B: down_proj at TP=4 and TP=8 - K not divisible by 512
+        self.assertIn(
+            (8192, 7392),
+            nk_pairs,
+            "SHAPES_TO_TUNE must include N=8192 K=7392 (Qwen2.5-72B down_proj TP=4)",
+        )
+        self.assertIn(
+            (8192, 3696),
+            nk_pairs,
+            "SHAPES_TO_TUNE must include N=8192 K=3696 (Qwen2.5-72B down_proj TP=8)",
+        )
+
+    def test_expected_shapes_include_qwen25_72b(self):
+        """_AITER_FP8_EXPECTED_GEMM_SHAPES must include Qwen2.5-72B down_proj shapes."""
+        from sglang.srt.layers.quantization.fp8_utils import (
+            _AITER_FP8_EXPECTED_GEMM_SHAPES,
+        )
+
+        nk_pairs = {(N, K) for N, K, _ in _AITER_FP8_EXPECTED_GEMM_SHAPES}
+        # Qwen2.5-72B: intermediate_size=29568, hidden_size=8192
+        # All TP variants have K not divisible by 512
+        for tp, K in [(2, 14784), (4, 7392), (8, 3696)]:
+            self.assertIn(
+                (8192, K),
+                nk_pairs,
+                f"_AITER_FP8_EXPECTED_GEMM_SHAPES must include N=8192 K={K} "
+                f"(Qwen2.5-72B down_proj TP={tp})",
+            )
+
 
 @unittest.skipIf(not is_hip(), "ROCm-only tests")
 class TestBailingMoEFusedFP8Path(unittest.TestCase):
