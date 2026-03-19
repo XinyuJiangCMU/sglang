@@ -426,6 +426,8 @@ class QuarkLinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        prequantized_fp8: Optional[torch.Tensor] = None,
+        prequantized_fp8_scale: Optional[torch.Tensor] = None,
     ):
         """
         Use the output of create_weights and the QuarkLinearScheme
@@ -436,6 +438,15 @@ class QuarkLinearMethod(LinearMethodBase):
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
+        # Pass prequantized FP8 params to schemes that support them.
+        if prequantized_fp8 is not None and hasattr(scheme, "_supports_prequantized_fp8"):
+            return scheme.apply_weights(
+                layer,
+                x,
+                bias=bias,
+                prequantized_fp8=prequantized_fp8,
+                prequantized_fp8_scale=prequantized_fp8_scale,
+            )
         return scheme.apply_weights(layer, x, bias=bias)
 
 

@@ -178,11 +178,16 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
             set_weight_attrs(input_scale, {"needs_scalar_to_array": True})
             layer.register_parameter("input_scale", input_scale)
 
+    # Signal to QuarkLinearMethod that prequantized_fp8 args are accepted.
+    _supports_prequantized_fp8 = True
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        prequantized_fp8: Optional[torch.Tensor] = None,
+        prequantized_fp8_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         if _use_aiter and self.weight_qscheme == "per_channel" and self.per_token:
@@ -193,6 +198,8 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
                 input_scale=layer.input_scale,
                 bias=bias,
                 use_per_token_if_dynamic=self.per_token,
+                prequantized_fp8=prequantized_fp8,
+                prequantized_fp8_scale=prequantized_fp8_scale,
             )
 
         return apply_fp8_linear(

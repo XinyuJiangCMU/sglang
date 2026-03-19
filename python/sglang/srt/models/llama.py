@@ -339,11 +339,13 @@ class LlamaDecoderLayer(nn.Module):
             )
             from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
             from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
             from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
 
             qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
-            # For CompressedTensors, check the underlying scheme signals FP8 support.
-            if isinstance(qm, CompressedTensorsLinearMethod):
+            # For scheme-based methods (CompressedTensors, Quark), check the underlying
+            # scheme signals FP8 prequantization support.
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
                 scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
                 self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
             else:
