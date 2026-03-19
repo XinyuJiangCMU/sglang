@@ -807,13 +807,16 @@ class TestFBGEMMFp8AITERPath(unittest.TestCase):
         weight = torch.randn(N, K, device="cuda").to(torch.float8_e4m3fn)
         weight_scale = torch.ones(N, 1, device="cuda", dtype=torch.float32) * 0.01
 
-        from torch.nn import Parameter
-        layer = type("MockLayer", (), {
-            "weight": Parameter(weight),
-            "weight_scale": Parameter(weight_scale),
-            "input_scale_ub": Parameter(torch.tensor(1.0)),
-        })()
+        from torch.nn import Module, Parameter
 
+        class MockLayer(Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = Parameter(weight)
+                self.weight_scale = Parameter(weight_scale)
+                self.input_scale_ub = Parameter(torch.tensor(1.0))
+
+        layer = MockLayer()
         method.process_weights_after_loading(layer)
 
         # After loading, weight should be preshuffled (N, K) shape preserved
