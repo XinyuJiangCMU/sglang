@@ -104,7 +104,7 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
                 # Only for dynamic per-token input quant; static input scheme uses
                 # apply_fp8_linear which expects (K, N) via weight.T internally.
                 N, K = weight.shape
-                use_scaled_mm = K > N or N * K > 200_000_000
+                use_scaled_mm = K > N or N * K > 400_000_000
                 layer._use_ck = use_scaled_mm
                 if use_scaled_mm:
                     w = weight.contiguous()

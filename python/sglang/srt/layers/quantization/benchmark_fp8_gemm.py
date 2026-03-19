@@ -95,7 +95,7 @@ def main():
             times = {}
             for name, (N, K) in shapes.items():
                 w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16).to(fp8)
-                use_smm = K > N or N * K > 200_000_000
+                use_smm = K > N or N * K > 400_000_000
 
                 if use_smm:
                     w_t = w.t()
@@ -158,7 +158,7 @@ def main():
                 f"{model['name']:<16} "
                 f"{times['qkv']:>7.1f}{'*' if (hidden > qkv_out) else ' '}"
                 f"{times['o']:>7.1f}{'*' if (hidden > hidden) else ' '}"
-                f"{times['gate_up']:>7.1f}{'*' if (hidden > intermediate*2) or (intermediate*2*hidden > 200e6) else ' '}"
+                f"{times['gate_up']:>7.1f}{'*' if (hidden > intermediate*2) or (intermediate*2*hidden > 400e6) else ' '}"
                 f"{times['down']:>7.1f}{'*' if (intermediate > hidden) else ' '}"
                 f"{norm_us:>8.1f}"
                 f"{silu_us:>8.1f}"

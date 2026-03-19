@@ -564,7 +564,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         # bpreshuffle for N >= K shapes.
                         self.use_per_token_if_dynamic = True
                         N, K = qweight.shape
-                        use_scaled_mm = K > N or N * K > 200_000_000
+                        use_scaled_mm = K > N or N * K > 400_000_000
                         layer._use_ck = use_scaled_mm
                         if use_scaled_mm:
                             qweight = qweight.contiguous()
@@ -627,7 +627,7 @@ class Fp8LinearMethod(LinearMethodBase):
                                 weight_scale=weight_scale,
                             )
                         N, K = weight.shape
-                        use_scaled_mm = K > N or N * K > 200_000_000
+                        use_scaled_mm = K > N or N * K > 400_000_000
                         layer._use_ck = use_scaled_mm
                         if use_scaled_mm:
                             weight = weight.contiguous()

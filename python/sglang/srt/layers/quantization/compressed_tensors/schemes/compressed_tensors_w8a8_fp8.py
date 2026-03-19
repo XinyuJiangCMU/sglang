@@ -188,7 +188,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 # bpreshuffle for N >= K shapes.
                 # Static input scheme uses apply_fp8_linear with (K, N) layout.
                 N, K = weight.shape
-                use_scaled_mm = K > N or N * K > 200_000_000
+                use_scaled_mm = K > N or N * K > 400_000_000
                 layer._use_ck = use_scaled_mm
                 if use_scaled_mm:
                     w = weight.contiguous()
