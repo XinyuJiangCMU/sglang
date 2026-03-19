@@ -69,9 +69,8 @@ SHAPES_TO_TUNE: List[Tuple[int, int, str]] = [
     # TP=2 down_proj K=13824 is already present; TP=1 gate_up K=5120 may be missing
     (55296, 5120, "Qwen2.5-32B gate_up TP=1"),
     (5120, 27648, "Qwen2.5-32B down_proj TP=1"),
-    # Qwen2.5-3B: hidden=2048, intermediate=11008
-    (2048, 11008, "Qwen2.5-3B down_proj TP=1"),
-    (22016, 2048, "Qwen2.5-3B gate_up TP=1"),
+    # Qwen2.5-3B: hidden=2048, intermediate=11008 — omitted:
+    #   N=2048/K=11008 and N=22016/K=2048 have no compatible CK bpreshuffle kernel
     # DeepSeek-V2-Lite dense: hidden=2048, intermediate=11264
     (2048, 11264, "DeepSeek-V2-Lite down_proj TP=1"),
     # Gemma3-4B: hidden=2560, intermediate=10240
