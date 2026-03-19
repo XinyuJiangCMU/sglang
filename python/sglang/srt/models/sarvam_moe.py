@@ -78,7 +78,10 @@ if _is_cuda:
     try:
         from sgl_kernel import bmm_fp8, concat_mla_k, merge_state_v2
 
-        from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            fp8_dtype,
+            per_tensor_quant_mla_fp8,
+        )
 
         _has_fp8_support = True
         _has_concat_mla_k = True
@@ -662,7 +665,7 @@ class SarvamMoEMLAAttention(nn.Module):
         if (
             _has_fp8_support
             and w_bkn is not None
-            and w_bkn.dtype == torch.float8_e4m3fn
+            and w_bkn.dtype in (torch.float8_e4m3fn, fp8_dtype)
         ):
             x_val, x_scale = per_tensor_quant_mla_fp8(
                 x_bmk,

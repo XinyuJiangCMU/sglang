@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, per_tensor_quant_mla_fp8
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
@@ -72,11 +72,11 @@ class DeepseekMLARocmForwardMixin:
                 q_nope.to(torch.bfloat16).transpose(0, 1),
                 self.w_kc.to(torch.bfloat16) * self.w_scale,
             )
-        elif self.w_kc.dtype == torch.float8_e4m3fn:
+        elif self.w_kc.dtype in (torch.float8_e4m3fn, fp8_dtype):
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
                 q_nope.transpose(0, 1),
                 zero_allocator.allocate(1),
-                dtype=torch.float8_e4m3fn,
+                dtype=fp8_dtype,
             )
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
@@ -206,11 +206,11 @@ class DeepseekMLARocmForwardMixin:
                 attn_output.to(torch.bfloat16).transpose(0, 1),
                 self.w_vc.to(torch.bfloat16) * self.w_scale,
             )
-        elif self.w_vc.dtype == torch.float8_e4m3fn:
+        elif self.w_vc.dtype in (torch.float8_e4m3fn, fp8_dtype):
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
                 attn_output.transpose(0, 1),
                 zero_allocator.allocate(1),
-                dtype=torch.float8_e4m3fn,
+                dtype=fp8_dtype,
             )
             attn_bmm_output = bmm_fp8(
                 attn_output_val,
