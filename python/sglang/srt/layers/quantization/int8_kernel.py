@@ -8,9 +8,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_device_name, is_cuda
+from sglang.srt.utils import get_bool_env_var, get_device_name, is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
 if _is_cuda:
     # Temporary
     try:
@@ -21,6 +24,13 @@ if _is_cuda:
         from sgl_kernel import sgl_per_token_group_quant_int8
 
         enable_sgl_per_token_group_quant_8bit = False
+
+if _use_aiter:
+    try:
+        from aiter import per_token_quant_hip as aiter_per_token_quant_hip
+        from aiter.utility.dtypes import i8 as aiter_i8
+    except ImportError:
+        raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +57,9 @@ def _per_token_quant_int8(
     absmax = tl.maximum(tl.max(tl.abs(x)), 1e-10)
     scale_x = absmax / 127
     x_q = x * (127 / absmax)
-    x_q = tl.extra.cuda.libdevice.round(x_q).to(tl.int8)
+    # Use tl.math.floor instead of tl.extra.cuda.libdevice.round which is NVIDIA CUDA-only
+    # tl.math.floor(x + 0.5) is portable across CUDA and ROCm
+    x_q = tl.math.floor(x_q + 0.5).to(tl.int8)
     if CAL_SUM:
         x_sum = tl.sum(x, axis=0)
         tl.store(x_sum_ptr + row_id, x_sum.to(x_sum_ptr.dtype.element_ty))
@@ -57,6 +69,17 @@ def _per_token_quant_int8(
 
 
 def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
+    # AITER fast path: ~4.5x faster than Triton on AMD ROCm (no cal_sum support)
+    if _use_aiter and not cal_sum:
+        x_2d = x.view(-1, x.shape[-1])
+        x_q, scales = aiter_per_token_quant_hip(x_2d, quant_dtype=aiter_i8)
+        # reshape back to original shape (scales are [M, 1])
+        x_q = x_q.view(x.shape)
+        scales = scales.view(x.shape[:-1] + (1,))
+        if scale_dtype != torch.float32:
+            scales = scales.to(scale_dtype)
+        return x_q, scales
+
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
     x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
