@@ -81,6 +81,7 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
+    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
@@ -486,7 +487,7 @@ class LayerCommunicator:
                             inp2_weight=None,
                             inp2_epsilon=None,
                             group_size=128,
-                            dtype_quant=torch.float8_e4m3fn,
+                            dtype_quant=fp8_dtype,
                             res1=None,
                             output_unquantized_inp1=False,
                         )
@@ -518,7 +519,7 @@ class LayerCommunicator:
                             inp2_weight=None,
                             inp2_epsilon=None,
                             group_size=128,
-                            dtype_quant=torch.float8_e4m3fn,
+                            dtype_quant=fp8_dtype,
                             res1=residual,
                             output_unquantized_inp1=False,
                         )
