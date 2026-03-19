@@ -1697,6 +1697,8 @@ def apply_fp8_ck_linear(
     bias: Optional[torch.Tensor] = None,
     prequantized_fp8: Optional[torch.Tensor] = None,
     prequantized_fp8_scale: Optional[torch.Tensor] = None,
+    weight_t: Optional[torch.Tensor] = None,
+    weight_scale_row: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FP8 GEMM using torch._scaled_mm (hipBLASLt) with rowwise scaling.
 
@@ -1704,6 +1706,9 @@ def apply_fp8_ck_linear(
     large GEMMs (gate_up, down_proj) on MI300X across all batch sizes.
     Weight is stored as (N, K) without shuffle_weight preprocessing;
     weight.t() gives a column-major view for _scaled_mm at zero cost.
+
+    For best performance, callers should pre-compute weight_t and
+    weight_scale_row at loading time and pass them here.
     """
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
@@ -1713,10 +1718,12 @@ def apply_fp8_ck_linear(
         input_2d = input.view(-1, input.shape[-1])
         q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
 
-    # weight_scale is (N, 1); _scaled_mm expects scale_b as (1, N).
-    w_scale_row = weight_scale.view(1, -1).contiguous()
+    if weight_t is None:
+        weight_t = weight.t()
+    if weight_scale_row is None:
+        weight_scale_row = weight_scale.view(1, -1).contiguous()
     output = torch._scaled_mm(
-        q_input, weight.t(), scale_a=x_scale, scale_b=w_scale_row,
+        q_input, weight_t, scale_a=x_scale, scale_b=weight_scale_row,
         out_dtype=input.dtype,
     )
     if bias is not None:
