@@ -109,6 +109,23 @@ class ApertusMLP(nn.Module):
         )
         return x
 
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """MLP forward with pre-quantized FP8 input for AMD AITER path.
+
+        Uses fp8_input/fp8_scale from the fused RMSNorm+FP8 kernel to call
+        up_proj without redundant per_token_quant (~13µs savings on MI300X).
+        Apertus uses xIELU activation with a single up_proj (not gated).
+        """
+        x, _ = self.up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        x = self.act_fn(x)
+        x, _ = self.down_proj(x)
+        return x
+
 
 class ApertusAttention(nn.Module):
     def __init__(
@@ -321,11 +338,12 @@ class ApertusDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apertus decoder forward with fused add+RMSNorm+FP8 for attention (AMD AITER).
+        """Apertus decoder forward with fused add+RMSNorm+FP8 for attn and MLP (AMD AITER).
 
-        Fuses the attention_layernorm add+norm+per_token_quant into a single kernel
-        (~13µs savings per layer on MI300X). Per-head q/k norms applied post-QKV
-        in BF16 (AITER cannot fuse those). feedforward_layernorm uses standard path.
+        Fuses both attention_layernorm and feedforward_layernorm add+norm+per_token_quant
+        into single AITER kernels (~13µs savings per norm call on MI300X). Per-head q/k
+        norms applied post-QKV in BF16 (AITER cannot fuse those).
+        ApertusMLP uses xIELU activation with a single up_proj (not gated).
         """
         # Attention: fused add+RMSNorm+FP8 into qkv_proj
         if residual is None:
@@ -342,10 +360,12 @@ class ApertusDecoderLayer(nn.Module):
             skip_o_reduce=True,
         )
 
-        # MLP: allreduce (TP>1) + standard RMSNorm feedforward_layernorm
+        # MLP: allreduce (TP>1) + fused add+RMSNorm+FP8 into mlp.up_proj
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        hidden_states, residual = self.feedforward_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        fp8_hs, fp8_scale, residual = self.feedforward_layernorm.forward_aiter_fp8_out(
+            hidden_states, residual
+        )
+        hidden_states = self.mlp._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
         return hidden_states, residual
 
     def forward(

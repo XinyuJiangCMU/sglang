@@ -2958,6 +2958,32 @@ class TestApertusFusedFP8Path(unittest.TestCase):
             "_forward_with_fp8_input must apply q_norm (per-head QK norm)",
         )
 
+    def test_apertus_mlp_has_forward_with_fp8_input(self):
+        """ApertusMLP must have _forward_with_fp8_input for full-layer FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.apertus")
+        self.assertTrue(
+            hasattr(mod.ApertusMLP, "_forward_with_fp8_input"),
+            "ApertusMLP must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_apertus_aiter_fp8_fuses_feedforward_layernorm(self):
+        """_forward_aiter_fp8 must fuse feedforward_layernorm for MLP FP8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.apertus")
+        src = inspect.getsource(mod.ApertusDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "feedforward_layernorm.forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must fuse feedforward_layernorm for MLP FP8",
+        )
+        self.assertIn(
+            "mlp._forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must pass FP8 to mlp.up_proj via _forward_with_fp8_input",
+        )
+
     def test_apertus_module_has_use_aiter_flag(self):
         """apertus module must have _use_aiter module-level flag."""
         import importlib
