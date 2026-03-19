@@ -55,6 +55,31 @@ SHAPES_TO_TUNE: List[Tuple[int, int, str]] = [
     # CK bpreshuffle kernel (K % 64 != 0) so only TP=1 and TP=2 are tunable.
     (8192, 29568, "Qwen2.5-72B down_proj TP=1"),
     (8192, 14784, "Qwen2.5-72B down_proj TP=2"),
+    # --- Expanded coverage added 2026-03-19 ---
+    # Qwen2.5-7B TP=4: down_proj K=4736 (18944/4)
+    (3584, 4736, "Qwen2.5-7B down_proj TP=4"),
+    # Llama3-8B TP=4: down_proj K=3584 (14336/4)
+    (4096, 3584, "Llama3-8B down_proj TP=4"),
+    # Qwen2.5-14B: hidden=5120, intermediate=13696
+    (5120, 13696, "Qwen2.5-14B down_proj TP=1"),
+    (5120, 6848, "Qwen2.5-14B down_proj TP=2"),
+    (27392, 5120, "Qwen2.5-14B gate_up TP=1"),
+    (13696, 5120, "Qwen2.5-14B gate_up TP=2"),
+    # Qwen2.5-32B: hidden=5120, intermediate=27648
+    # TP=2 down_proj K=13824 is already present; TP=1 gate_up K=5120 may be missing
+    (55296, 5120, "Qwen2.5-32B gate_up TP=1"),
+    (5120, 27648, "Qwen2.5-32B down_proj TP=1"),
+    # Qwen2.5-3B: hidden=2048, intermediate=11008
+    (2048, 11008, "Qwen2.5-3B down_proj TP=1"),
+    (22016, 2048, "Qwen2.5-3B gate_up TP=1"),
+    # DeepSeek-V2-Lite dense: hidden=2048, intermediate=11264
+    (2048, 11264, "DeepSeek-V2-Lite down_proj TP=1"),
+    # Gemma3-4B: hidden=2560, intermediate=10240
+    (2560, 10240, "Gemma3-4B down_proj TP=1"),
+    (2560, 5120, "Gemma3-4B down_proj TP=2"),
+    # Gemma3-12B: hidden=3840, intermediate=15360
+    (3840, 15360, "Gemma3-12B down_proj TP=1"),
+    (3840, 7680, "Gemma3-12B down_proj TP=2"),
 ]
 
 # Batch sizes (M) to tune for each shape.
