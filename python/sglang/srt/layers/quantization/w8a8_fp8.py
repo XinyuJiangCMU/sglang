@@ -384,6 +384,11 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
             )
+            # aiter_fused_moe does not accept routed_scaling_factor; apply separately
+            # when needed (e.g. DeepSeek V3 uses routed_scaling_factor=2.5).
+            rsf = self.moe_runner_config.routed_scaling_factor
+            if rsf is not None and rsf != 1.0:
+                output = output * rsf
             return StandardCombineInput(hidden_states=output)
 
         quant_info = TritonMoeQuantInfo(
