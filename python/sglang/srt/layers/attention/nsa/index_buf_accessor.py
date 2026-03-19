@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -392,7 +392,7 @@ def _set_k_and_s_triton(
     if _is_fp8_fnuz:
         buf_fp8 = buf.view(torch.float8_e4m3fnuz)
     else:
-        buf_fp8 = buf.view(torch.float8_e4m3fn)
+        buf_fp8 = buf.view(fp8_dtype)
     buf_fp32 = buf.view(torch.float32)
 
     _set_k_and_s_triton_kernel[(num_tokens_to_write,)](

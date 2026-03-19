@@ -15,7 +15,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
@@ -127,7 +127,7 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition,
-                dtype=torch.float8_e4m3fn,
+                dtype=fp8_dtype,
             ),
             input_dim=1,
             output_dim=0,
