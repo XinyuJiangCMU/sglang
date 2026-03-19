@@ -398,6 +398,34 @@ class RMSNorm(MultiPlatformOp):
             self, x, residual, post_residual_addition, self.weight
         )
 
+    def forward_with_allreduce_fusion_fp8_out(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Fused allreduce + add_residual + RMSNorm + FP8 quant (AMD AITER path).
+
+        Returns (fp8_out, residual_out, fp8_scale) or None if not available.
+        fp8_out has dtype float8_e4m3fnuz, fp8_scale shape (M, 1) float32.
+
+        Falls back to None when:
+        - TP size is 1 (no allreduce needed; use forward_aiter_fp8_out instead)
+        - custom all-reduce communicator is unavailable
+        - the AITER custom_fused_ar_rms_quant kernel is not available
+        """
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_world_size,
+            tensor_model_parallel_fused_allreduce_rmsnorm_quant,
+        )
+
+        if get_tensor_model_parallel_world_size() <= 1:
+            return None
+
+        result = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+            x, residual, self.weight, self.variance_epsilon
+        )
+        return result  # (fp8_out, residual_out, scale_out) or None
+
 
 class LayerNorm(MultiPlatformOp):
     def __init__(

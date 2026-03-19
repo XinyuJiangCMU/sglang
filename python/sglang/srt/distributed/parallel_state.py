@@ -698,6 +698,54 @@ class GroupCoordinator:
         )
         return fused_outputs
 
+    def fused_allreduce_rmsnorm_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Attempt fused all-reduce + RMSNorm + FP8 quantization.
+
+        Returns (fp8_out, residual_out, scale_out) or None if not available.
+        fp8_out has dtype float8_e4m3fnuz, scale_out shape is (M, 1) float32.
+        This fuses allreduce + add_residual + RMSNorm + per_token_quant into
+        a single kernel, saving ~14µs per norm on MI300X compared to separate
+        allreduce+norm + per_token_quant_hip.
+        """
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+
+        if not hasattr(ca_comm, "custom_fused_ar_rms_quant"):
+            return None
+
+        if not ca_comm.should_custom_ar(input_):
+            return None
+
+        # Use same 1-stage policy as fused_allreduce_rmsnorm.
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            use_1stage_ar = True
+        else:
+            total_bytes = input_.numel() * input_.element_size()
+            hidden_dim = input_.shape[-1]
+            use_1stage_ar = total_bytes <= 128 * 1024 and hidden_dim in {
+                512,
+                1024,
+                2048,
+                4096,
+            }
+
+        return ca_comm.custom_fused_ar_rms_quant(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            use_1stage_ar,
+        )
+
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
