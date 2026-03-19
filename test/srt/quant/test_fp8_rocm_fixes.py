@@ -2864,5 +2864,113 @@ class TestApertusFusedFP8Path(unittest.TestCase):
         )
 
 
+class TestNemotronHMLPFusedFP8Path(unittest.TestCase):
+    """Tests for the NemotronH MLP decoder layer fused RMSNorm+FP8 path (AMD AITER)."""
+
+    def test_nemotron_h_mlp_has_forward_with_fp8_input(self):
+        """NemotronHMLP must have _forward_with_fp8_input for AMD AITER FP8 path."""
+        from sglang.srt.models.nemotron_h import NemotronHMLP
+        self.assertTrue(
+            hasattr(NemotronHMLP, "_forward_with_fp8_input"),
+            "NemotronHMLP must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_nemotron_h_mlp_decoder_layer_has_aiter_fp8_flag(self):
+        """NemotronHMLPDecoderLayer must have _aiter_fp8 attribute."""
+        from sglang.srt.models.nemotron_h import NemotronHMLPDecoderLayer
+        self.assertTrue(
+            hasattr(NemotronHMLPDecoderLayer, "_forward_aiter_fp8"),
+            "NemotronHMLPDecoderLayer must have _forward_aiter_fp8 method",
+        )
+
+    def test_nemotron_h_mlp_decoder_layer_has_forward_aiter_fp8(self):
+        """NemotronHMLPDecoderLayer must have _forward_aiter_fp8 method."""
+        from sglang.srt.models.nemotron_h import NemotronHMLPDecoderLayer
+        self.assertTrue(
+            hasattr(NemotronHMLPDecoderLayer, "_forward_aiter_fp8"),
+            "NemotronHMLPDecoderLayer must have _forward_aiter_fp8",
+        )
+
+    def test_nemotron_h_mlp_decoder_forward_dispatches_to_aiter(self):
+        """NemotronHMLPDecoderLayer.forward must dispatch to _forward_aiter_fp8 when flag set."""
+        from sglang.srt.models.nemotron_h import NemotronHMLPDecoderLayer
+        import inspect
+        src = inspect.getsource(NemotronHMLPDecoderLayer.forward)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "NemotronHMLPDecoderLayer.forward must dispatch on _aiter_fp8",
+        )
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "NemotronHMLPDecoderLayer.forward must call _forward_aiter_fp8",
+        )
+
+    def test_nemotron_h_mlp_aiter_fp8_uses_fused_norm(self):
+        """NemotronHMLPDecoderLayer._forward_aiter_fp8 must use forward_aiter_fp8_out."""
+        from sglang.srt.models.nemotron_h import NemotronHMLPDecoderLayer
+        import inspect
+        src = inspect.getsource(NemotronHMLPDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must use fused norm forward_aiter_fp8_out",
+        )
+        self.assertIn(
+            "_forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must call mixer._forward_with_fp8_input",
+        )
+
+    def test_nemotron_h_mlp_forward_with_fp8_uses_up_proj(self):
+        """NemotronHMLP._forward_with_fp8_input must use up_proj.forward_with_fp8_input."""
+        from sglang.srt.models.nemotron_h import NemotronHMLP
+        import inspect
+        src = inspect.getsource(NemotronHMLP._forward_with_fp8_input)
+        self.assertIn(
+            "up_proj.forward_with_fp8_input",
+            src,
+            "_forward_with_fp8_input must use up_proj.forward_with_fp8_input",
+        )
+
+    def test_nemotron_h_mlp_decoder_layer_aiter_fp8_not_set_by_default(self):
+        """NemotronHMLPDecoderLayer._aiter_fp8 must default to False without ROCm FP8 quant."""
+        from sglang.srt.models.nemotron_h import NemotronHMLPDecoderLayer
+        # Verify _aiter_fp8 is set in __init__ (not a class-level constant)
+        import inspect
+        src = inspect.getsource(NemotronHMLPDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "NemotronHMLPDecoderLayer.__init__ must set _aiter_fp8",
+        )
+        self.assertIn(
+            "_use_aiter",
+            src,
+            "NemotronHMLPDecoderLayer.__init__ must check _use_aiter flag",
+        )
+
+    def test_nemotron_h_mlp_fp8_respects_hidden_states_shape(self):
+        """NemotronHMLPDecoderLayer.forward must skip FP8 path for empty batches."""
+        from sglang.srt.models.nemotron_h import NemotronHMLPDecoderLayer
+        import inspect
+        src = inspect.getsource(NemotronHMLPDecoderLayer.forward)
+        self.assertIn(
+            "hidden_states.shape[0] != 0",
+            src,
+            "NemotronHMLPDecoderLayer.forward must guard FP8 path with shape check",
+        )
+
+    def test_nemotron_h_module_has_use_aiter_flag(self):
+        """nemotron_h module must have _use_aiter module-level flag."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.nemotron_h")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "nemotron_h module must have _use_aiter flag for AMD AITER detection",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

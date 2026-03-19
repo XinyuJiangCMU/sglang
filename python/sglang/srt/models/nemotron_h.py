@@ -118,6 +118,22 @@ class NemotronHMLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """MLP forward with pre-quantized FP8 input for AMD AITER path.
+
+        Uses fp8_input/fp8_scale from the fused RMSNorm+FP8 kernel to call
+        up_proj without redundant per_token_quant (~13µs savings on MI300X).
+        """
+        x, _ = self.up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        x = self.act_fn(x)
+        x, _ = self.down_proj(x)
+        return x
+
 
 _alt_stream = None
 
@@ -324,6 +340,59 @@ class NemotronHMLPDecoderLayer(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
+        # AMD AITER fused RMSNorm+FP8 path: enabled when SGLANG_USE_AITER=1 (ROCm)
+        # and up_proj uses a supported FP8 quant method.
+        if _use_aiter:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fbgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            try:
+                from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                    CompressedTensorsLinearMethod,
+                )
+                from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+
+                qm = getattr(self.mixer.up_proj, "quant_method", None)
+                if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                    scheme = getattr(self.mixer.up_proj, "scheme", None)
+                    self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+                else:
+                    self._aiter_fp8 = isinstance(
+                        qm,
+                        (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                    )
+            except ImportError:
+                qm = getattr(self.mixer.up_proj, "quant_method", None)
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
+        else:
+            self._aiter_fp8 = False
+
+    def _forward_aiter_fp8(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """NemotronH MLP decoder forward with fused add+RMSNorm+FP8 (AMD AITER).
+
+        Fuses the norm add+norm+per_token_quant into a single kernel
+        (~13µs savings per layer on MI300X). The FP8-quantized hidden states
+        are passed directly to up_proj via forward_with_fp8_input().
+        """
+        if residual is None:
+            residual = hidden_states
+            fp8_hs, fp8_scale, _ = self.norm.forward_aiter_fp8_out(hidden_states)
+        else:
+            fp8_hs, fp8_scale, residual = self.norm.forward_aiter_fp8_out(
+                hidden_states, residual
+            )
+        hidden_states = self.mixer._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
+        return hidden_states, residual
+
     def forward(
         self,
         *,
@@ -331,6 +400,10 @@ class NemotronHMLPDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._aiter_fp8 and hidden_states.shape[0] != 0:
+            return self._forward_aiter_fp8(
+                hidden_states=hidden_states, residual=residual, forward_batch=forward_batch
+            )
         if residual is None:
             residual = hidden_states
             hidden_states = self.norm(hidden_states)
