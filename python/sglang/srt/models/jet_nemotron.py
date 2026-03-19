@@ -24,6 +24,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -414,6 +415,23 @@ class JetNemotronAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _forward_with_fp8_input(
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        forward_batch: ForwardBatch,
+        skip_o_reduce: bool = False,
+    ) -> torch.Tensor:
+        """Attention forward using pre-quantized FP8 input for qkv_proj (AMD AITER path)."""
+        qkv, _ = self.qkv_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, forward_batch)
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_o_reduce)
+        return output
+
 
 class JetNemotronDecoderLayer(nn.Module):
     def __init__(
@@ -458,6 +476,95 @@ class JetNemotronDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
+        # JetBlock (jet layer type) uses qkvabz_proj and delta-rule attention,
+        # which is incompatible with qkv_proj FP8 input path; only dense attn
+        # layers (attn/swa) with qkv_proj support full fusion.
+        self._is_attn_layer = config.layer_types[layer_id] in ("attn", "swa")
+        if _use_aiter:
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.mlp.gate_up_proj, "quant_method", None)
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                scheme = getattr(self.mlp.gate_up_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
+        else:
+            self._aiter_fp8 = False
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, None]:
+        """Decoder forward with fused add+RMSNorm+FP8 quantization (AMD AITER path).
+
+        For attn/swa layers: fuses both input_layernorm+attn and
+        post_attention_layernorm+mlp with FP8 pre-quantization.
+        For jet layers: only fuses post_attention_layernorm+mlp since JetBlock
+        uses qkvabz_proj (incompatible with FP8 input path).
+        """
+        from sglang.srt.distributed import tensor_model_parallel_all_reduce
+
+        if self._is_attn_layer:
+            # Fuse input_layernorm+FP8 → qkv_proj
+            residual = hidden_states
+            fp8_hs, fp8_scale, _ = self.input_layernorm.forward_aiter_fp8_out(
+                hidden_states
+            )
+            # Skip o_proj allreduce; attempt fused allreduce+add+norm+fp8 quant.
+            hidden_states = self.self_attn._forward_with_fp8_input(
+                positions, hidden_states, fp8_hs, fp8_scale, forward_batch,
+                skip_o_reduce=True,
+            )
+            fused = self.post_attention_layernorm.forward_with_allreduce_fusion_fp8_out(
+                hidden_states, residual
+            )
+            if fused is not None:
+                fp8_hs, residual, fp8_scale = fused
+            else:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                fp8_hs, fp8_scale, residual = (
+                    self.post_attention_layernorm.forward_aiter_fp8_out(
+                        hidden_states, residual
+                    )
+                )
+            # Fuse post_attention_layernorm+FP8 → gate_up_proj
+            hidden_states = self.mlp._forward_with_fp8_input(
+                hidden_states, fp8_hs, fp8_scale
+            )
+            hidden_states = residual + hidden_states
+        else:
+            # JetBlock: standard attention, fuse only post_attention_layernorm+MLP
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            hidden_states = residual + hidden_states
+            # Fuse post_attention_layernorm+FP8 → gate_up_proj
+            residual = hidden_states
+            fp8_hs, fp8_scale, _ = self.post_attention_layernorm.forward_aiter_fp8_out(
+                hidden_states
+            )
+            hidden_states = self.mlp._forward_with_fp8_input(
+                hidden_states, fp8_hs, fp8_scale
+            )
+            hidden_states = residual + hidden_states
+        return hidden_states, None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -465,6 +572,9 @@ class JetNemotronDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self._aiter_fp8 and not forward_batch.forward_mode.is_idle():
+            return self._forward_aiter_fp8(positions, hidden_states, forward_batch)
+
         # Self Attention
         residual = hidden_states
 

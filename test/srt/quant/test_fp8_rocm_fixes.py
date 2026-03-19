@@ -3934,5 +3934,122 @@ class TestBailingMoELinearFusedFP8Path(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestJetNemotronFusedFP8Path(unittest.TestCase):
+    """Tests for JetNemotron fused RMSNorm+FP8 decoder path on AMD MI300X."""
+
+    def test_jet_nemotron_module_has_use_aiter_import(self):
+        """jet_nemotron module must import _use_aiter from fp8_utils."""
+        import importlib
+
+        mod = importlib.import_module("sglang.srt.models.jet_nemotron")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "jet_nemotron module must import _use_aiter from fp8_utils",
+        )
+
+    def test_jet_nemotron_decoder_layer_has_aiter_fp8_attr(self):
+        """JetNemotronDecoderLayer must have _aiter_fp8 attribute."""
+        import inspect
+        from sglang.srt.models.jet_nemotron import JetNemotronDecoderLayer
+
+        src = inspect.getsource(JetNemotronDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "JetNemotronDecoderLayer.__init__ must set _aiter_fp8",
+        )
+
+    def test_jet_nemotron_decoder_layer_has_forward_aiter_fp8(self):
+        """JetNemotronDecoderLayer must define _forward_aiter_fp8 method."""
+        from sglang.srt.models.jet_nemotron import JetNemotronDecoderLayer
+
+        self.assertTrue(
+            hasattr(JetNemotronDecoderLayer, "_forward_aiter_fp8"),
+            "JetNemotronDecoderLayer must define _forward_aiter_fp8",
+        )
+
+    def test_jet_nemotron_forward_dispatches_to_aiter_fp8(self):
+        """JetNemotronDecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        from sglang.srt.models.jet_nemotron import JetNemotronDecoderLayer
+
+        src = inspect.getsource(JetNemotronDecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "forward must dispatch to _forward_aiter_fp8 when _aiter_fp8 is set",
+        )
+
+    def test_jet_nemotron_aiter_fp8_passes_fp8_to_mlp(self):
+        """_forward_aiter_fp8 must call mlp._forward_with_fp8_input."""
+        import inspect
+        from sglang.srt.models.jet_nemotron import JetNemotronDecoderLayer
+
+        src = inspect.getsource(JetNemotronDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "mlp._forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must pass FP8 to mlp._forward_with_fp8_input",
+        )
+
+    def test_jet_nemotron_aiter_fp8_uses_forward_aiter_fp8_out(self):
+        """_forward_aiter_fp8 must use forward_aiter_fp8_out for norm fusion."""
+        import inspect
+        from sglang.srt.models.jet_nemotron import JetNemotronDecoderLayer
+
+        src = inspect.getsource(JetNemotronDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must use forward_aiter_fp8_out",
+        )
+
+    def test_jet_nemotron_attention_has_fp8_input_method(self):
+        """JetNemotronAttention must define _forward_with_fp8_input."""
+        from sglang.srt.models.jet_nemotron import JetNemotronAttention
+
+        self.assertTrue(
+            hasattr(JetNemotronAttention, "_forward_with_fp8_input"),
+            "JetNemotronAttention must define _forward_with_fp8_input for FP8 path",
+        )
+
+    def test_jet_nemotron_aiter_fp8_handles_jet_block_layers(self):
+        """_forward_aiter_fp8 must handle JetBlock (jet) layers separately."""
+        import inspect
+        from sglang.srt.models.jet_nemotron import JetNemotronDecoderLayer
+
+        src = inspect.getsource(JetNemotronDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "_is_attn_layer",
+            src,
+            "_forward_aiter_fp8 must check _is_attn_layer to handle jet vs attn/swa",
+        )
+
+    def test_jet_nemotron_aiter_fp8_uses_allreduce_fusion(self):
+        """_forward_aiter_fp8 must attempt allreduce+norm fusion for attn layers."""
+        import inspect
+        from sglang.srt.models.jet_nemotron import JetNemotronDecoderLayer
+
+        src = inspect.getsource(JetNemotronDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_with_allreduce_fusion_fp8_out",
+            src,
+            "_forward_aiter_fp8 must attempt allreduce+norm fusion",
+        )
+
+    def test_jet_nemotron_aiter_fp8_guards_idle_mode(self):
+        """forward must guard _forward_aiter_fp8 against idle forward mode."""
+        import inspect
+        from sglang.srt.models.jet_nemotron import JetNemotronDecoderLayer
+
+        src = inspect.getsource(JetNemotronDecoderLayer.forward)
+        self.assertIn(
+            "is_idle",
+            src,
+            "forward must guard _aiter_fp8 dispatch with is_idle() check",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
