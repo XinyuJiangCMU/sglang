@@ -4770,5 +4770,60 @@ class TestHybridCKBpreshuffleDispatch(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestFP8KVCachePrefill(unittest.TestCase):
+    """Test FP8 KV cache native prefill (avoid BF16 dequant)."""
+
+    def test_aiter_backend_has_q_descale(self):
+        """AiterAttnBackend pre-allocates q_descale tensor."""
+        import inspect
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+        src = inspect.getsource(AiterAttnBackend.__init__)
+        self.assertIn("q_descale", src,
+                       "AiterAttnBackend.__init__ should pre-allocate q_descale")
+
+    def test_prefill_uses_native_fp8_kv(self):
+        """forward_extend passes FP8 KV directly with descale instead of dequant."""
+        import inspect
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+        src = inspect.getsource(AiterAttnBackend.forward_extend)
+        # Should NOT have the old .to(dtype) dequant pattern
+        self.assertNotIn("k_cache.to(dtype)", src,
+                         "Should not dequant FP8 KV cache to BF16 in prefill")
+        self.assertNotIn("v_cache.to(dtype)", src,
+                         "Should not dequant FP8 KV cache to BF16 in prefill")
+        # Should have FP8 native path with descale
+        self.assertIn("q_descale", src,
+                       "Should pass q_descale for FP8 KV prefill")
+        self.assertIn("k_descale", src,
+                       "Should pass k_descale for FP8 KV prefill")
+        self.assertIn("v_descale", src,
+                       "Should pass v_descale for FP8 KV prefill")
+
+    def test_prefill_fp8_path_converts_q_to_fp8(self):
+        """FP8 KV prefill path quantizes Q to FP8 for same-dtype requirement."""
+        import inspect
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+        src = inspect.getsource(AiterAttnBackend.forward_extend)
+        self.assertIn("q_fp8", src,
+                       "Should convert Q to FP8 for native FP8 prefill")
+
+    def test_bf16_path_unchanged(self):
+        """BF16 KV cache path does not use descale."""
+        import inspect
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+        src = inspect.getsource(AiterAttnBackend.forward_extend)
+        # Source should have two mha_batch_prefill_func calls:
+        # 1. FP8 path (with k_descale) 2. BF16 path (without k_descale)
+        parts = src.split("mha_batch_prefill_func")
+        # parts[0] = before first call, parts[1] = first call args, parts[2] = second call args
+        self.assertGreaterEqual(len(parts), 3,
+                                "Should have at least 2 mha_batch_prefill_func calls")
+        # The last call (BF16 path) should not have k_descale
+        bf16_call = parts[-1][:500]
+        self.assertNotIn("k_descale", bf16_call,
+                         "BF16 path should not pass k_descale")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -205,6 +205,7 @@ class AiterAttnBackend(AttentionBackend):
         self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
             self.device
         )
+        self.q_descale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
 
         self.logits_soft_cap = 0.0
 
@@ -2125,33 +2126,60 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
-            if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
-
             window_size = (-1, -1)
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
 
-            o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache,
-                v_cache,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
-                self.forward_metadata.kv_indices,
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
-                causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
-                window_size=window_size,
-                sink_ptr=sinks,
-            )
+            q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
+            if self.kv_cache_dtype == fp8_dtype:
+                # FP8 KV cache: use native FP8 prefill with descale instead
+                # of dequantizing KV to BF16 (saves memory bandwidth)
+                q_fp8 = q_view.to(fp8)
+                k_scale = (
+                    layer.k_scale if layer.k_scale is not None else self.k_scale
+                )
+                v_scale = (
+                    layer.v_scale if layer.v_scale is not None else self.v_scale
+                )
+                o = mha_batch_prefill_func(
+                    q_fp8,
+                    k_cache,
+                    v_cache,
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    self.forward_metadata.kv_indices,
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_kv_len,
+                    causal=True,
+                    logits_soft_cap=self.logits_soft_cap,
+                    alibi_slopes=None,
+                    return_lse=False,
+                    return_attn_probs=False,
+                    window_size=window_size,
+                    sink_ptr=sinks,
+                    q_descale=self.q_descale,
+                    k_descale=k_scale,
+                    v_descale=v_scale,
+                )
+            else:
+                o = mha_batch_prefill_func(
+                    q_view,
+                    k_cache,
+                    v_cache,
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    self.forward_metadata.kv_indices,
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_kv_len,
+                    causal=True,
+                    logits_soft_cap=self.logits_soft_cap,
+                    alibi_slopes=None,
+                    return_lse=False,
+                    return_attn_probs=False,
+                    window_size=window_size,
+                    sink_ptr=sinks,
+                )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
