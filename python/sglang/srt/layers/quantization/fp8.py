@@ -587,13 +587,14 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.weight_scale = Parameter(
                     layer.weight_scale.data, requires_grad=False
                 )
-                if (
+                is_static_activation = (
                     hasattr(self.quant_config, "activation_scheme")
                     and self.quant_config.activation_scheme == "static"
                 ) or (
                     hasattr(self.quant_config, "linear_activation_scheme")
                     and self.quant_config.linear_activation_scheme == "static"
-                ):
+                )
+                if is_static_activation:
                     layer.input_scale = Parameter(
                         layer.input_scale.data, requires_grad=False
                     )
@@ -608,11 +609,13 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale = convert_to_channelwise(
                         layer.weight_scale, layer.logical_widths
                     )
-                    if _use_aiter and self.use_aiter_fp8_per_token:
+                    if _use_aiter and self.use_aiter_fp8_per_token and not is_static_activation:
                         # AITER gemm_a8w8_bpreshuffle expects:
                         #   WQ: (N, K) preshuffled  (NOT transposed)
                         #   w_scale: (N, 1)           (from convert_to_channelwise, already (N,1))
-                        # apply method uses apply_fp8_ptpc_linear which passes weight directly.
+                        # apply() uses apply_fp8_ptpc_linear which passes weight directly.
+                        # Only use for dynamic activation: static input_scale checkpoints
+                        # use apply_fp8_linear which expects (K, N) layout.
                         self.use_per_token_if_dynamic = True
                         if _is_fp8_fnuz:
                             weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
@@ -624,7 +627,20 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                         # fall through to input_scale handling below
                     else:
-                        # Update layer with new values for CUTLASS/Marlin path.
+                        # CUTLASS/Marlin path, or static-activation AITER path.
+                        # Normalize to e4m3fnuz before transposing (AMD only).
+                        if _is_fp8_fnuz:
+                            input_scale = getattr(layer, "input_scale", None)
+                            weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                                weight=weight,
+                                weight_scale=weight_scale,
+                                input_scale=input_scale,
+                            )
+                            if input_scale is not None:
+                                layer.input_scale = Parameter(
+                                    input_scale, requires_grad=False
+                                )
+                        # Update layer with new values in (K, N) layout for CUTLASS/Marlin.
                         layer.weight = Parameter(weight.t(), requires_grad=False)
                         layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 else:
@@ -654,13 +670,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     # Update layer with new values.
                     layer.weight = Parameter(weight.t(), requires_grad=False)
                     layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-                if (
-                    hasattr(self.quant_config, "activation_scheme")
-                    and self.quant_config.activation_scheme == "static"
-                ) or (
-                    hasattr(self.quant_config, "linear_activation_scheme")
-                    and self.quant_config.linear_activation_scheme == "static"
-                ):
+                if is_static_activation:
                     layer.input_scale = Parameter(
                         layer.input_scale.max(), requires_grad=False
                     )
@@ -744,12 +754,14 @@ class Fp8LinearMethod(LinearMethodBase):
         # AITER per-token-per-channel path: weight is stored as (N, K) preshuffled,
         # weight_scale is (N, 1).  apply_fp8_ptpc_linear uses gemm_a8w8_bpreshuffle
         # which expects this layout directly (no additional transpose).
-        if _use_aiter and self.use_per_token_if_dynamic:
+        # Only use this path for dynamic quantization; static input_scale checkpoints
+        # need apply_fp8_linear which respects the static scale.
+        if _use_aiter and self.use_per_token_if_dynamic and layer.input_scale is None:
             return apply_fp8_ptpc_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
-                input_scale=layer.input_scale,
+                input_scale=None,
                 bias=bias,
                 use_per_token_if_dynamic=True,
             )
