@@ -7,13 +7,17 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, fp8_max
+
 logger = logging.getLogger(__name__)
+
+_fp8_min = -fp8_max
 
 
 def quantize_fp8_scale_tensorwise(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    FP8_MAX = 448.0
-    scale = w.abs().amax().float() / FP8_MAX
-    scaled = (w / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    # Use platform-aware fp8_max: 448.0 for e4m3fn (NVIDIA), 240.0 for e4m3fnuz (AMD MI300X)
+    scale = w.abs().amax().float() / fp8_max
+    scaled = (w / scale).clamp(_fp8_min, fp8_max).to(fp8_dtype)
     return scaled, scale
 
 
