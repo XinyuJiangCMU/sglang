@@ -45,9 +45,11 @@ from sglang.srt.models.mimo_v2_flash import (
     MiMoV2MLP,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip
 
 MiMoV2FlashConfig = None
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +127,90 @@ class MiMoV2MTPLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
+        # AMD AITER fused add+RMSNorm+FP8: check if qkv_proj supports FP8.
+        # MTPLayer is always dense so both attention and MLP use the FP8 path.
+        if _use_aiter:
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm,
+                    (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                )
+        else:
+            self._aiter_fp8 = False
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """MiMoV2MTPLayer forward with fused add+RMSNorm+FP8 (AMD AITER).
+
+        Both attention and dense MLP sub-layers use the FP8 path.
+        Falls back to standard path when prepare_attn_fp8_out()/prepare_mlp_fp8_out() returns None.
+        """
+        # --- Attention sub-layer ---
+        fp8_result = self.layer_communicator.prepare_attn_fp8_out(
+            hidden_states, residual, forward_batch
+        )
+        if fp8_result is not None and hidden_states.shape[0] != 0:
+            fp8_hs, fp8_scale, residual = fp8_result
+            hidden_states = self.self_attn._forward_with_fp8_input(
+                positions, hidden_states, fp8_hs, fp8_scale, forward_batch,
+                skip_o_reduce=False,
+            )
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
+            if hidden_states.shape[0] != 0:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+
+        # --- Dense MLP sub-layer ---
+        if hidden_states.shape[0] != 0:
+            fp8_result = self.layer_communicator.prepare_mlp_fp8_out(
+                hidden_states, residual, forward_batch
+            )
+            if fp8_result is not None:
+                fp8_hs, fp8_scale, residual = fp8_result
+                with get_global_expert_distribution_recorder().disable_this_region():
+                    hidden_states = self.mlp._forward_with_fp8_input(
+                        hidden_states, fp8_hs, fp8_scale
+                    )
+                hidden_states, residual = self.layer_communicator.postprocess_layer(
+                    hidden_states, residual, forward_batch
+                )
+                return hidden_states, residual
+
+        # Standard MLP path (FP8 fallback)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
+        return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -132,6 +218,11 @@ class MiMoV2MTPLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # AMD AITER fused add+RMSNorm+FP8 path (MI300X) - both attention and MLP
+        if self._aiter_fp8 and hidden_states.shape[0] != 0:
+            return self._forward_aiter_fp8(
+                positions, hidden_states, forward_batch, residual
+            )
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
