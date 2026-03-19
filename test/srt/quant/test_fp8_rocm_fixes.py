@@ -1862,5 +1862,234 @@ class TestLlama4FusedFP8Path(unittest.TestCase):
         )
 
 
+class TestGlm4MoeFusedFP8Path(unittest.TestCase):
+    """Tests for GLM4MoE fused RMSNorm+FP8 decoder path (AMD AITER)."""
+
+    def test_glm4_moe_mlp_has_forward_with_fp8_input(self):
+        """Glm4MoeMLP must have _forward_with_fp8_input for the dense FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4_moe")
+        self.assertTrue(
+            hasattr(mod.Glm4MoeMLP, "_forward_with_fp8_input"),
+            "Glm4MoeMLP must have _forward_with_fp8_input for AMD AITER dense MLP FP8 path",
+        )
+
+    def test_glm4_moe_attention_has_forward_with_fp8_input(self):
+        """Glm4MoeAttention must have _forward_with_fp8_input for FP8 attention."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4_moe")
+        self.assertTrue(
+            hasattr(mod.Glm4MoeAttention, "_forward_with_fp8_input"),
+            "Glm4MoeAttention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_glm4_moe_decoder_layer_has_forward_aiter_fp8(self):
+        """Glm4MoeDecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4_moe")
+        self.assertTrue(
+            hasattr(mod.Glm4MoeDecoderLayer, "_forward_aiter_fp8"),
+            "Glm4MoeDecoderLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_glm4_moe_decoder_layer_has_aiter_fp8_flag(self):
+        """Glm4MoeDecoderLayer._aiter_fp8 flag must be set in __init__."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4_moe")
+        src = inspect.getsource(mod.Glm4MoeDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "Glm4MoeDecoderLayer.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_glm4_moe_forward_dispatches_to_aiter_fp8(self):
+        """Glm4MoeDecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4_moe")
+        src = inspect.getsource(mod.Glm4MoeDecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "Glm4MoeDecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+
+class TestGptOssFusedFP8Path(unittest.TestCase):
+    """Tests for GptOss fused RMSNorm+FP8 attention path (AMD AITER)."""
+
+    def test_gpt_oss_attention_has_forward_with_fp8_input(self):
+        """GptOssAttention must have _forward_with_fp8_input for FP8 attention."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gpt_oss")
+        self.assertTrue(
+            hasattr(mod.GptOssAttention, "_forward_with_fp8_input"),
+            "GptOssAttention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_gpt_oss_decoder_layer_has_forward_aiter_fp8(self):
+        """GptOssDecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gpt_oss")
+        self.assertTrue(
+            hasattr(mod.GptOssDecoderLayer, "_forward_aiter_fp8"),
+            "GptOssDecoderLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_gpt_oss_decoder_layer_has_aiter_fp8_flag(self):
+        """GptOssDecoderLayer._aiter_fp8 flag must be set in __init__."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gpt_oss")
+        src = inspect.getsource(mod.GptOssDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "GptOssDecoderLayer.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_gpt_oss_forward_dispatches_to_aiter_fp8(self):
+        """GptOssDecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gpt_oss")
+        src = inspect.getsource(mod.GptOssDecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "GptOssDecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_gpt_oss_fp8_handles_fused_set_kv_buffer(self):
+        """GptOssAttention._forward_with_fp8_input must replicate fused_set_kv_buffer logic."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gpt_oss")
+        src = inspect.getsource(mod.GptOssAttention._forward_with_fp8_input)
+        self.assertIn(
+            "fused_set_kv_buffer",
+            src,
+            "_forward_with_fp8_input must replicate fused_set_kv_buffer logic",
+        )
+
+
+class TestLLaDA2FusedFP8Path(unittest.TestCase):
+    """Tests for LLaDA2 fused RMSNorm+FP8 decoder path (AMD AITER)."""
+
+    def test_llada2_mlp_has_forward_with_fp8_input(self):
+        """LLaDA2MoeMLP must have _forward_with_fp8_input for the dense FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.llada2")
+        self.assertTrue(
+            hasattr(mod.LLaDA2MoeMLP, "_forward_with_fp8_input"),
+            "LLaDA2MoeMLP must have _forward_with_fp8_input for AMD AITER dense MLP FP8 path",
+        )
+
+    def test_llada2_attention_has_forward_with_fp8_input(self):
+        """LLaDA2MoeAttention must have _forward_with_fp8_input for FP8 attention."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.llada2")
+        self.assertTrue(
+            hasattr(mod.LLaDA2MoeAttention, "_forward_with_fp8_input"),
+            "LLaDA2MoeAttention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_llada2_block_has_forward_aiter_fp8(self):
+        """LLaDA2MoeBlock must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.llada2")
+        self.assertTrue(
+            hasattr(mod.LLaDA2MoeBlock, "_forward_aiter_fp8"),
+            "LLaDA2MoeBlock must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_llada2_block_has_aiter_fp8_flag(self):
+        """LLaDA2MoeBlock._aiter_fp8 flag must be set in __init__."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.llada2")
+        src = inspect.getsource(mod.LLaDA2MoeBlock.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "LLaDA2MoeBlock.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_llada2_forward_dispatches_to_aiter_fp8(self):
+        """LLaDA2MoeBlock.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.llada2")
+        src = inspect.getsource(mod.LLaDA2MoeBlock.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "LLaDA2MoeBlock.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_llada2_attention_uses_query_key_value(self):
+        """LLaDA2MoeAttention._forward_with_fp8_input must use query_key_value."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.llada2")
+        src = inspect.getsource(mod.LLaDA2MoeAttention._forward_with_fp8_input)
+        self.assertIn(
+            "query_key_value",
+            src,
+            "_forward_with_fp8_input must use query_key_value (not qkv_proj)",
+        )
+
+
+class TestMiMoV2MTPFusedFP8Path(unittest.TestCase):
+    """Tests for MiMoV2MTP fused RMSNorm+FP8 decoder path (AMD AITER)."""
+
+    def test_mimo_v2_mtp_layer_has_forward_aiter_fp8(self):
+        """MiMoV2MTPLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mimo_v2_flash_nextn")
+        self.assertTrue(
+            hasattr(mod.MiMoV2MTPLayer, "_forward_aiter_fp8"),
+            "MiMoV2MTPLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_mimo_v2_mtp_layer_has_aiter_fp8_flag(self):
+        """MiMoV2MTPLayer._aiter_fp8 flag must be set in __init__."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mimo_v2_flash_nextn")
+        src = inspect.getsource(mod.MiMoV2MTPLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "MiMoV2MTPLayer.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_mimo_v2_mtp_forward_dispatches_to_aiter_fp8(self):
+        """MiMoV2MTPLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mimo_v2_flash_nextn")
+        src = inspect.getsource(mod.MiMoV2MTPLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "MiMoV2MTPLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_mimo_v2_mtp_uses_mimo_v2_fp8_methods(self):
+        """_forward_aiter_fp8 must reuse MiMoV2Attention/_forward_with_fp8_input."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mimo_v2_flash_nextn")
+        src = inspect.getsource(mod.MiMoV2MTPLayer._forward_aiter_fp8)
+        self.assertIn(
+            "_forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must call _forward_with_fp8_input for attention",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
