@@ -1673,5 +1673,65 @@ class TestBailingMoEFusedFP8Path(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestMixtralFusedFP8Path(unittest.TestCase):
+    """Test Mixtral fused RMSNorm+FP8 attention path for AMD MI300X.
+
+    Note: MixtralMoE does not support FP8 input, so only the attention
+    pre-norm is fused. The post-attention norm uses the standard allreduce path.
+    """
+
+    def test_mixtral_attention_has_forward_with_fp8_input(self):
+        """MixtralAttention must have _forward_with_fp8_input."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mixtral")
+        self.assertTrue(
+            hasattr(mod.MixtralAttention, "_forward_with_fp8_input"),
+            "MixtralAttention must have _forward_with_fp8_input for AMD AITER optimization",
+        )
+
+    def test_mixtral_decoder_layer_has_forward_aiter_fp8(self):
+        """MixtralDecoderLayer must have _forward_aiter_fp8."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mixtral")
+        self.assertTrue(
+            hasattr(mod.MixtralDecoderLayer, "_forward_aiter_fp8"),
+            "MixtralDecoderLayer must have _forward_aiter_fp8 for AMD AITER optimization",
+        )
+
+    def test_mixtral_decoder_layer_has_aiter_fp8_flag(self):
+        """MixtralDecoderLayer must set _aiter_fp8 in __init__."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mixtral")
+        src = inspect.getsource(mod.MixtralDecoderLayer.__init__)
+        self.assertIn(
+            "W8A8Fp8LinearMethod", src,
+            "MixtralDecoderLayer must check W8A8Fp8LinearMethod for _aiter_fp8",
+        )
+
+    def test_mixtral_forward_dispatches_to_aiter_fp8(self):
+        """MixtralDecoderLayer.forward() must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mixtral")
+        src = inspect.getsource(mod.MixtralDecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8", src,
+            "MixtralDecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_mixtral_aiter_fp8_uses_standard_moe_path(self):
+        """_forward_aiter_fp8 must call block_sparse_moe directly (no FP8 MLP)."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.mixtral")
+        src = inspect.getsource(mod.MixtralDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "block_sparse_moe", src,
+            "_forward_aiter_fp8 must call block_sparse_moe (standard MoE, no FP8 MLP)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
