@@ -2693,5 +2693,84 @@ class TestErnie45VLMoeFusedFP8Path(unittest.TestCase):
         )
 
 
+class TestApertusFusedFP8Path(unittest.TestCase):
+    """Tests for Apertus fused RMSNorm+FP8 decoder path (AMD AITER)."""
+
+    def test_apertus_attention_has_forward_with_fp8_input(self):
+        """ApertusAttention must have _forward_with_fp8_input for FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.apertus")
+        self.assertTrue(
+            hasattr(mod.ApertusAttention, "_forward_with_fp8_input"),
+            "ApertusAttention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_apertus_decoder_layer_has_aiter_fp8_flag(self):
+        """ApertusDecoderLayer.__init__ must set _aiter_fp8 flag."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.apertus")
+        src = inspect.getsource(mod.ApertusDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "ApertusDecoderLayer.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_apertus_decoder_layer_has_forward_aiter_fp8(self):
+        """ApertusDecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.apertus")
+        self.assertTrue(
+            hasattr(mod.ApertusDecoderLayer, "_forward_aiter_fp8"),
+            "ApertusDecoderLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_apertus_forward_dispatches_to_aiter_fp8(self):
+        """ApertusDecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.apertus")
+        src = inspect.getsource(mod.ApertusDecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "ApertusDecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_apertus_aiter_fp8_fuses_attention_layernorm(self):
+        """_forward_aiter_fp8 must call forward_aiter_fp8_out on attention_layernorm."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.apertus")
+        src = inspect.getsource(mod.ApertusDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must use attention_layernorm.forward_aiter_fp8_out",
+        )
+
+    def test_apertus_attention_fp8_applies_per_head_qk_norms(self):
+        """_forward_with_fp8_input must apply per-head q_norm and k_norm."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.apertus")
+        src = inspect.getsource(mod.ApertusAttention._forward_with_fp8_input)
+        self.assertIn(
+            "q_norm",
+            src,
+            "_forward_with_fp8_input must apply q_norm (per-head QK norm)",
+        )
+
+    def test_apertus_module_has_use_aiter_flag(self):
+        """apertus module must have _use_aiter module-level flag."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.apertus")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "apertus module must have _use_aiter flag for AMD AITER detection",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
