@@ -2406,6 +2406,32 @@ class TestStep3p5FusedFP8Path(unittest.TestCase):
             "_forward_with_fp8_input must handle use_head_wise_attn_gate for g_proj",
         )
 
+    def test_step3p5_mlp_has_forward_with_fp8_input(self):
+        """Step3p5MLP must have _forward_with_fp8_input for full-layer FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.step3p5")
+        self.assertTrue(
+            hasattr(mod.Step3p5MLP, "_forward_with_fp8_input"),
+            "Step3p5MLP must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_step3p5_aiter_fp8_fuses_post_attention_norm_for_dense_mlp(self):
+        """_forward_aiter_fp8 must fuse post_attention_layernorm for dense MLP layers."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.step3p5")
+        src = inspect.getsource(mod.Step3p5DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "post_attention_layernorm.forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must fuse post_attention_layernorm for dense MLP FP8",
+        )
+        self.assertIn(
+            "mlp._forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must pass FP8 to mlp.gate_up_proj via _forward_with_fp8_input",
+        )
+
     def test_step3p5_module_has_use_aiter_flag(self):
         """step3p5 module must have _use_aiter module-level flag."""
         import importlib

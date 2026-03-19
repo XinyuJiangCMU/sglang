@@ -112,6 +112,23 @@ class Step3p5MLP(nn.Module):
             output, _ = self.down_proj(x)
         return output
 
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """MLP forward with pre-quantized FP8 input for AMD AITER path.
+
+        Uses fp8_input/fp8_scale from the fused GemmaRMSNorm+FP8 kernel to call
+        gate_up_proj without redundant per_token_quant (~13µs savings on MI300X).
+        Only valid when limit is None (standard SiluAndMul path).
+        """
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        x = self.act_fn(gate_up)
+        output, _ = self.down_proj(x)
+        return output
+
 
 class Step3p5MoEMLP(nn.Module):
     def __init__(
@@ -726,16 +743,24 @@ class Step3p5DecoderLayer(nn.Module):
                     forward_batch=forward_batch,
                 )
 
-        # MLP: manual residual addition + post_attention_layernorm (same as standard)
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        if self.use_moe:
-            share_output = self.share_expert(hidden_states)
-            moe_output = self.moe(hidden_states)
-            hidden_states = moe_output + share_output
+        # MLP path: fuse post_attention_layernorm for dense layers without swiglu_limit
+        if not self.use_moe and self.mlp.limit is None:
+            # Fused add+GemmaRMSNorm+FP8 into gate_up_proj
+            fp8_hs, fp8_scale, residual = self.post_attention_layernorm.forward_aiter_fp8_out(
+                hidden_states, residual
+            )
+            hidden_states = self.mlp._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
         else:
-            hidden_states = self.mlp(hidden_states)
+            # Fallback: manual residual addition + post_attention_layernorm (standard)
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            if self.use_moe:
+                share_output = self.share_expert(hidden_states)
+                moe_output = self.moe(hidden_states)
+                hidden_states = moe_output + share_output
+            else:
+                hidden_states = self.mlp(hidden_states)
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
