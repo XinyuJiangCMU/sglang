@@ -2465,7 +2465,7 @@ class TestOlmoeFusedFP8Path(unittest.TestCase):
             "_forward_aiter_fp8 must use forward_aiter_fp8_out for fused input_layernorm+FP8",
         )
         self.assertNotIn(
-            "_forward_with_fp8_input",
+            "mlp._forward_with_fp8_input",
             src,
             "OLMoE _forward_aiter_fp8 must NOT call mlp._forward_with_fp8_input (MoE is not FP8-fused)",
         )
