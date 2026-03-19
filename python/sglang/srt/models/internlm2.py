@@ -188,17 +188,19 @@ class InternLM2Attention(nn.Module):
         fp8_input: torch.Tensor,
         fp8_scale: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_o_reduce: bool = False,
     ) -> torch.Tensor:
         """Attention forward using pre-quantized FP8 input for wqkv (AMD AITER path).
 
         Skips redundant per_token_quant_hip inside gemm_a8w8_bpreshuffle by
         reusing FP8 already computed by the preceding fused RMSNorm+FP8 op.
+        skip_o_reduce: if True, skip the wo allreduce for fused AR path.
         """
         qkv, _ = self.wqkv.forward_with_fp8_input(x, fp8_input, fp8_scale)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.wo(attn_output)
+        output, _ = self.wo(attn_output, skip_all_reduce=skip_o_reduce)
         return output
 
 
@@ -263,7 +265,13 @@ class InternLMDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Decoder forward with fused add+RMSNorm+FP8 quantization (AMD AITER path)."""
+        """Decoder forward with fused add+RMSNorm+FP8 quantization (AMD AITER path).
+
+        For TP>1, also fuses the wo allreduce with ffn_norm via
+        forward_with_allreduce_fusion_fp8_out when AITER custom-AR is available.
+        """
+        from sglang.srt.distributed import tensor_model_parallel_all_reduce
+
         # Self Attention: fused add+norm+fp8 into wqkv
         if residual is None:
             residual = hidden_states
@@ -275,13 +283,19 @@ class InternLMDecoderLayer(nn.Module):
                 hidden_states, residual
             )
         hidden_states = self.attention._forward_with_fp8_input(
-            positions, hidden_states, fp8_hs, fp8_scale, forward_batch
+            positions, hidden_states, fp8_hs, fp8_scale, forward_batch,
+            skip_o_reduce=True,
         )
+        fused = self.ffn_norm.forward_with_allreduce_fusion_fp8_out(hidden_states, residual)
+        if fused is not None:
+            fp8_hs, residual, fp8_scale = fused
+        else:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            fp8_hs, fp8_scale, residual = self.ffn_norm.forward_aiter_fp8_out(
+                hidden_states, residual
+            )
 
         # Fully Connected: fused add+norm+fp8 into gate_up_proj
-        fp8_hs, fp8_scale, residual = self.ffn_norm.forward_aiter_fp8_out(
-            hidden_states, residual
-        )
         hidden_states = self.feed_forward._forward_with_fp8_input(
             hidden_states, fp8_hs, fp8_scale
         )
