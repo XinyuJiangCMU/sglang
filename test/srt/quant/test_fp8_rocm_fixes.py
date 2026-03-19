@@ -3417,5 +3417,115 @@ class TestKimiLinearFusedFP8Path(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestBailingMoELinearFusedFP8Path(unittest.TestCase):
+    """Tests for fused post_attention_layernorm+FP8 MLP path in BailingMoELinearDecoderLayer (AMD AITER)."""
+
+    def test_bailing_mlp_has_forward_with_fp8_input(self):
+        """BailingMLP (bailing_moe_linear) must implement _forward_with_fp8_input."""
+        from sglang.srt.models.bailing_moe_linear import BailingMLP
+
+        self.assertTrue(
+            hasattr(BailingMLP, "_forward_with_fp8_input"),
+            "BailingMLP in bailing_moe_linear must have _forward_with_fp8_input method",
+        )
+
+    def test_bailing_decoder_layer_has_aiter_fp8_flag(self):
+        """BailingMoELinearDecoderLayer must set _aiter_fp8 in __init__."""
+        import inspect
+        from sglang.srt.models.bailing_moe_linear import BailingMoELinearDecoderLayer
+
+        src = inspect.getsource(BailingMoELinearDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "BailingMoELinearDecoderLayer.__init__ must set _aiter_fp8 flag",
+        )
+
+    def test_bailing_decoder_layer_has_forward_aiter_fp8(self):
+        """BailingMoELinearDecoderLayer must implement _forward_aiter_fp8 method."""
+        from sglang.srt.models.bailing_moe_linear import BailingMoELinearDecoderLayer
+
+        self.assertTrue(
+            hasattr(BailingMoELinearDecoderLayer, "_forward_aiter_fp8"),
+            "BailingMoELinearDecoderLayer must have _forward_aiter_fp8 method",
+        )
+
+    def test_bailing_forward_dispatches_to_aiter_fp8(self):
+        """BailingMoELinearDecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        from sglang.srt.models.bailing_moe_linear import BailingMoELinearDecoderLayer
+
+        src = inspect.getsource(BailingMoELinearDecoderLayer.forward)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "BailingMoELinearDecoderLayer.forward must check _aiter_fp8 to dispatch",
+        )
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "BailingMoELinearDecoderLayer.forward must call _forward_aiter_fp8",
+        )
+
+    def test_bailing_aiter_fp8_fuses_post_attention_layernorm(self):
+        """_forward_aiter_fp8 must use prepare_mlp_fp8_out for the MLP sub-layer."""
+        import inspect
+        from sglang.srt.models.bailing_moe_linear import BailingMoELinearDecoderLayer
+
+        src = inspect.getsource(BailingMoELinearDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "prepare_mlp_fp8_out",
+            src,
+            "_forward_aiter_fp8 must call prepare_mlp_fp8_out for fused MLP norm",
+        )
+
+    def test_bailing_aiter_fp8_passes_fp8_to_mlp(self):
+        """_forward_aiter_fp8 must call mlp._forward_with_fp8_input."""
+        import inspect
+        from sglang.srt.models.bailing_moe_linear import BailingMoELinearDecoderLayer
+
+        src = inspect.getsource(BailingMoELinearDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "mlp._forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must pass FP8 to mlp._forward_with_fp8_input",
+        )
+
+    def test_bailing_aiter_fp8_only_for_dense_mlp(self):
+        """_aiter_fp8 must check BailingMLP type to guard MoE layers."""
+        import inspect
+        from sglang.srt.models.bailing_moe_linear import BailingMoELinearDecoderLayer
+
+        src = inspect.getsource(BailingMoELinearDecoderLayer.__init__)
+        self.assertIn(
+            "BailingMLP",
+            src,
+            "__init__ must check isinstance(self.mlp, BailingMLP) before enabling _aiter_fp8",
+        )
+
+    def test_bailing_module_has_use_aiter_import(self):
+        """bailing_moe_linear module must import _use_aiter from fp8_utils."""
+        import importlib
+
+        mod = importlib.import_module("sglang.srt.models.bailing_moe_linear")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "bailing_moe_linear module must import _use_aiter from fp8_utils",
+        )
+
+    def test_bailing_mlp_fp8_skips_down_proj_reduce(self):
+        """BailingMLP._forward_with_fp8_input must pass skip_all_reduce to down_proj."""
+        import inspect
+        from sglang.srt.models.bailing_moe_linear import BailingMLP
+
+        src = inspect.getsource(BailingMLP._forward_with_fp8_input)
+        self.assertIn(
+            "skip_all_reduce",
+            src,
+            "_forward_with_fp8_input must use skip_all_reduce for should_allreduce_fusion",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

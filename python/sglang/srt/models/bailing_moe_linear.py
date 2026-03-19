@@ -40,6 +40,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
+    _use_aiter,
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
@@ -201,6 +202,27 @@ class BailingMLP(nn.Module):
             skip_all_reduce=use_reduce_scatter or should_allreduce_fusion,
         )
         return x
+
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        """MLP forward using pre-quantized FP8 input (AMD AITER path).
+
+        Skips redundant per_token_quant inside gemm_a8w8_bpreshuffle by reusing
+        the FP8 tensor already computed by the preceding fused RMSNorm+FP8 op.
+        """
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        out = self.act_fn(gate_up)
+        out, _ = self.down_proj(
+            out,
+            skip_all_reduce=use_reduce_scatter or should_allreduce_fusion,
+        )
+        return out
 
 
 class BailingMoEGate(nn.Module):
@@ -805,12 +827,101 @@ class BailingMoELinearDecoderLayer(nn.Module):
             qkv_latent_func=qkv_latent_func,
         )
 
+        # AMD AITER fused add+RMSNorm+FP8 for dense MLP layers (MI300X).
+        # Attention types (linear/MLA/GQA) are too complex for FP8 input;
+        # only post_attention_layernorm+MLP FP8 fusion is applied.
+        if _use_aiter and not is_moe_layer and isinstance(self.mlp, BailingMLP):
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.mlp.gate_up_proj, "quant_method", None)
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                scheme = getattr(self.mlp.gate_up_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm,
+                    (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                )
+        else:
+            self._aiter_fp8 = False
+
     def _is_layer_sparse(
         self, config: PretrainedConfig, layer_id: int, is_nextn: bool = False
     ) -> bool:
         return is_nextn or (
             config.num_experts is not None and layer_id >= config.first_k_dense_replace
         )
+
+    def _forward_aiter_fp8(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decoder forward with fused post_attention_layernorm+FP8 for dense MLP (AMD AITER).
+
+        Attention sub-layer uses the standard path (linear/MLA/GQA attention types
+        are too complex for pre-quantized FP8 input).
+        MLP sub-layer: fused add+RMSNorm+FP8 quantization feeds gate_up_proj directly,
+        saving one redundant per_token_quant_hip call per layer on MI300X.
+        Falls back to standard MLP path when prepare_mlp_fp8_out() returns None.
+        """
+        # --- Attention sub-layer: standard path ---
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        if not forward_batch.forward_mode.is_idle():
+            if self.use_mla:
+                hidden_states = self.attention(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    zero_allocator=zero_allocator,
+                )
+            else:
+                hidden_states = self.attention(
+                    hidden_states=hidden_states,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                )
+
+        # --- MLP sub-layer: fused post_attention_layernorm+FP8 ---
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        fp8_result = self.layer_communicator.prepare_mlp_fp8_out(
+            hidden_states, residual, forward_batch
+        )
+        if fp8_result is not None:
+            fp8_hs, fp8_scale, residual = fp8_result
+            hidden_states = self.mlp._forward_with_fp8_input(
+                hidden_states, fp8_hs, fp8_scale,
+                should_allreduce_fusion, use_reduce_scatter,
+            )
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states = self.mlp(
+                hidden_states, should_allreduce_fusion, use_reduce_scatter
+            )
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+        return hidden_states, residual
 
     def forward(
         self,
@@ -821,6 +932,12 @@ class BailingMoELinearDecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # AMD AITER fused post_attention_layernorm+FP8 for dense MLP (MI300X)
+        if self._aiter_fp8 and not forward_batch.forward_mode.is_idle():
+            return self._forward_aiter_fp8(
+                hidden_states, positions, forward_batch, residual, zero_allocator
+            )
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
