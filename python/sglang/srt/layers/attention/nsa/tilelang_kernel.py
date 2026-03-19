@@ -49,8 +49,8 @@ def act_quant_kernel(
     N, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False
 ):
     M = T.symbolic("M")
-    fp8_min = -224.0 if _is_fp8_fnuz else -448.0
-    fp8_max = 224.0 if _is_fp8_fnuz else 448.0
+    fp8_max = torch.finfo(fp8_dtype).max  # 240.0 for e4m3fnuz, 448.0 for e4m3fn
+    fp8_min = -fp8_max
     fp8_max_inv = 1 / fp8_max
     num_stages = 0 if round_scale else 2
     blk_m = 32
