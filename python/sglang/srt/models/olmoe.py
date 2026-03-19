@@ -42,9 +42,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip, make_layers, print_warning_once
+from sglang.srt.utils import add_prefix, make_layers, print_warning_once
 
-_use_aiter = is_hip() and get_bool_env_var("SGLANG_USE_AITER", default_value="true")
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter
 
 
 class OlmoeMoE(nn.Module):

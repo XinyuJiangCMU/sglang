@@ -64,14 +64,14 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, get_bool_env_var, is_cuda, is_hip, make_layers
+from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
 
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter
 from sglang.srt.models.utils import apply_qk_norm
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
-_use_aiter = is_hip() and get_bool_env_var("SGLANG_USE_AITER", default_value="true")
 
 
 class ExaoneMoEMLP(nn.Module):
