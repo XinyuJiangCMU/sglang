@@ -1514,5 +1514,98 @@ class TestQwen3NextFusedFP8Path(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestAiterGemmCoverage(unittest.TestCase):
+    """Tests for AITER FP8 GEMM config coverage checker."""
+
+    def test_expected_shapes_list_nonempty(self):
+        """_AITER_FP8_EXPECTED_GEMM_SHAPES must be non-empty."""
+        from sglang.srt.layers.quantization.fp8_utils import (
+            _AITER_FP8_EXPECTED_GEMM_SHAPES,
+        )
+
+        self.assertGreater(
+            len(_AITER_FP8_EXPECTED_GEMM_SHAPES),
+            0,
+            "_AITER_FP8_EXPECTED_GEMM_SHAPES must contain at least one entry",
+        )
+
+    def test_qwen25_7b_down_proj_in_expected_shapes(self):
+        """Qwen2.5-7B down_proj (N=3584, K=9472) must be in expected shapes list."""
+        from sglang.srt.layers.quantization.fp8_utils import (
+            _AITER_FP8_EXPECTED_GEMM_SHAPES,
+        )
+
+        nk_pairs = {(N, K) for N, K, _ in _AITER_FP8_EXPECTED_GEMM_SHAPES}
+        self.assertIn(
+            (3584, 9472),
+            nk_pairs,
+            "N=3584 K=9472 (Qwen2.5-7B down_proj) must be in _AITER_FP8_EXPECTED_GEMM_SHAPES",
+        )
+
+    def test_check_function_exists(self):
+        """_check_aiter_fp8_gemm_coverage must be a callable."""
+        from sglang.srt.layers.quantization.fp8_utils import (
+            _check_aiter_fp8_gemm_coverage,
+        )
+
+        self.assertTrue(
+            callable(_check_aiter_fp8_gemm_coverage),
+            "_check_aiter_fp8_gemm_coverage must be callable",
+        )
+
+    def test_check_function_nonfatal_without_aiter(self):
+        """_check_aiter_fp8_gemm_coverage must not raise even if AITER unavailable."""
+        from sglang.srt.layers.quantization.fp8_utils import (
+            _check_aiter_fp8_gemm_coverage,
+        )
+
+        # The function is lru_cached; calling it again is a no-op.
+        # Just ensure it doesn't raise.
+        try:
+            _check_aiter_fp8_gemm_coverage()
+        except Exception as e:
+            self.fail(
+                f"_check_aiter_fp8_gemm_coverage raised an exception: {e}"
+            )
+
+    def test_aiter_gemm_tune_module_importable(self):
+        """aiter_gemm_tune utility module must be importable."""
+        try:
+            import importlib
+
+            mod = importlib.import_module(
+                "sglang.srt.layers.quantization.aiter_gemm_tune"
+            )
+            self.assertTrue(
+                hasattr(mod, "find_missing_shapes"),
+                "aiter_gemm_tune must have find_missing_shapes function",
+            )
+            self.assertTrue(
+                hasattr(mod, "tune"),
+                "aiter_gemm_tune must have tune function",
+            )
+            self.assertTrue(
+                hasattr(mod, "SHAPES_TO_TUNE"),
+                "aiter_gemm_tune must have SHAPES_TO_TUNE list",
+            )
+        except ImportError as e:
+            self.fail(f"Could not import aiter_gemm_tune: {e}")
+
+    def test_aiter_gemm_tune_shapes_include_qwen25(self):
+        """aiter_gemm_tune.SHAPES_TO_TUNE must include Qwen2.5-7B shapes."""
+        import importlib
+
+        mod = importlib.import_module(
+            "sglang.srt.layers.quantization.aiter_gemm_tune"
+        )
+        nk_pairs = {(N, K) for N, K, _ in mod.SHAPES_TO_TUNE}
+        self.assertIn(
+            (3584, 9472),
+            nk_pairs,
+            "SHAPES_TO_TUNE must include N=3584 K=9472 (Qwen2.5-7B down_proj)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
