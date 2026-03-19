@@ -361,7 +361,8 @@ class Glm4DecoderLayer(nn.Module):
         # post_self_attn_layernorm: applied to attention output only (no residual add)
         hidden_states = self.post_self_attn_layernorm(hidden_states)
 
-        # MLP: fused add+RMSNorm+FP8 into gate_up_proj via post_attention_layernorm
+        # MLP: allreduce already done above; use fused add+RMSNorm+FP8 via post_attention_layernorm.
+        # forward_with_allreduce_fusion_fp8_out falls back gracefully when TP=1 or unavailable.
         fp8_hs, fp8_scale, residual = self.post_attention_layernorm.forward_aiter_fp8_out(
             hidden_states, residual
         )

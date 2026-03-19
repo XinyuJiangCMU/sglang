@@ -360,11 +360,18 @@ class ApertusDecoderLayer(nn.Module):
             skip_o_reduce=True,
         )
 
-        # MLP: allreduce (TP>1) + fused add+RMSNorm+FP8 into mlp.up_proj
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        fp8_hs, fp8_scale, residual = self.feedforward_layernorm.forward_aiter_fp8_out(
+        # MLP: allreduce fused with add+RMSNorm+FP8 when AITER custom-AR available (TP>1),
+        # otherwise explicit allreduce + fused add+norm+FP8.
+        fused = self.feedforward_layernorm.forward_with_allreduce_fusion_fp8_out(
             hidden_states, residual
         )
+        if fused is not None:
+            fp8_hs, residual, fp8_scale = fused
+        else:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            fp8_hs, fp8_scale, residual = self.feedforward_layernorm.forward_aiter_fp8_out(
+                hidden_states, residual
+            )
         hidden_states = self.mlp._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
         return hidden_states, residual
 

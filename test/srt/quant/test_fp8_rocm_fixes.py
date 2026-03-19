@@ -2525,6 +2525,18 @@ class TestArceeFusedFP8Path(unittest.TestCase):
             "_forward_aiter_fp8 must call mlp._forward_with_fp8_input for MLP FP8",
         )
 
+    def test_arcee_aiter_fp8_uses_allreduce_fusion_when_available(self):
+        """_forward_aiter_fp8 must use forward_with_allreduce_fusion_fp8_out for TP>1."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.arcee")
+        src = inspect.getsource(mod.ArceeDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_with_allreduce_fusion_fp8_out",
+            src,
+            "_forward_aiter_fp8 must try forward_with_allreduce_fusion_fp8_out for TP>1 savings",
+        )
+
     def test_arcee_module_has_use_aiter_flag(self):
         """arcee module must have _use_aiter module-level flag."""
         import importlib
@@ -2982,6 +2994,18 @@ class TestApertusFusedFP8Path(unittest.TestCase):
             "mlp._forward_with_fp8_input",
             src,
             "_forward_aiter_fp8 must pass FP8 to mlp.up_proj via _forward_with_fp8_input",
+        )
+
+    def test_apertus_aiter_fp8_uses_allreduce_fusion_when_available(self):
+        """_forward_aiter_fp8 must use forward_with_allreduce_fusion_fp8_out for TP>1."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.apertus")
+        src = inspect.getsource(mod.ApertusDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_with_allreduce_fusion_fp8_out",
+            src,
+            "_forward_aiter_fp8 must try forward_with_allreduce_fusion_fp8_out for TP>1 savings",
         )
 
     def test_apertus_module_has_use_aiter_flag(self):
