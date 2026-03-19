@@ -81,6 +81,16 @@ SHAPES_TO_TUNE: List[Tuple[int, int, str]] = [
     # Gemma3-12B: hidden=3840, intermediate=15360
     (3840, 15360, "Gemma3-12B down_proj TP=1"),
     (3840, 7680, "Gemma3-12B down_proj TP=2"),
+    # --- Qwen2.5-72B N>=K shapes (stay on bpreshuffle with hybrid dispatch) ---
+    # QKV: num_heads=64, kv_heads=8, head_dim=128 -> N=(64+2*8)*128=10240
+    (10240, 8192, "Qwen2.5-72B QKV proj TP=1"),
+    # GateUp: N=intermediate*2/tp = 29568*2/1 = 59136
+    (59136, 8192, "Qwen2.5-72B gate_up TP=1"),
+    # O proj: N=hidden=8192, K=hidden=8192
+    (8192, 8192, "Qwen2.5-72B/Llama3-70B o_proj TP=1"),
+    # Llama3-8B/70B: QKV and GateUp shapes
+    (6144, 4096, "Llama3-8B QKV proj TP=1"),
+    (8192, 4096, "Llama3-70B QKV proj TP=1"),
 ]
 
 # Batch sizes (M) to tune for each shape.

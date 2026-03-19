@@ -4558,5 +4558,128 @@ class TestLongcatFlashFP8AiterPath(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestHybridCKBpreshuffleDispatch(unittest.TestCase):
+    """Test that the hybrid CK/bpreshuffle GEMM dispatch selects the right kernel
+    based on weight shape: CK for K > N (down_proj), bpreshuffle for N >= K."""
+
+    def test_apply_fp8_ck_linear_exists(self):
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ck_linear
+        self.assertTrue(callable(apply_fp8_ck_linear))
+
+    def test_w8a8_process_weights_sets_use_ck_flag(self):
+        """W8A8Fp8LinearMethod should set _use_ck based on K > N."""
+        from sglang.srt.layers.quantization.w8a8_fp8 import _use_aiter
+        if not _use_aiter:
+            self.skipTest("AITER not enabled")
+
+        import inspect
+        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+        src = inspect.getsource(W8A8Fp8LinearMethod.process_weights_after_loading)
+        self.assertIn("_use_ck", src, "process_weights_after_loading must set _use_ck")
+        self.assertIn("K > N", src, "Heuristic should be K > N for CK dispatch")
+
+    def test_w8a8_process_weights_no_ck_for_gate_up(self):
+        """Gate/up proj (N > K) should use bpreshuffle (no shuffle skip)."""
+        from sglang.srt.layers.quantization.w8a8_fp8 import _use_aiter
+        if not _use_aiter:
+            self.skipTest("AITER not enabled")
+
+        import inspect
+        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+        src = inspect.getsource(W8A8Fp8LinearMethod.process_weights_after_loading)
+        # When use_ck is False, shuffle_weight should still be called
+        self.assertIn("shuffle_weight", src, "Non-CK path must still call shuffle_weight")
+
+    def test_ck_linear_correctness(self):
+        """apply_fp8_ck_linear produces correct output vs BF16 reference."""
+        from sglang.srt.layers.quantization.w8a8_fp8 import _use_aiter
+        if not _use_aiter:
+            self.skipTest("AITER not enabled")
+
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ck_linear
+        from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+
+        N, K = 4096, 14336  # down_proj shape
+        w_bf16 = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.01
+        x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
+        ref = torch.mm(x, w_bf16.t())
+
+        qw, w_scale = per_token_group_quant_fp8(w_bf16, K)
+        out = apply_fp8_ck_linear(x, qw, w_scale)
+
+        cos = torch.nn.functional.cosine_similarity(
+            ref.flatten().float(), out.flatten().float(), dim=0
+        )
+        self.assertGreater(cos.item(), 0.99, f"CK output diverged: cosine={cos.item()}")
+
+    def test_bpreshuffle_linear_correctness(self):
+        """apply_fp8_ptpc_linear produces correct output vs BF16 reference."""
+        from sglang.srt.layers.quantization.w8a8_fp8 import _use_aiter
+        if not _use_aiter:
+            self.skipTest("AITER not enabled")
+
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
+        from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+        from aiter.ops.shuffle import shuffle_weight
+
+        N, K = 28672, 4096  # gate_up shape
+        w_bf16 = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.01
+        x = torch.randn(4, K, device="cuda", dtype=torch.bfloat16)
+        ref = torch.mm(x, w_bf16.t())
+
+        qw, w_scale = per_token_group_quant_fp8(w_bf16, K)
+        qw_shuffled = shuffle_weight(qw.contiguous(), (16, 16))
+        out = apply_fp8_ptpc_linear(x, qw_shuffled, w_scale, use_per_token_if_dynamic=True)
+
+        cos = torch.nn.functional.cosine_similarity(
+            ref.flatten().float(), out.flatten().float(), dim=0
+        )
+        self.assertGreater(cos.item(), 0.99, f"bpreshuffle output diverged: cosine={cos.item()}")
+
+    def test_hybrid_dispatch_in_apply(self):
+        """W8A8Fp8LinearMethod.apply() dispatches correctly based on _use_ck."""
+        from sglang.srt.layers.quantization.w8a8_fp8 import _use_aiter
+        if not _use_aiter:
+            self.skipTest("AITER not enabled")
+
+        import inspect
+        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+        src = inspect.getsource(W8A8Fp8LinearMethod.apply)
+        self.assertIn("_use_ck", src, "apply() must check _use_ck flag")
+        self.assertIn("apply_fp8_ck_linear", src, "apply() must call apply_fp8_ck_linear")
+        self.assertIn("apply_fp8_ptpc_linear", src, "apply() must call apply_fp8_ptpc_linear")
+
+    def test_fbgemm_fp8_has_hybrid_dispatch(self):
+        """FBGEMMFp8LinearMethod.apply() has hybrid CK/bpreshuffle dispatch."""
+        import inspect
+        from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+        src = inspect.getsource(FBGEMMFp8LinearMethod.apply)
+        self.assertIn("_use_ck", src, "FBGEMMFp8 apply() must check _use_ck flag")
+
+    def test_compressed_tensors_has_hybrid_dispatch(self):
+        """CompressedTensorsW8A8Fp8.apply_weights() has hybrid CK/bpreshuffle dispatch."""
+        import inspect
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
+            CompressedTensorsW8A8Fp8,
+        )
+        src = inspect.getsource(CompressedTensorsW8A8Fp8.apply_weights)
+        self.assertIn("_use_ck", src, "CompressedTensors apply_weights() must check _use_ck")
+
+    def test_quark_has_hybrid_dispatch(self):
+        """QuarkW8A8Fp8.apply_weights() has hybrid CK/bpreshuffle dispatch."""
+        import inspect
+        from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import QuarkW8A8Fp8
+        src = inspect.getsource(QuarkW8A8Fp8.apply_weights)
+        self.assertIn("_use_ck", src, "Quark apply_weights() must check _use_ck")
+
+    def test_fp8_linear_method_has_hybrid_dispatch(self):
+        """Fp8LinearMethod.apply() has hybrid CK/bpreshuffle dispatch."""
+        import inspect
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+        src = inspect.getsource(Fp8LinearMethod.apply)
+        self.assertIn("_use_ck", src, "Fp8LinearMethod apply() must check _use_ck")
+
+
 if __name__ == "__main__":
     unittest.main()
