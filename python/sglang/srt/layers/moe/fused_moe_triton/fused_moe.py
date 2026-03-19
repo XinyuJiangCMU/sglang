@@ -663,6 +663,12 @@ def fused_experts_impl(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states[begin_chunk_idx:end_chunk_idx],
                 )
+                # aiter.moe_sum does not support routed_scaling_factor;
+                # apply it as a separate multiply when needed (e.g. DeepSeek).
+                if routed_scaling_factor != 1.0:
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx].mul_(
+                        routed_scaling_factor
+                    )
             else:
                 # According to micro benchmark results, torch.compile can get better performance for small token.
                 if tokens_in_chunk <= 32:
