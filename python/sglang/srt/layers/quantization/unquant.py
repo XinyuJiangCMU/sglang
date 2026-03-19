@@ -436,6 +436,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     ),
                     expert_mask=layer.expert_mask_gpu,
                 )
+                # aiter.fused_moe does not accept routed_scaling_factor; apply separately.
+                rsf = moe_runner_config.routed_scaling_factor
+                if rsf is not None and rsf != 1.0:
+                    output = output * rsf
                 return StandardCombineInput(hidden_states=output)
             else:
                 quant_info = TritonMoeQuantInfo(
