@@ -168,6 +168,22 @@ class LongcatFlashMLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """MLP forward using pre-quantized FP8 input for gate_up_proj (AMD AITER path).
+
+        Skips redundant per_token_quant_hip inside gemm_a8w8_bpreshuffle by
+        reusing FP8 already computed by the preceding fused RMSNorm+FP8 op.
+        """
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        out = self.act_fn(gate_up)
+        out, _ = self.down_proj(out)
+        return out
+
 
 class LongcatFlashRouter(nn.Module):
     def __init__(

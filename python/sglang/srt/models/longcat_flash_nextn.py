@@ -169,6 +169,72 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
+        # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
+        # MLA attention is too complex for qkv_proj FP8 input; only MLP norm fusion
+        # is applied via prepare_mlp_fp8_out + mlp._forward_with_fp8_input.
+        if _use_aiter:
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.mlp.gate_up_proj, "quant_method", None)
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                scheme = getattr(self.mlp.gate_up_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
+        else:
+            self._aiter_fp8 = False
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual,
+        zero_allocator,
+    ):
+        """Decoder forward with fused post_attention_layernorm+FP8 for MLP (AMD AITER path).
+
+        MLA attention is incompatible with qkv_proj FP8 input; only
+        prepare_mlp_fp8_out fuses allreduce+add+RMSNorm+FP8 into a single kernel.
+        """
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
+
+        result = self.layer_communicator.prepare_mlp_fp8_out(
+            hidden_states, residual, forward_batch
+        )
+        if result is not None:
+            fp8_hs, fp8_scale, residual = result
+            hidden_states = self.mlp._forward_with_fp8_input(
+                hidden_states, fp8_hs, fp8_scale
+            )
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states = self.mlp(hidden_states)
+
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+        return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -177,6 +243,10 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        if self._aiter_fp8 and not forward_batch.forward_mode.is_idle():
+            return self._forward_aiter_fp8(
+                positions, hidden_states, forward_batch, residual, zero_allocator
+            )
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch

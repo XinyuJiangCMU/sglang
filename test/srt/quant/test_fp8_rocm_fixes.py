@@ -4051,5 +4051,100 @@ class TestJetNemotronFusedFP8Path(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestLongcatFlashNextNFusedFP8Path(unittest.TestCase):
+    """Tests for LongcatFlashDenseDecoderLayer fused MLP FP8 path on AMD MI300X."""
+
+    def test_longcat_flash_mlp_has_fp8_input_method(self):
+        """LongcatFlashMLP must define _forward_with_fp8_input."""
+        from sglang.srt.models.longcat_flash import LongcatFlashMLP
+
+        self.assertTrue(
+            hasattr(LongcatFlashMLP, "_forward_with_fp8_input"),
+            "LongcatFlashMLP must define _forward_with_fp8_input for FP8 path",
+        )
+
+    def test_longcat_flash_nextn_decoder_has_aiter_fp8_attr(self):
+        """LongcatFlashDenseDecoderLayer must set _aiter_fp8 in __init__."""
+        import inspect
+        from sglang.srt.models.longcat_flash_nextn import LongcatFlashDenseDecoderLayer
+
+        src = inspect.getsource(LongcatFlashDenseDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "LongcatFlashDenseDecoderLayer.__init__ must set _aiter_fp8",
+        )
+
+    def test_longcat_flash_nextn_decoder_has_forward_aiter_fp8(self):
+        """LongcatFlashDenseDecoderLayer must define _forward_aiter_fp8."""
+        from sglang.srt.models.longcat_flash_nextn import LongcatFlashDenseDecoderLayer
+
+        self.assertTrue(
+            hasattr(LongcatFlashDenseDecoderLayer, "_forward_aiter_fp8"),
+            "LongcatFlashDenseDecoderLayer must define _forward_aiter_fp8",
+        )
+
+    def test_longcat_flash_nextn_forward_dispatches_to_aiter_fp8(self):
+        """LongcatFlashDenseDecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        from sglang.srt.models.longcat_flash_nextn import LongcatFlashDenseDecoderLayer
+
+        src = inspect.getsource(LongcatFlashDenseDecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "forward must dispatch to _forward_aiter_fp8 when _aiter_fp8 is set",
+        )
+
+    def test_longcat_flash_nextn_aiter_fp8_uses_prepare_mlp_fp8_out(self):
+        """_forward_aiter_fp8 must use prepare_mlp_fp8_out for norm+FP8 fusion."""
+        import inspect
+        from sglang.srt.models.longcat_flash_nextn import LongcatFlashDenseDecoderLayer
+
+        src = inspect.getsource(LongcatFlashDenseDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "prepare_mlp_fp8_out",
+            src,
+            "_forward_aiter_fp8 must use prepare_mlp_fp8_out",
+        )
+
+    def test_longcat_flash_nextn_aiter_fp8_calls_mlp_fp8(self):
+        """_forward_aiter_fp8 must call mlp._forward_with_fp8_input."""
+        import inspect
+        from sglang.srt.models.longcat_flash_nextn import LongcatFlashDenseDecoderLayer
+
+        src = inspect.getsource(LongcatFlashDenseDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "mlp._forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must call mlp._forward_with_fp8_input",
+        )
+
+    def test_longcat_flash_nextn_aiter_fp8_guards_idle_mode(self):
+        """forward must guard _forward_aiter_fp8 against idle forward mode."""
+        import inspect
+        from sglang.srt.models.longcat_flash_nextn import LongcatFlashDenseDecoderLayer
+
+        src = inspect.getsource(LongcatFlashDenseDecoderLayer.forward)
+        self.assertIn(
+            "is_idle",
+            src,
+            "forward must guard _aiter_fp8 dispatch with is_idle() check",
+        )
+
+    def test_longcat_flash_mlp_fp8_uses_forward_with_fp8_input(self):
+        """LongcatFlashMLP._forward_with_fp8_input must use gate_up_proj FP8 forward."""
+        import inspect
+        from sglang.srt.models.longcat_flash import LongcatFlashMLP
+
+        src = inspect.getsource(LongcatFlashMLP._forward_with_fp8_input)
+        self.assertIn(
+            "forward_with_fp8_input",
+            src,
+            "_forward_with_fp8_input must call gate_up_proj.forward_with_fp8_input",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
