@@ -43,6 +43,9 @@ strategy_to_parameter_type = {
 
 
 class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
+    # Signal to CompressedTensorsLinearMethod that prequantized_fp8 args are accepted.
+    _supports_prequantized_fp8 = True
+
     def __init__(self, weight_quant: QuantizationArgs, is_static_input_scheme: bool):
         self.weight_quant = weight_quant
         self.strategy = self.weight_quant.strategy

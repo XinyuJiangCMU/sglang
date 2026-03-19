@@ -273,14 +273,22 @@ class Qwen2DecoderLayer(nn.Module):
         )
         # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
         if _use_aiter:
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
             from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
             from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
             from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
 
             qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
-            self._aiter_fp8 = isinstance(
-                qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
-            )
+            # For CompressedTensors, check the underlying scheme signals FP8 support.
+            if isinstance(qm, CompressedTensorsLinearMethod):
+                scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
         else:
             self._aiter_fp8 = False
 
