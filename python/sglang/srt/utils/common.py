@@ -107,8 +107,8 @@ def is_hip() -> bool:
 
 
 if is_hip():
-    HIP_FP8_E4M3_FNUZ_MAX = 224.0
-    FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
+    # float8_e4m3fnuz is the native FP8 dtype on AMD ROCm; max is 240.0
+    FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fnuz).max
 else:
     FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
