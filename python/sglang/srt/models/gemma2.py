@@ -93,6 +93,22 @@ class Gemma2MLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """MLP forward with pre-quantized FP8 input for AMD AITER path.
+
+        Uses fp8_input/fp8_scale from the fused GemmaRMSNorm+FP8 kernel to call
+        gate_up_proj without redundant per_token_quant (~13µs savings on MI300X).
+        """
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
 
 class Gemma2Attention(nn.Module):
     def __init__(
@@ -298,11 +314,13 @@ class Gemma2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Gemma2 decoder forward with fused add+GemmaRMSNorm+FP8 for attention (AMD AITER).
+        """Gemma2 decoder forward with fused add+GemmaRMSNorm+FP8 (AMD AITER).
 
-        Fuses the input_layernorm add+norm+per_token_quant into a single kernel
-        (~13µs savings per layer on MI300X). The Gemma2-specific post_attention_layernorm,
-        pre_feedforward_layernorm, and post_feedforward_layernorm remain in BF16.
+        Fuses both input_layernorm and pre_feedforward_layernorm add+norm+per_token_quant
+        into single AITER kernels (~13µs savings per norm call on MI300X).
+        post_attention_layernorm (applied to attention output only, no residual add) and
+        post_feedforward_layernorm (applied to MLP output, no residual add) remain in BF16
+        as they do not benefit from the fused add+norm+quant pattern.
         """
         # Attention: fused add+GemmaRMSNorm+FP8 into qkv_proj
         if residual is None:
@@ -319,13 +337,15 @@ class Gemma2DecoderLayer(nn.Module):
             skip_o_reduce=True,
         )
 
-        # Allreduce (TP>1) then post_attention_layernorm (no residual add here)
+        # Allreduce (TP>1) then post_attention_layernorm (no residual add)
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # pre_feedforward_layernorm adds residual + norms for MLP
-        hidden_states, residual = self.pre_feedforward_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        # MLP: fused add+GemmaRMSNorm+FP8 into gate_up_proj via pre_feedforward_layernorm
+        fp8_hs, fp8_scale, residual = self.pre_feedforward_layernorm.forward_aiter_fp8_out(
+            hidden_states, residual
+        )
+        hidden_states = self.mlp._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         return hidden_states, residual
 

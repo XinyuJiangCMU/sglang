@@ -2755,6 +2755,32 @@ class TestGemma2FusedFP8Path(unittest.TestCase):
             "_forward_aiter_fp8 must apply post_attention_layernorm (Gemma2 architecture)",
         )
 
+    def test_gemma2_mlp_has_forward_with_fp8_input(self):
+        """Gemma2MLP must have _forward_with_fp8_input for full-layer FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gemma2")
+        self.assertTrue(
+            hasattr(mod.Gemma2MLP, "_forward_with_fp8_input"),
+            "Gemma2MLP must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_gemma2_aiter_fp8_fuses_pre_feedforward_layernorm(self):
+        """_forward_aiter_fp8 must fuse pre_feedforward_layernorm via forward_aiter_fp8_out."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gemma2")
+        src = inspect.getsource(mod.Gemma2DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "pre_feedforward_layernorm.forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must fuse pre_feedforward_layernorm for MLP FP8",
+        )
+        self.assertIn(
+            "mlp._forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must pass FP8 to mlp.gate_up_proj via _forward_with_fp8_input",
+        )
+
 
 class TestErnie45VLMoeFusedFP8Path(unittest.TestCase):
     """Tests for Ernie4.5 VL MoE fused RMSNorm+FP8 decoder path (AMD AITER)."""
