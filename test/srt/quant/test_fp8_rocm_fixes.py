@@ -1513,6 +1513,42 @@ class TestQwen3NextFusedFP8Path(unittest.TestCase):
             "_forward_with_fp8_input must handle attn_output_gate (Qwen3Next gated attention)",
         )
 
+    def test_qwen3_next_aiter_fp8_fuses_dense_mlp_norm(self):
+        """_forward_aiter_fp8 must call prepare_mlp_fp8_out for dense MLP layers."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen3_next")
+        src = inspect.getsource(mod.Qwen3HybridAttentionDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "prepare_mlp_fp8_out",
+            src,
+            "_forward_aiter_fp8 must call prepare_mlp_fp8_out for dense MLP FP8 fusion",
+        )
+
+    def test_qwen3_next_aiter_fp8_uses_mlp_forward_with_fp8_input(self):
+        """_forward_aiter_fp8 must call mlp._forward_with_fp8_input for dense layers."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen3_next")
+        src = inspect.getsource(mod.Qwen3HybridAttentionDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "_forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must call mlp._forward_with_fp8_input for dense layers",
+        )
+
+    def test_qwen3_next_aiter_fp8_checks_qwen2_moe_mlp_type(self):
+        """_forward_aiter_fp8 must check isinstance(self.mlp, Qwen2MoeMLP) for MLP type."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen3_next")
+        src = inspect.getsource(mod.Qwen3HybridAttentionDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "Qwen2MoeMLP",
+            src,
+            "_forward_aiter_fp8 must check isinstance(self.mlp, Qwen2MoeMLP) to gate FP8 MLP",
+        )
+
 
 @unittest.skipIf(not is_hip(), "ROCm-only tests")
 class TestAiterGemmCoverage(unittest.TestCase):

@@ -858,10 +858,11 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Qwen3Next hybrid attention decoder forward with fused add+GemmaRMSNorm+FP8.
 
-        Uses prepare_attn_fp8_out() to fuse add+norm+per_token_quant into a
-        single kernel, saving ~14µs per layer on MI300X.
-        Falls back to standard path when fused FP8 is unavailable.
-        MLP is always MoE (Qwen2MoeSparseMoeBlock) and uses the standard path.
+        Uses prepare_attn_fp8_out() / prepare_mlp_fp8_out() to fuse
+        add+norm+per_token_quant into a single kernel, saving ~14µs per norm
+        op on MI300X.  Falls back to standard path when fused FP8 is unavailable.
+        For dense MLP layers (Qwen2MoeMLP), also fuses post_attention_layernorm.
+        For MoE layers (Qwen2MoeSparseMoeBlock), MLP uses the standard path.
         """
         # Input layernorm: fused add+GemmaRMSNorm+FP8 quant
         fp8_result = self.layer_communicator.prepare_attn_fp8_out(
@@ -885,14 +886,38 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                     forward_batch=forward_batch,
                 )
 
-        # MLP: always MoE (Qwen2MoeSparseMoeBlock) - use standard path
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        # MLP: fuse post_attention_layernorm+FP8 for dense layers; standard for MoE
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+        if isinstance(self.mlp, Qwen2MoeMLP):
+            mlp_fp8 = self.layer_communicator.prepare_mlp_fp8_out(
+                hidden_states, residual, forward_batch
+            )
+            if mlp_fp8 is not None:
+                fp8_hs, fp8_scale, residual = mlp_fp8
+                # Pass should_allreduce_fusion=True to match the standard path
+                # (down_proj skips allreduce; postprocess_layer handles the rest).
+                hidden_states = self.mlp._forward_with_fp8_input(
+                    hidden_states,
+                    fp8_hs,
+                    fp8_scale,
+                    should_allreduce_fusion=True,
+                    use_reduce_scatter=use_reduce_scatter,
+                )
+            else:
+                hidden_states, residual = self.layer_communicator.prepare_mlp(
+                    hidden_states, residual, forward_batch
+                )
+                hidden_states = self.mlp(
+                    hidden_states, forward_batch, use_reduce_scatter
+                )
+        else:
+            # MoE: standard path
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
