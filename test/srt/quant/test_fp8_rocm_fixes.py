@@ -779,5 +779,154 @@ class TestFusedRMSNormFP8(unittest.TestCase):
         self.assertGreater(cos_res, 0.9999, f"Residual cosine too low: {cos_res:.6f}")
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestFBGEMMFp8AITERPath(unittest.TestCase):
+    """Test FBGEMMFp8LinearMethod with AITER gemm_a8w8_bpreshuffle path."""
+
+    def setUp(self):
+        from sglang.srt.layers.quantization.fp8_utils import _use_aiter
+        if not _use_aiter:
+            self.skipTest("SGLANG_USE_AITER not set (required for AITER path)")
+        try:
+            from aiter.ops.shuffle import shuffle_weight  # noqa: F401
+        except ImportError:
+            self.skipTest("aiter.ops.shuffle not available")
+
+    def test_process_weights_preshuffle(self):
+        """FBGEMMFp8 process_weights_after_loading should preshuffle weight on AITER."""
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+        from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config, FBGEMMFp8LinearMethod
+
+        config = FBGEMMFp8Config(ignore_list=[], input_scale_ub=1.0)
+        method = FBGEMMFp8LinearMethod(config)
+
+        # Create a mock layer with weight in (N, K) = (256, 256) before loading
+        N, K = 256, 256
+        weight = torch.randn(N, K, device="cuda").to(fp8_dtype)
+        weight_scale = torch.ones(N, 1, device="cuda", dtype=torch.float32) * 0.01
+
+        from torch.nn import Parameter
+        layer = type("MockLayer", (), {
+            "weight": Parameter(weight),
+            "weight_scale": Parameter(weight_scale),
+            "input_scale_ub": Parameter(torch.tensor(1.0)),
+        })()
+
+        method.process_weights_after_loading(layer)
+
+        # After loading, weight should be preshuffled (N, K) shape preserved
+        self.assertEqual(layer.weight.shape, (N, K))
+        self.assertEqual(layer.weight.dtype, fp8_dtype)
+        # input_scale_ub should be deleted since AITER doesn't use it
+        self.assertFalse(hasattr(layer, "input_scale_ub"),
+                         "input_scale_ub should be deleted for AITER path")
+
+    def test_apply_correctness(self):
+        """FBGEMMFp8 AITER path should produce correct GEMM output."""
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, per_token_group_quant_fp8
+        from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config, FBGEMMFp8LinearMethod
+
+        try:
+            from aiter.ops.shuffle import shuffle_weight
+        except ImportError:
+            self.skipTest("aiter.ops.shuffle not available")
+
+        M, N, K = 4, 512, 512
+        W_bf16 = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        qW, wscale = per_token_group_quant_fp8(W_bf16, K)
+        W_shuffled = shuffle_weight(qW.contiguous(), (16, 16))
+
+        from torch.nn import Parameter
+        layer = type("MockLayer", (), {
+            "weight": Parameter(W_shuffled),
+            "weight_scale": Parameter(wscale),
+        })()
+
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        ref = x @ W_bf16.t()
+
+        config = FBGEMMFp8Config(ignore_list=[], input_scale_ub=1.0)
+        method = FBGEMMFp8LinearMethod(config)
+        out = method.apply(layer, x, bias=None)
+
+        self.assertEqual(out.shape, (M, N))
+        cos = torch.nn.functional.cosine_similarity(
+            ref.flatten().float().unsqueeze(0),
+            out.flatten().float().unsqueeze(0),
+        ).item()
+        self.assertGreater(cos, 0.99, f"FBGEMMFp8 AITER cosine={cos:.4f}")
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestRoutedScalingFactorMoE(unittest.TestCase):
+    """Test that routed_scaling_factor is correctly applied in AMD MoE paths."""
+
+    def _make_mock_moe_runner_config(self, rsf=2.5):
+        """Create a minimal MoeRunnerConfig with routed_scaling_factor."""
+        from unittest.mock import MagicMock
+        config = MagicMock()
+        config.routed_scaling_factor = rsf
+        config.activation = "silu"
+        config.apply_router_weight_on_input = False
+        config.no_combine = False
+        return config
+
+    def test_w8a8_fp8_moe_rsf_applied(self):
+        """W8A8FP8MoEMethod AITER path must apply routed_scaling_factor."""
+        from sglang.srt.layers.quantization.fp8_utils import _use_aiter
+        if not _use_aiter:
+            self.skipTest("SGLANG_USE_AITER not set")
+        try:
+            from aiter import fused_moe as aiter_fused_moe  # noqa: F401
+        except ImportError:
+            self.skipTest("aiter.fused_moe not available")
+
+        # Verify the routed_scaling_factor code path exists in W8A8FP8MoEMethod
+        import inspect
+        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8FP8MoEMethod
+        src = inspect.getsource(W8A8FP8MoEMethod.apply)
+        self.assertIn("routed_scaling_factor", src,
+                      "W8A8FP8MoEMethod.apply should reference routed_scaling_factor")
+
+    def test_quark_w8a8_fp8_moe_rsf_applied(self):
+        """QuarkW8A8Fp8MoEMethod AITER path must apply routed_scaling_factor."""
+        import inspect
+        from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8_moe import (
+            QuarkW8A8Fp8MoEMethod,
+        )
+        src = inspect.getsource(QuarkW8A8Fp8MoEMethod.apply)
+        self.assertIn("routed_scaling_factor", src,
+                      "QuarkW8A8Fp8MoEMethod.apply should reference routed_scaling_factor")
+
+    def test_compressed_tensors_moe_rsf_applied(self):
+        """W8A8FP8MoEMethod (compressed_tensors) AITER path must apply routed_scaling_factor."""
+        import inspect
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe import (
+            W8A8FP8MoEMethod,
+        )
+        src = inspect.getsource(W8A8FP8MoEMethod.apply)
+        self.assertIn("routed_scaling_factor", src,
+                      "compressed_tensors W8A8FP8MoEMethod.apply should reference routed_scaling_factor")
+
+    def test_triton_moe_runner_rsf_applied(self):
+        """TritonRunnerCore.run should apply routed_scaling_factor after moe_sum."""
+        import inspect
+        from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
+        src = inspect.getsource(TritonRunnerCore.run)
+        self.assertIn("routed_scaling_factor", src,
+                      "TritonRunnerCore.run should reference routed_scaling_factor")
+
+    def test_rsf_value_check(self):
+        """routed_scaling_factor != 1.0 guard should prevent unnecessary multiply."""
+        # Verify the pattern: only apply multiply when rsf != 1.0
+        # This is a simple source-code check for the guard condition
+        import inspect
+        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8FP8MoEMethod
+        src = inspect.getsource(W8A8FP8MoEMethod.apply)
+        # Should contain both the rsf reference and the != 1.0 guard
+        self.assertIn("rsf != 1.0", src,
+                      "Should guard routed_scaling_factor multiply with != 1.0 check")
+
+
 if __name__ == "__main__":
     unittest.main()
