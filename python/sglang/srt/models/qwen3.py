@@ -30,13 +30,14 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
 
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -172,6 +173,40 @@ class Qwen3Attention(nn.Module):
         )
         return q, k, v
 
+    def _forward_with_fp8_input(
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        forward_batch: ForwardBatch,
+        skip_o_reduce: bool = False,
+    ) -> torch.Tensor:
+        """Attention forward using pre-quantized FP8 input for qkv_proj (AMD AITER path).
+
+        Skips redundant per_token_quant_hip inside gemm_a8w8_bpreshuffle by
+        reusing FP8 already computed by the preceding fused RMSNorm+FP8 op.
+        x is the float tensor before norm, used only for output dtype/shape.
+        skip_o_reduce: if True, skip the o_proj allreduce (caller will fuse it
+        with the subsequent norm via prepare_mlp_fp8_out).
+
+        Note: Qwen3 has per-head q_norm/k_norm so QKV output is BF16 from here.
+        """
+        qkv, _ = self.qkv_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            head_dim=self.head_dim,
+            alt_stream=self.alt_stream,
+        )
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, forward_batch)
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_o_reduce)
+        return output
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -273,6 +308,112 @@ class Qwen3DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
+        # Fused add+RMSNorm+FP8 path for AMD AITER (gfx942 / MI300X).
+        # Disabled when rl_on_policy_target uses fp32 norms (norm_kwargs non-empty).
+        if _use_aiter and not norm_kwargs:
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
+        else:
+            self._aiter_fp8 = False
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Qwen3 decoder forward with fused add+RMSNorm+FP8 quantization (AMD AITER).
+
+        Uses LayerCommunicator.prepare_attn_fp8_out() / prepare_mlp_fp8_out() to
+        fuse the add+norm+per_token_quant into a single kernel call, skipping
+        the redundant aiter.per_token_quant_hip inside gemm_a8w8_bpreshuffle.
+        Falls back to the standard path via prepare_attn/prepare_mlp when the
+        fused FP8 path is unavailable (complex TP/DP scatter modes, allreduce
+        fusion not available for TP>1, etc.).
+        """
+        from sglang.srt.distributed import tensor_model_parallel_all_reduce
+
+        # Input layernorm: fused add+norm+fp8 quant
+        fp8_result = self.layer_communicator.prepare_attn_fp8_out(
+            hidden_states, residual, forward_batch,
+            post_residual_addition=post_residual_addition,
+        )
+        if fp8_result is not None and hidden_states.shape[0] != 0:
+            fp8_hs, fp8_scale, residual = fp8_result
+            hidden_states = self.self_attn._forward_with_fp8_input(
+                positions, hidden_states, fp8_hs, fp8_scale, forward_batch,
+                skip_o_reduce=True,
+            )
+        else:
+            # Fallback to standard path for this attention sub-layer
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch,
+                post_residual_addition=post_residual_addition,
+            )
+            if hidden_states.shape[0] != 0:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+            return self._forward_mlp_standard(hidden_states, residual, forward_batch)
+
+        # MLP: fused allreduce+add+norm+fp8 quant.
+        # prepare_mlp_fp8_out handles allreduce for TP>1 (AITER AR fusion) or
+        # plain add+norm+fp8 for TP=1.  Returns None when the fused FP8 path is
+        # unavailable.  In that case, fall back to prepare_mlp which handles
+        # allreduce + layernorm internally (for both TP=1 and TP>1).
+        mlp_fp8 = self.layer_communicator.prepare_mlp_fp8_out(
+            hidden_states, residual, forward_batch
+        )
+        if mlp_fp8 is not None:
+            fp8_hs, fp8_scale, residual = mlp_fp8
+            hidden_states = self.mlp._forward_with_fp8_input(
+                hidden_states, fp8_hs, fp8_scale
+            )
+        else:
+            # Fallback: prepare_mlp handles allreduce (TP>1) + layernorm
+            return self._forward_mlp_standard(hidden_states, residual, forward_batch)
+
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+        return hidden_states, residual
+
+    def _forward_mlp_standard(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Standard (non-FP8-fused) MLP sub-layer forward."""
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch,
+        )
+        hidden_states = self.mlp(hidden_states)
+        if _is_npu and get_cmo_stream():
+            wait_cmo_stream()
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+        return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -281,6 +422,13 @@ class Qwen3DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # AMD AITER fused add+RMSNorm+FP8 path (MI300X)
+        if self._aiter_fp8:
+            return self._forward_aiter_fp8(
+                positions, hidden_states, forward_batch, residual,
+                post_residual_addition=post_residual_addition,
+            )
+
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,

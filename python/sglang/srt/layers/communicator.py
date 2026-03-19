@@ -579,6 +579,102 @@ class LayerCommunicator:
             context=self._context,
         )
 
+    def prepare_attn_fp8_out(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+        """Fused add+RMSNorm+FP8 variant of prepare_attn for AMD AITER path.
+
+        Returns (fp8_hs, fp8_scale, residual) where fp8_hs has dtype
+        float8_e4m3fnuz and fp8_scale has shape (M, 1) float32.
+        Returns None if the fused FP8 path is unavailable (complex TP/DP modes,
+        non-RMSNorm norms, or AITER not available).
+
+        The caller is responsible for routing fp8_hs/fp8_scale to the attention
+        linear via forward_with_fp8_input() rather than calling the norm separately.
+        """
+        from sglang.srt.layers.layernorm import RMSNorm
+
+        if (
+            not _use_aiter
+            or not isinstance(self.input_layernorm, RMSNorm)
+            or get_attn_tp_context().input_scattered
+            or hidden_states.shape[0] == 0
+            or self._communicate_with_all_reduce_and_layer_norm_fn
+            is not CommunicateWithAllReduceAndLayerNormFn._simple
+            or is_dp_attention_enabled()
+        ):
+            return None
+
+        if residual is None:
+            residual = hidden_states
+            fp8_hs, fp8_scale, _ = self.input_layernorm.forward_aiter_fp8_out(
+                hidden_states
+            )
+        else:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            fp8_hs, fp8_scale, residual = self.input_layernorm.forward_aiter_fp8_out(
+                hidden_states, residual
+            )
+
+        # Pass fp8_hs through the simple communicate fn (TP=1 no-op).
+        # We return fp8_hs directly since _simple just returns hidden_states as-is.
+        # (No scatter/gather in the simple path.)
+        return fp8_hs, fp8_scale, residual
+
+    def prepare_mlp_fp8_out(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Fused allreduce+add+RMSNorm+FP8 variant of prepare_mlp for AMD AITER path.
+
+        Returns (fp8_hs, fp8_scale, residual) where fp8_hs has dtype
+        float8_e4m3fnuz and fp8_scale has shape (M, 1) float32.
+        Returns None if the fused FP8 path is unavailable (complex TP/DP modes,
+        non-RMSNorm norms, allreduce-then-norm needed but AITER AR fusion missing).
+
+        For TP=1, performs only fused add+norm+fp8_quant.
+        For TP>1, attempts fused allreduce+add+norm+fp8_quant via
+        forward_with_allreduce_fusion_fp8_out; falls back to None if unavailable.
+        """
+        from sglang.srt.layers.layernorm import RMSNorm
+
+        if (
+            not _use_aiter
+            or not isinstance(self.post_attention_layernorm, RMSNorm)
+            or hidden_states.shape[0] == 0
+            or is_dp_attention_enabled()
+        ):
+            return None
+
+        if (
+            self._communicate_with_all_reduce_and_layer_norm_fn
+            is CommunicateWithAllReduceAndLayerNormFn._simple
+        ):
+            # TP=1 or attn_tp_size==1 simple path: just fused norm+fp8_quant
+            fp8_hs, fp8_scale, residual = (
+                self.post_attention_layernorm.forward_aiter_fp8_out(
+                    hidden_states, residual
+                )
+            )
+            return fp8_hs, fp8_scale, residual
+
+        # TP>1: try fused allreduce+add+norm+fp8 (AITER custom AR kernel)
+        fused = self.post_attention_layernorm.forward_with_allreduce_fusion_fp8_out(
+            hidden_states, residual
+        )
+        if fused is not None:
+            fp8_hs, residual, fp8_scale = fused
+            return fp8_hs, fp8_scale, residual
+
+        return None
+
     def postprocess_layer(
         self,
         hidden_states: torch.Tensor,
