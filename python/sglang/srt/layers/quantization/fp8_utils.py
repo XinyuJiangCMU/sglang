@@ -1555,7 +1555,9 @@ def apply_fp8_ptpc_linear(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
 
-    # weight is transposed (K, N)
+    # Default output_shape assumes per-tensor path where weight is (K, N).
+    # For per-channel (non-per-tensor) path weight is (N, K) preshuffled;
+    # output_shape is overridden below in that branch.
     output_shape = [*input.shape[:-1], weight.shape[1]]
 
     q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
@@ -1564,7 +1566,8 @@ def apply_fp8_ptpc_linear(
     per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
 
     if not (per_tensor_weights and per_tensor_activations):
-        # weight is in (N, K)
+        # Per-channel path: weight is in (N, K) preshuffled layout,
+        # weight_scale is (N, 1).  gemm_a8w8_bpreshuffle outputs (M, N).
         output_shape = [*input.shape[:-1], weight.shape[0]]
 
     output = aiter.gemm_a8w8_bpreshuffle(

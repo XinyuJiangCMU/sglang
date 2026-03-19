@@ -282,7 +282,9 @@ class TestAITERPerChannelGEMM(unittest.TestCase):
         torch.manual_seed(42)
         W = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
         qw, ws = per_token_group_quant_fp8(W, W.shape[-1])
-        ws_stored = ws.t().contiguous()
+        # ws has shape (N, 1) from per_token_group_quant_fp8 - use directly, no transpose.
+        # gemm_a8w8_bpreshuffle expects w_scale in (N, 1) layout.
+        ws_stored = ws.contiguous()
         qw_shuffled = shuffle_weight(qw.contiguous(), (16, 16))
 
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
@@ -346,7 +348,8 @@ class TestAITERPerChannelGEMM(unittest.TestCase):
         M, N, K = 4, 2560, 2560
         W = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
         qw, ws = per_token_group_quant_fp8(W, W.shape[-1])
-        ws_stored = ws.t().contiguous()
+        # ws has shape (N, 1) - use directly (no transpose) for gemm_a8w8_bpreshuffle
+        ws_stored = ws.contiguous()
         qw_shuffled = shuffle_weight(qw.contiguous(), (16, 16))
 
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
@@ -484,7 +487,8 @@ class TestFP8EdgeCases(unittest.TestCase):
         M, N, K = 32, 2560, 2560
         W = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
         qW, wscale = per_token_group_quant_fp8(W, K)
-        wscale_stored = wscale.t().contiguous()
+        # wscale has shape (N, 1) - use directly (no transpose) for gemm_a8w8_bpreshuffle
+        wscale_stored = wscale.contiguous()
         W_shuffled = shuffle_weight(qW.contiguous(), (16, 16))
 
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
@@ -566,7 +570,8 @@ class TestFP8PerformanceSanity(unittest.TestCase):
         M, N, K = 1, 2560, 2560
         W = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
         qW, ws = per_token_group_quant_fp8(W, K)
-        ws = ws.t().contiguous()
+        # ws has shape (N, 1) - use directly (no transpose) for gemm_a8w8_bpreshuffle
+        ws = ws.contiguous()
         W_s = shuffle_weight(qW.contiguous(), (16, 16))
 
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)

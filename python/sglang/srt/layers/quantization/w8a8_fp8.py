@@ -141,13 +141,18 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
                 qweight, weight_scale = per_token_group_quant_fp8(
                     layer.weight, layer.weight.shape[-1]
                 )
-                weight_scale = weight_scale.t().contiguous()
+                # weight_scale is (N, 1) from per_token_group_quant_fp8.
+                # AITER (gemm_a8w8_bpreshuffle) expects (N, 1) - keep as-is.
+                # CUTLASS expects a flat vector; transpose to (1, N) for fp8_scaled_mm compat.
+                if not _use_aiter:
+                    weight_scale = weight_scale.t().contiguous()
             else:
                 # per-tensor quantization fallback
                 qweight, weight_scale = input_to_float8(layer.weight, dtype=fp8_dtype)
 
             # Update the layer with the new values.
-            if _use_aiter and not self.cutlass_fp8_supported:
+            if _use_aiter:
+                # AITER gemm_a8w8_bpreshuffle expects (N, K) preshuffled weight + (N, 1) scale.
                 layer.weight = Parameter(
                     shuffle_weight(qweight.contiguous(), (16, 16)),
                     requires_grad=False,
