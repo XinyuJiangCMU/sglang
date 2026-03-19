@@ -1512,6 +1512,26 @@ def apply_fp8_linear(
         )
         return _process_scaled_mm_output(output, input_2d.shape, output_shape)
 
+    # AMD-specific: per-tensor weight scale + per-token activation scale.
+    # hipBLAS rowwise scaled_mm requires scale_b of shape (1, N); expand the
+    # scalar weight scale to that shape (contiguous copy is only N float32s).
+    if (
+        per_tensor_weights
+        and not per_tensor_activations
+        and use_per_token_if_dynamic
+        and USE_ROWWISE_TORCH_SCALED_MM
+    ):
+        w_scale_1n = weight_scale.reshape(1, 1).expand(1, weight.shape[1]).contiguous()
+        output = torch._scaled_mm(
+            qinput,
+            weight,
+            out_dtype=input.dtype,
+            scale_a=x_scale,
+            scale_b=w_scale_1n,
+            bias=bias,
+        )
+        return _process_scaled_mm_output(output, input_2d.shape, output_shape)
+
     # Fallback for channelwise case, where we use unfused DQ
     # due to limitations with scaled_mm
 
