@@ -205,7 +205,6 @@ class AiterAttnBackend(AttentionBackend):
         self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
             self.device
         )
-        self.q_descale = torch.tensor([1.0], dtype=torch.float32).to(self.device)
 
         self.logits_soft_cap = 0.0
 
@@ -2138,8 +2137,16 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.kv_cache_dtype == fp8_dtype:
                 # FP8 KV cache: use native FP8 prefill with descale instead
-                # of dequantizing KV to BF16 (saves memory bandwidth)
-                q_fp8 = q_view.to(fp8)
+                # of dequantizing KV to BF16 (saves memory bandwidth).
+                # Use per-tensor quant (not naive cast) because Q values
+                # can exceed FP8 max (240) for large hidden dimensions.
+                from aiter import dynamic_per_tensor_quant
+
+                q_flat = q_view.reshape(-1, layer.head_dim)
+                q_fp8 = torch.empty_like(q_flat, dtype=fp8_dtype)
+                q_scale = torch.empty(1, dtype=torch.float32, device=q.device)
+                dynamic_per_tensor_quant(q_fp8, q_flat, q_scale)
+                q_fp8 = q_fp8.view_as(q_view)
                 k_scale = (
                     layer.k_scale if layer.k_scale is not None else self.k_scale
                 )
@@ -2162,7 +2169,7 @@ class AiterAttnBackend(AttentionBackend):
                     return_attn_probs=False,
                     window_size=window_size,
                     sink_ptr=sinks,
-                    q_descale=self.q_descale,
+                    q_descale=q_scale,
                     k_descale=k_scale,
                     v_descale=v_scale,
                 )

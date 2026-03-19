@@ -4774,13 +4774,13 @@ class TestHybridCKBpreshuffleDispatch(unittest.TestCase):
 class TestFP8KVCachePrefill(unittest.TestCase):
     """Test FP8 KV cache native prefill (avoid BF16 dequant)."""
 
-    def test_aiter_backend_has_q_descale(self):
-        """AiterAttnBackend pre-allocates q_descale tensor."""
+    def test_prefill_uses_per_tensor_quant_for_q(self):
+        """FP8 KV prefill uses dynamic_per_tensor_quant for Q (not naive cast)."""
         import inspect
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
-        src = inspect.getsource(AiterAttnBackend.__init__)
-        self.assertIn("q_descale", src,
-                       "AiterAttnBackend.__init__ should pre-allocate q_descale")
+        src = inspect.getsource(AiterAttnBackend.forward_extend)
+        self.assertIn("dynamic_per_tensor_quant", src,
+                       "Should use per-tensor quant for Q to avoid FP8 clamping")
 
     def test_prefill_uses_native_fp8_kv(self):
         """forward_extend passes FP8 KV directly with descale instead of dequant."""
