@@ -97,9 +97,11 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
                 weight_scale = layer.weight_scale.data
             if self.per_token:
                 weight_scale = weight_scale.view(-1, 1)
-            if _use_aiter:
-                # Keep (N, K) layout for AITER GEMM; apply_fp8_ptpc_linear expects
-                # pre-shuffled, non-transposed weight
+            if _use_aiter and self.per_token:
+                # Keep (N, K) layout for AITER per-token-per-channel GEMM;
+                # apply_fp8_ptpc_linear expects pre-shuffled, non-transposed weight.
+                # Only for dynamic per-token input quant; static input scheme uses
+                # apply_fp8_linear which expects (K, N) via weight.T internally.
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)), requires_grad=False
                 )
@@ -178,7 +180,7 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        if _use_aiter and self.weight_qscheme == "per_channel":
+        if _use_aiter and self.weight_qscheme == "per_channel" and self.per_token:
             return apply_fp8_ptpc_linear(
                 input=x,
                 weight=layer.weight,

@@ -1346,7 +1346,9 @@ def _apply_fallback_scaled_mm(
     )
 
     output = _process_scaled_mm_output(output, input_2d_shape, output_shape)
-    x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])
+    # x_scale may be 0-dim (per-tensor scalar) or ≥1-dim (per-token); only narrow if 1D+
+    if x_scale.dim() >= 1:
+        x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])
 
     output = output * x_scale * weight_scale.t()
     if bias is not None:
