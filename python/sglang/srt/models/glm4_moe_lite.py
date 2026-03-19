@@ -295,7 +295,8 @@ class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
             )
             self.shared_experts_is_fp8 = (
                 not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+                and self.shared_experts.gate_up_proj.weight.dtype
+                in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
             )
 
         self.top_k = config.num_experts_per_tok

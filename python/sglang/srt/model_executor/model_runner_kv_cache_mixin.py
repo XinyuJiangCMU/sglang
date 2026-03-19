@@ -256,7 +256,7 @@ class ModelRunnerKVCacheMixin:
         # Calculate override_kv_cache_dim for FP8 storage for non-trtllm attention backends:
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
-        if kv_cache_dtype == torch.float8_e4m3fn:
+        if kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             assert (
                 kv_lora_rank % quant_block_size == 0
             ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"

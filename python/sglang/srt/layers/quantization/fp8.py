@@ -359,7 +359,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # Create the weight
         weight_dtype = (
-            torch.float8_e4m3fn if self.is_checkpoint_fp8_serialized else params_dtype
+            fp8_dtype if self.is_checkpoint_fp8_serialized else params_dtype
         )
         weight = ModelWeightParameter(
             data=torch.empty(
@@ -776,7 +776,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
+            params_dtype = torch.uint32 if _use_hip_int4 else fp8_dtype
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (
