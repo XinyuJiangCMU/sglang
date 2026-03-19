@@ -1733,5 +1733,134 @@ class TestMixtralFusedFP8Path(unittest.TestCase):
         )
 
 
+class TestQwen2MoEFusedFP8Path(unittest.TestCase):
+    """Tests for Qwen2MoE fused RMSNorm+FP8 attention path (AMD AITER)."""
+
+    def test_qwen2_moe_attention_has_forward_with_fp8_input(self):
+        """Qwen2MoeAttention must have _forward_with_fp8_input method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen2_moe")
+        self.assertTrue(
+            hasattr(mod.Qwen2MoeAttention, "_forward_with_fp8_input"),
+            "Qwen2MoeAttention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_qwen2_moe_decoder_layer_has_forward_aiter_fp8(self):
+        """Qwen2MoeDecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen2_moe")
+        self.assertTrue(
+            hasattr(mod.Qwen2MoeDecoderLayer, "_forward_aiter_fp8"),
+            "Qwen2MoeDecoderLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_qwen2_moe_decoder_layer_has_aiter_fp8_flag(self):
+        """Qwen2MoeDecoderLayer._aiter_fp8 flag must be set in __init__."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen2_moe")
+        src = inspect.getsource(mod.Qwen2MoeDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "Qwen2MoeDecoderLayer.__init__ must set _aiter_fp8 for AMD detection",
+        )
+
+    def test_qwen2_moe_forward_dispatches_to_aiter_fp8(self):
+        """Qwen2MoeDecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen2_moe")
+        src = inspect.getsource(mod.Qwen2MoeDecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "Qwen2MoeDecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_qwen2_moe_aiter_fp8_uses_standard_moe_path(self):
+        """_forward_aiter_fp8 must use standard path for MoE (not FP8 MLP fused)."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen2_moe")
+        src = inspect.getsource(mod.Qwen2MoeDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "self.mlp",
+            src,
+            "_forward_aiter_fp8 must call self.mlp (MoE, standard path)",
+        )
+
+
+class TestLlama4FusedFP8Path(unittest.TestCase):
+    """Tests for Llama4 fused RMSNorm+FP8 decoder layer (AMD AITER)."""
+
+    def test_llama4_attention_has_forward_with_fp8_input(self):
+        """Llama4Attention must have _forward_with_fp8_input method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.llama4")
+        self.assertTrue(
+            hasattr(mod.Llama4Attention, "_forward_with_fp8_input"),
+            "Llama4Attention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_llama4_decoder_layer_has_forward_aiter_fp8(self):
+        """Llama4DecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.llama4")
+        self.assertTrue(
+            hasattr(mod.Llama4DecoderLayer, "_forward_aiter_fp8"),
+            "Llama4DecoderLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_llama4_decoder_layer_has_aiter_fp8_flag(self):
+        """Llama4DecoderLayer._aiter_fp8 flag must be set in __init__."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.llama4")
+        src = inspect.getsource(mod.Llama4DecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "Llama4DecoderLayer.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_llama4_forward_dispatches_to_aiter_fp8(self):
+        """Llama4DecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.llama4")
+        src = inspect.getsource(mod.Llama4DecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "Llama4DecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_llama4_aiter_fp8_handles_nope_layers(self):
+        """_forward_with_fp8_input must handle both RoPE and NoPE layers."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.llama4")
+        src = inspect.getsource(mod.Llama4Attention._forward_with_fp8_input)
+        # Must handle temperature tuning for NoPE layers
+        self.assertIn(
+            "attn_temperature_tuning",
+            src,
+            "_forward_with_fp8_input must handle NoPE temperature tuning",
+        )
+
+    def test_llama4_aiter_fp8_dense_uses_fp8_mlp(self):
+        """_forward_aiter_fp8 must try FP8 MLP path for dense LlamaMLP layers."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.llama4")
+        src = inspect.getsource(mod.Llama4DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "LlamaMLP",
+            src,
+            "_forward_aiter_fp8 must dispatch FP8 MLP path for dense LlamaMLP layers",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
