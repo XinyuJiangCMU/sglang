@@ -1563,6 +1563,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_config.activation,
                 moe_runner_config.no_combine,
                 moe_runner_config.apply_router_weight_on_input,
+                moe_runner_config.routed_scaling_factor,
             )
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
@@ -1775,6 +1776,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         activation: str = "silu",
         no_combine: bool = False,
         apply_router_weight_on_input: bool = False,
+        routed_scaling_factor: Optional[float] = None,
     ) -> Optional[torch.Tensor]:
         topk_weights, topk_ids, _ = topk_output
 
@@ -1792,7 +1794,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."
-            return fused_moe(
+            output = fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -1805,11 +1807,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     ActivationType.Silu if activation == "silu" else ActivationType.Gelu
                 ),
             )
+            # aiter.fused_moe does not accept routed_scaling_factor; apply separately.
+            if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+                output = output * routed_scaling_factor
+            return output
 
         if _use_aiter:
             assert not no_combine, f"{no_combine=} is not supported."
             if self.block_quant:
-                return fused_moe(
+                output = fused_moe(
                     x,
                     layer.w13_weight,
                     layer.w2_weight,
@@ -1826,7 +1832,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     expert_mask=layer.expert_mask_gpu,
                 )
             else:
-                return fused_moe(
+                output = fused_moe(
                     x,
                     layer.w13_weight,
                     layer.w2_weight,
@@ -1842,6 +1848,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     ),
                     expert_mask=layer.expert_mask_gpu,
                 )
+            # aiter.fused_moe does not accept routed_scaling_factor; apply separately.
+            # The caller (deepseek_v2.py) skips applying this factor when _use_aiter=True,
+            # so we must apply it here.
+            if routed_scaling_factor is not None and routed_scaling_factor != 1.0:
+                output = output * routed_scaling_factor
+            return output
         return None
 
 
