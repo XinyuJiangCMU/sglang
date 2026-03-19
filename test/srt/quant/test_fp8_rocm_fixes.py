@@ -2353,5 +2353,132 @@ class TestMixtralQuantFusedFP8Path(unittest.TestCase):
         )
 
 
+class TestExaoneMoEFusedFP8Path(unittest.TestCase):
+    """Tests for ExaoneMoE fused RMSNorm+FP8 decoder path (AMD AITER)."""
+
+    def test_exaone_moe_mlp_has_forward_with_fp8_input(self):
+        """ExaoneMoEMLP must have _forward_with_fp8_input for dense MLP FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.exaone_moe")
+        self.assertTrue(
+            hasattr(mod.ExaoneMoEMLP, "_forward_with_fp8_input"),
+            "ExaoneMoEMLP must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_exaone_moe_attention_has_forward_with_fp8_input(self):
+        """ExaoneMoEAttention must have _forward_with_fp8_input for FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.exaone_moe")
+        self.assertTrue(
+            hasattr(mod.ExaoneMoEAttention, "_forward_with_fp8_input"),
+            "ExaoneMoEAttention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_exaone_moe_attention_fp8_uses_apply_qk_norm(self):
+        """ExaoneMoEAttention._forward_with_fp8_input must use apply_qk_norm."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.exaone_moe")
+        src = inspect.getsource(mod.ExaoneMoEAttention._forward_with_fp8_input)
+        self.assertIn(
+            "apply_qk_norm",
+            src,
+            "ExaoneMoEAttention._forward_with_fp8_input must use apply_qk_norm for per-head QK norm",
+        )
+
+    def test_exaone_moe_decoder_layer_has_aiter_fp8_flag(self):
+        """ExaoneMoEDecoderLayer.__init__ must set _aiter_fp8 flag."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.exaone_moe")
+        src = inspect.getsource(mod.ExaoneMoEDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "ExaoneMoEDecoderLayer.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_exaone_moe_decoder_layer_handles_mixed_dense_moe(self):
+        """_forward_aiter_fp8 must handle both dense MLP (FP8-fused) and sparse MoE (standard) paths."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.exaone_moe")
+        src = inspect.getsource(mod.ExaoneMoEDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "_is_moe_layer",
+            src,
+            "_forward_aiter_fp8 must branch on _is_moe_layer for dense vs sparse MLP",
+        )
+
+    def test_exaone_moe_module_has_use_aiter_flag(self):
+        """exaone_moe module must have _use_aiter module-level flag."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.exaone_moe")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "exaone_moe module must have _use_aiter flag for AMD AITER detection",
+        )
+
+
+class TestOlmoeFusedFP8Path(unittest.TestCase):
+    """Tests for OLMoE fused RMSNorm+FP8 decoder path (AMD AITER)."""
+
+    def test_olmoe_attention_has_forward_with_fp8_input(self):
+        """OlmoeAttention must have _forward_with_fp8_input for FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.olmoe")
+        self.assertTrue(
+            hasattr(mod.OlmoeAttention, "_forward_with_fp8_input"),
+            "OlmoeAttention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_olmoe_decoder_layer_has_aiter_fp8_flag(self):
+        """OlmoeDecoderLayer.__init__ must set _aiter_fp8 flag."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.olmoe")
+        src = inspect.getsource(mod.OlmoeDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "OlmoeDecoderLayer.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_olmoe_decoder_layer_has_forward_aiter_fp8(self):
+        """OlmoeDecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.olmoe")
+        self.assertTrue(
+            hasattr(mod.OlmoeDecoderLayer, "_forward_aiter_fp8"),
+            "OlmoeDecoderLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_olmoe_aiter_fp8_attention_only(self):
+        """OLMoE _forward_aiter_fp8 must only fuse attention (MLP is always MoE)."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.olmoe")
+        src = inspect.getsource(mod.OlmoeDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must use forward_aiter_fp8_out for fused input_layernorm+FP8",
+        )
+        self.assertNotIn(
+            "_forward_with_fp8_input",
+            src,
+            "OLMoE _forward_aiter_fp8 must NOT call mlp._forward_with_fp8_input (MoE is not FP8-fused)",
+        )
+
+    def test_olmoe_module_has_use_aiter_flag(self):
+        """olmoe module must have _use_aiter module-level flag."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.olmoe")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "olmoe module must have _use_aiter flag for AMD AITER detection",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

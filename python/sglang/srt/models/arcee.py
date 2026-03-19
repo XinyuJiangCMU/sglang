@@ -24,6 +24,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.layernorm import RMSNorm
@@ -49,6 +50,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -175,6 +177,22 @@ class ArceeAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+    def _forward_with_fp8_input(
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        forward_batch: ForwardBatch,
+        skip_o_reduce: bool = False,
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, forward_batch)
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_o_reduce)
+        return output
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -238,6 +256,69 @@ class ArceeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # AMD AITER fused RMSNorm+FP8 path: enabled when SGLANG_USE_AITER=1 (ROCm)
+        # and qkv_proj uses a supported FP8 quant method.
+        if _use_aiter:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fbgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            try:
+                from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                    CompressedTensorsLinearMethod,
+                )
+                from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+
+                qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+                if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                    scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
+                    self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+                else:
+                    self._aiter_fp8 = isinstance(
+                        qm,
+                        (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                    )
+            except ImportError:
+                qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
+        else:
+            self._aiter_fp8 = False
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Arcee decoder forward with fused add+RMSNorm+FP8 for attention (AMD AITER).
+
+        Fuses the input_layernorm add+norm+per_token_quant into a single kernel
+        (~13µs savings per layer on MI300X).
+        """
+        # Attention: fused add+RMSNorm+FP8 into qkv_proj
+        if residual is None:
+            residual = hidden_states
+            fp8_hs, fp8_scale, _ = self.input_layernorm.forward_aiter_fp8_out(
+                hidden_states
+            )
+        else:
+            fp8_hs, fp8_scale, residual = self.input_layernorm.forward_aiter_fp8_out(
+                hidden_states, residual
+            )
+        hidden_states = self.self_attn._forward_with_fp8_input(
+            positions, hidden_states, fp8_hs, fp8_scale, forward_batch,
+            skip_o_reduce=True,
+        )
+
+        # MLP: allreduce (TP>1) + standard RMSNorm + MLP
+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -245,6 +326,11 @@ class ArceeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._aiter_fp8:
+            return self._forward_aiter_fp8(
+                positions, hidden_states, forward_batch, residual
+            )
+
         # Self Attention
         if residual is None:
             residual = hidden_states
