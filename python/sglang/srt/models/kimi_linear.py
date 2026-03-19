@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -472,6 +473,62 @@ class KimiDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # Fused add+RMSNorm+FP8 path for AMD AITER (gfx942 / MI300X).
+        # Only enabled for dense (non-MoE) MLP layers.  The attention
+        # (KDA or MLA) performs its own allreduce internally, so we cannot
+        # use forward_with_allreduce_fusion_fp8_out here; we fall back to
+        # forward_aiter_fp8_out for the post_attention_layernorm alone.
+        self._aiter_fp8 = False
+        if _use_aiter and isinstance(self.mlp, KimiMLP):
+            quant_method = getattr(self.mlp.gate_up_proj, "quant_method", None)
+            if quant_method is not None:
+                from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+                from sglang.srt.layers.quantization.fbgemm_fp8 import (
+                    FBGEMMFp8LinearMethod,
+                )
+                from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+                self._aiter_fp8 = isinstance(
+                    quant_method,
+                    (Fp8LinearMethod, FBGEMMFp8LinearMethod, W8A8Fp8LinearMethod),
+                )
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decoder forward with fused add+RMSNorm+FP8 quantization (AMD AITER path).
+
+        The complex attention (KDA / MLA) handles its own allreduce, so only
+        post_attention_layernorm is fused via forward_aiter_fp8_out; the
+        resulting FP8 tensor is passed directly to gate_up_proj, skipping the
+        redundant per_token_quant_hip inside gemm_a8w8_bpreshuffle.
+        """
+        # Attention: standard path (KDA/MLA are too complex for FP8 input)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+        )
+
+        # MLP: fused add+norm+FP8 into gate_up_proj
+        fp8_hs, fp8_scale, residual = self.post_attention_layernorm.forward_aiter_fp8_out(
+            hidden_states, residual
+        )
+        hidden_states = self.mlp._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
+        return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -480,6 +537,10 @@ class KimiDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._aiter_fp8 and hidden_states.shape[0] != 0:
+            return self._forward_aiter_fp8(
+                positions, hidden_states, forward_batch, residual, zero_allocator
+            )
         # Self Attention
         if residual is None:
             residual = hidden_states

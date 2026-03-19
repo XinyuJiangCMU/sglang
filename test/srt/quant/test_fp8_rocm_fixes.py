@@ -3281,5 +3281,105 @@ class TestHunYuanFusedFP8Path(unittest.TestCase):
         )
 
 
+class TestKimiLinearFusedFP8Path(unittest.TestCase):
+    """Tests for fused RMSNorm+FP8 MLP path in KimiDecoderLayer (AMD AITER)."""
+
+    def test_kimi_decoder_layer_has_aiter_fp8_flag(self):
+        """KimiDecoderLayer must set _aiter_fp8 in __init__."""
+        import inspect
+        from sglang.srt.models.kimi_linear import KimiDecoderLayer
+
+        src = inspect.getsource(KimiDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "KimiDecoderLayer.__init__ must set _aiter_fp8 flag",
+        )
+
+    def test_kimi_decoder_layer_has_forward_aiter_fp8(self):
+        """KimiDecoderLayer must implement _forward_aiter_fp8 method."""
+        from sglang.srt.models.kimi_linear import KimiDecoderLayer
+
+        self.assertTrue(
+            hasattr(KimiDecoderLayer, "_forward_aiter_fp8"),
+            "KimiDecoderLayer must have _forward_aiter_fp8 method",
+        )
+
+    def test_kimi_forward_dispatches_to_aiter_fp8(self):
+        """KimiDecoderLayer.forward must dispatch to _forward_aiter_fp8 when enabled."""
+        import inspect
+        from sglang.srt.models.kimi_linear import KimiDecoderLayer
+
+        src = inspect.getsource(KimiDecoderLayer.forward)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "KimiDecoderLayer.forward must check _aiter_fp8 to dispatch",
+        )
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "KimiDecoderLayer.forward must call _forward_aiter_fp8",
+        )
+
+    def test_kimi_aiter_fp8_fuses_post_attention_layernorm(self):
+        """_forward_aiter_fp8 must call forward_aiter_fp8_out on post_attention_layernorm."""
+        import inspect
+        from sglang.srt.models.kimi_linear import KimiDecoderLayer
+
+        src = inspect.getsource(KimiDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "post_attention_layernorm.forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must fuse post_attention_layernorm via forward_aiter_fp8_out",
+        )
+
+    def test_kimi_aiter_fp8_passes_fp8_to_mlp(self):
+        """_forward_aiter_fp8 must call mlp._forward_with_fp8_input."""
+        import inspect
+        from sglang.srt.models.kimi_linear import KimiDecoderLayer
+
+        src = inspect.getsource(KimiDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "mlp._forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must pass FP8 to mlp._forward_with_fp8_input",
+        )
+
+    def test_kimi_aiter_fp8_only_for_dense_mlp(self):
+        """_aiter_fp8 must only be True for dense (non-MoE) KimiMLP layers."""
+        import inspect
+        from sglang.srt.models.kimi_linear import KimiDecoderLayer
+
+        src = inspect.getsource(KimiDecoderLayer.__init__)
+        self.assertIn(
+            "KimiMLP",
+            src,
+            "__init__ must check isinstance(self.mlp, KimiMLP) before enabling _aiter_fp8",
+        )
+
+    def test_kimi_aiter_fp8_respects_hidden_states_shape(self):
+        """KimiDecoderLayer.forward must skip FP8 path for empty batches."""
+        import inspect
+        from sglang.srt.models.kimi_linear import KimiDecoderLayer
+
+        src = inspect.getsource(KimiDecoderLayer.forward)
+        self.assertIn(
+            "hidden_states.shape[0] != 0",
+            src,
+            "KimiDecoderLayer.forward must guard FP8 path for empty batches",
+        )
+
+    def test_kimi_module_has_use_aiter_import(self):
+        """kimi_linear module must import _use_aiter for AMD AITER detection."""
+        import importlib
+
+        mod = importlib.import_module("sglang.srt.models.kimi_linear")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "kimi_linear module must import _use_aiter from fp8_utils",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
