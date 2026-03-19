@@ -128,7 +128,8 @@ class DeepseekMLAForwardMixin:
                     q_lora = None
                     if (
                         _use_aiter_gfx95
-                        and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                        and self.q_b_proj.weight.dtype
+                        in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
                     ):
                         if self.use_nsa:
                             q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
@@ -139,7 +140,7 @@ class DeepseekMLAForwardMixin:
                                 self.kv_a_layernorm.weight,
                                 self.kv_a_layernorm.variance_epsilon,
                                 group_size=128,
-                                dtype_quant=torch.float8_e4m3fn,
+                                dtype_quant=fp8_dtype,
                                 res1=None,
                                 output_unquantized_inp1=True,
                             )
@@ -153,7 +154,7 @@ class DeepseekMLAForwardMixin:
                                 self.kv_a_layernorm.weight,
                                 self.kv_a_layernorm.variance_epsilon,
                                 group_size=128,
-                                dtype_quant=torch.float8_e4m3fn,
+                                dtype_quant=fp8_dtype,
                                 res1=None,
                                 output_unquantized_inp1=False,
                             )
@@ -245,7 +246,7 @@ class DeepseekMLAForwardMixin:
                     q_nope_out,
                 )
             else:
-                if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
+                if (_use_aiter_gfx95 and self.w_kc.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)) or (
                     get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
                 ):
                     # fp8 Triton kernel: always on gfx950,
@@ -426,7 +427,7 @@ class DeepseekMLAForwardMixin:
                     attn_bmm_output,
                 )
             else:
-                if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
+                if _use_aiter_gfx95 and self.w_kc.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
                     attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=attn_output,
                         WQ=self.w_vc.transpose(-1, -2),
@@ -446,10 +447,10 @@ class DeepseekMLAForwardMixin:
             if self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+            elif self.o_proj.weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_fp8_group_quant(
-                    attn_bmm_output, group_size=128, dtype_quant=torch.float8_e4m3fn
+                    attn_bmm_output, group_size=128, dtype_quant=fp8_dtype
                 )
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)

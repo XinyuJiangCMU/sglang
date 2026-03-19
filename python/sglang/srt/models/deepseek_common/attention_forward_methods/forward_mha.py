@@ -122,7 +122,8 @@ class DeepseekMHAForwardMixin:
                 # tuple.
                 if (
                     _use_aiter_gfx95
-                    and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
+                    and self.q_b_proj.weight.dtype
+                    in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
                 ):
                     q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
                         q,
@@ -132,7 +133,7 @@ class DeepseekMHAForwardMixin:
                         None,
                         None,
                         group_size=128,
-                        dtype_quant=torch.float8_e4m3fn,
+                        dtype_quant=fp8_dtype,
                         res1=None,
                         output_unquantized_inp1=True,
                     )
@@ -163,7 +164,7 @@ class DeepseekMHAForwardMixin:
                     None,
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
+            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
 
                 q, _, _, _ = fused_rms_fp8_group_quant(
                     q,
@@ -173,7 +174,7 @@ class DeepseekMHAForwardMixin:
                     None,
                     None,
                     group_size=128,
-                    dtype_quant=torch.float8_e4m3fn,
+                    dtype_quant=fp8_dtype,
                     res1=None,
                     output_unquantized_inp1=False,
                 )
@@ -192,7 +193,7 @@ class DeepseekMHAForwardMixin:
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
 
-        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
 
             kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
                 kv_a,
@@ -202,7 +203,7 @@ class DeepseekMHAForwardMixin:
                 None,
                 None,
                 group_size=128,
-                dtype_quant=torch.float8_e4m3fn,
+                dtype_quant=fp8_dtype,
                 res1=None,
                 output_unquantized_inp1=True,  # return unqaunt kv_a
             )
@@ -251,7 +252,7 @@ class DeepseekMHAForwardMixin:
                 )
             )[0]
         else:
-            if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+            if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
                 kv = self.kv_b_proj(kv_a_quanted)[0]
             else:
                 kv = self.kv_b_proj(kv_a)[0]
