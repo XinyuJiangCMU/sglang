@@ -1532,6 +1532,27 @@ def apply_fp8_linear(
         )
         return _process_scaled_mm_output(output, input_2d.shape, output_shape)
 
+    # AMD-specific: channel-wise weight scale + per-tensor (static) activation scale.
+    # hipBLAS rowwise scaled_mm requires scale_a of shape (M, 1) and scale_b of
+    # shape (1, N).  Broadcast the per-tensor activation scalar to (M, 1) and
+    # transpose the (N, 1) channel weight scale to (1, N).
+    if (
+        not per_tensor_weights
+        and per_tensor_activations
+        and USE_ROWWISE_TORCH_SCALED_MM
+    ):
+        m = input_2d.shape[0]
+        x_scale_mn = x_scale.reshape(1, 1).expand(m, 1).contiguous()
+        output = torch._scaled_mm(
+            qinput,
+            weight,
+            out_dtype=input.dtype,
+            scale_a=x_scale_mn,
+            scale_b=weight_scale.t(),
+            bias=bias,
+        )
+        return _process_scaled_mm_output(output, input_2d.shape, output_shape)
+
     # Fallback for channelwise case, where we use unfused DQ
     # due to limitations with scaled_mm
 
@@ -1582,20 +1603,11 @@ def apply_fp8_ptpc_linear(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
 
-    # Default output_shape assumes per-tensor path where weight is (K, N).
-    # For per-channel (non-per-tensor) path weight is (N, K) preshuffled;
-    # output_shape is overridden below in that branch.
-    output_shape = [*input.shape[:-1], weight.shape[1]]
+    # weight is always stored as (N, K) preshuffled when using AITER;
+    # gemm_a8w8_bpreshuffle outputs (M, N).
+    output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
-
-    per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
-    per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
-
-    if not (per_tensor_weights and per_tensor_activations):
-        # Per-channel path: weight is in (N, K) preshuffled layout,
-        # weight_scale is (N, 1).  gemm_a8w8_bpreshuffle outputs (M, N).
-        output_shape = [*input.shape[:-1], weight.shape[0]]
 
     output = aiter.gemm_a8w8_bpreshuffle(
         q_input, weight, x_scale, weight_scale, None, input.dtype
