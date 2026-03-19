@@ -3418,6 +3418,109 @@ class TestKimiLinearFusedFP8Path(unittest.TestCase):
 
 
 @unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestFalconH1FusedFP8Path(unittest.TestCase):
+    """Tests for fused pre_ff_layernorm+FP8 MLP path in FalconH1HybridAttentionDecoderLayer (AMD AITER)."""
+
+    def test_falcon_h1_mlp_has_forward_with_fp8_input(self):
+        """FalconH1MLP must implement _forward_with_fp8_input."""
+        from sglang.srt.models.falcon_h1 import FalconH1MLP
+
+        self.assertTrue(
+            hasattr(FalconH1MLP, "_forward_with_fp8_input"),
+            "FalconH1MLP must have _forward_with_fp8_input method",
+        )
+
+    def test_falcon_h1_decoder_layer_has_aiter_fp8_flag(self):
+        """FalconH1HybridAttentionDecoderLayer must set _aiter_fp8 in __init__."""
+        import inspect
+        from sglang.srt.models.falcon_h1 import FalconH1HybridAttentionDecoderLayer
+
+        src = inspect.getsource(FalconH1HybridAttentionDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "FalconH1HybridAttentionDecoderLayer.__init__ must set _aiter_fp8 flag",
+        )
+
+    def test_falcon_h1_decoder_layer_has_forward_aiter_fp8(self):
+        """FalconH1HybridAttentionDecoderLayer must implement _forward_aiter_fp8."""
+        from sglang.srt.models.falcon_h1 import FalconH1HybridAttentionDecoderLayer
+
+        self.assertTrue(
+            hasattr(FalconH1HybridAttentionDecoderLayer, "_forward_aiter_fp8"),
+            "FalconH1HybridAttentionDecoderLayer must have _forward_aiter_fp8 method",
+        )
+
+    def test_falcon_h1_forward_dispatches_to_aiter_fp8(self):
+        """FalconH1HybridAttentionDecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        from sglang.srt.models.falcon_h1 import FalconH1HybridAttentionDecoderLayer
+
+        src = inspect.getsource(FalconH1HybridAttentionDecoderLayer.forward)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "FalconH1HybridAttentionDecoderLayer.forward must check _aiter_fp8",
+        )
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "FalconH1HybridAttentionDecoderLayer.forward must call _forward_aiter_fp8",
+        )
+
+    def test_falcon_h1_aiter_fp8_fuses_pre_ff_layernorm(self):
+        """_forward_aiter_fp8 must call prepare_mlp_fp8_out for MLP sub-layer."""
+        import inspect
+        from sglang.srt.models.falcon_h1 import FalconH1HybridAttentionDecoderLayer
+
+        src = inspect.getsource(FalconH1HybridAttentionDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "prepare_mlp_fp8_out",
+            src,
+            "_forward_aiter_fp8 must call prepare_mlp_fp8_out to fuse pre_ff_layernorm",
+        )
+
+    def test_falcon_h1_aiter_fp8_passes_fp8_to_mlp(self):
+        """_forward_aiter_fp8 must call feed_forward._forward_with_fp8_input."""
+        import inspect
+        from sglang.srt.models.falcon_h1 import FalconH1HybridAttentionDecoderLayer
+
+        src = inspect.getsource(FalconH1HybridAttentionDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "feed_forward._forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must pass FP8 to feed_forward._forward_with_fp8_input",
+        )
+
+    def test_falcon_h1_mlp_applies_gate_and_down_multipliers(self):
+        """FalconH1MLP._forward_with_fp8_input must apply gate_multiplier and down_multiplier."""
+        import inspect
+        from sglang.srt.models.falcon_h1 import FalconH1MLP
+
+        src = inspect.getsource(FalconH1MLP._forward_with_fp8_input)
+        self.assertIn(
+            "gate_multiplier",
+            src,
+            "_forward_with_fp8_input must apply gate_multiplier matching the standard path",
+        )
+        self.assertIn(
+            "down_multiplier",
+            src,
+            "_forward_with_fp8_input must apply down_multiplier matching the standard path",
+        )
+
+    def test_falcon_h1_module_has_use_aiter_import(self):
+        """falcon_h1 module must import _use_aiter from fp8_utils."""
+        import importlib
+
+        mod = importlib.import_module("sglang.srt.models.falcon_h1")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "falcon_h1 module must import _use_aiter from fp8_utils",
+        )
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
 class TestGlm4MoeLiteFusedFP8Path(unittest.TestCase):
     """Tests for fused post_attention_layernorm+FP8 MLP path in Glm4MoeLiteDecoderLayer (AMD AITER)."""
 

@@ -35,6 +35,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,26 @@ class FalconH1MLP(nn.Module):
         )
         x = x * self.down_multiplier
         return x
+
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        """MLP forward using pre-quantized FP8 input (AMD AITER path).
+
+        Skips redundant per_token_quant_hip inside gemm_a8w8_bpreshuffle by reusing
+        the FP8 tensor already computed by the preceding fused add+RMSNorm+FP8 op.
+        Applies gate_multiplier and down_multiplier matching the standard path.
+        """
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        gate_up[:, : self.intermediate_size // self.tp_size] *= self.gate_multiplier
+        out = self.act_fn(gate_up)
+        out, _ = self.down_proj(out, skip_all_reduce=use_reduce_scatter)
+        out = out * self.down_multiplier
+        return out
 
 
 class FalconH1HybridAttentionDecoderLayer(nn.Module):
@@ -234,6 +255,30 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             allow_reduce_scatter=True,
         )
 
+        # AMD AITER fused add+RMSNorm+FP8 for MLP (MI300X).
+        # Hybrid attention+Mamba block is too complex for pre-quantized FP8 input;
+        # only fused pre_ff_layernorm+MLP FP8 is applied.
+        if _use_aiter:
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.feed_forward.gate_up_proj, "quant_method", None)
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                scheme = getattr(self.feed_forward.gate_up_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm,
+                    (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                )
+        else:
+            self._aiter_fp8 = False
+
         self.alt_stream = alt_stream
         self.key_multiplier = config.key_multiplier
 
@@ -317,6 +362,77 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ):
+        """Decoder forward with fused pre_ff_layernorm+FP8 for MLP (AMD AITER).
+
+        Hybrid attention+Mamba block uses the standard path (too complex for
+        pre-quantized FP8 input due to per-block scaling and parallel Mamba branch).
+        MLP sub-layer: fused add+RMSNorm+FP8 feeds gate_up_proj directly, saving one
+        redundant per_token_quant_hip call per layer on MI300X.
+        Falls back to standard MLP path when prepare_mlp_fp8_out() returns None.
+        """
+        # --- Attention+Mamba sub-layer: standard path ---
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+
+        if not forward_batch.forward_mode.is_idle():
+            # Attention block
+            attention_hidden_states = self.self_attention(
+                positions=positions,
+                hidden_states=hidden_states * self.attention_in_multiplier,
+                forward_batch=forward_batch,
+            )
+            attention_hidden_states = attention_hidden_states * self.attn_out_multiplier
+
+            attn_backend = forward_batch.attn_backend
+            assert isinstance(attn_backend, HybridLinearAttnBackend)
+            assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
+            # Mamba block
+            mamba_hidden_states = torch.empty_like(hidden_states)
+            attn_backend.linear_attn_backend.forward(
+                self.mamba,
+                hidden_states * self.ssm_in_multiplier,
+                mamba_hidden_states,
+                layer_id=self.layer_id,
+                mup_vector=self.mup_vector,
+            )
+            mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
+
+            hidden_states = attention_hidden_states + mamba_hidden_states
+
+        # --- MLP sub-layer: fused pre_ff_layernorm+FP8 ---
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        fp8_result = self.layer_communicator.prepare_mlp_fp8_out(
+            hidden_states, residual, forward_batch
+        )
+        if fp8_result is not None:
+            fp8_hs, fp8_scale, residual = fp8_result
+            hidden_states = self.feed_forward._forward_with_fp8_input(
+                hidden_states, fp8_hs, fp8_scale, use_reduce_scatter
+            )
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states = self.feed_forward(
+                hidden_states, forward_batch, use_reduce_scatter
+            )
+
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
+        return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -325,6 +441,12 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ):
+        # AMD AITER fused pre_ff_layernorm+FP8 for MLP (MI300X)
+        if self._aiter_fp8 and not forward_batch.forward_mode.is_idle():
+            return self._forward_aiter_fp8(
+                positions, hidden_states, residual, forward_batch
+            )
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
