@@ -54,6 +54,14 @@ if _is_cuda or _is_xpu:
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
 
+    try:
+        from aiter import silu_and_mul as _aiter_silu_and_mul
+        from aiter import gelu_and_mul as _aiter_gelu_and_mul
+
+        _has_aiter_activation = True
+    except ImportError:
+        _has_aiter_activation = False
+
 if is_npu():
     import torch_npu
 
@@ -76,6 +84,15 @@ class SiluAndMul(MultiPlatformOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         silu_and_mul(x, out)
         return out
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_hip and _has_aiter_activation:
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            _aiter_silu_and_mul(out, x)
+            return out
+        return self.forward_cuda(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if _is_cpu_amx_available:
@@ -126,6 +143,15 @@ class GeluAndMul(MultiPlatformOp):
             return self.forward_native(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_impl(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_hip and _has_aiter_activation and self.approximate == "none":
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            _aiter_gelu_and_mul(out, x)
+            return out
         return self._forward_impl(x)
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
