@@ -595,12 +595,13 @@ class LayerCommunicator:
 
         The caller is responsible for routing fp8_hs/fp8_scale to the attention
         linear via forward_with_fp8_input() rather than calling the norm separately.
+        Supports both RMSNorm and GemmaRMSNorm (which uses (1 + weight) scaling).
         """
-        from sglang.srt.layers.layernorm import RMSNorm
+        from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 
         if (
             not _use_aiter
-            or not isinstance(self.input_layernorm, RMSNorm)
+            or not isinstance(self.input_layernorm, (RMSNorm, GemmaRMSNorm))
             or get_attn_tp_context().input_scattered
             or hidden_states.shape[0] == 0
             or self._communicate_with_all_reduce_and_layer_norm_fn
@@ -642,12 +643,13 @@ class LayerCommunicator:
         For TP=1, performs only fused add+norm+fp8_quant.
         For TP>1, attempts fused allreduce+add+norm+fp8_quant via
         forward_with_allreduce_fusion_fp8_out; falls back to None if unavailable.
+        Supports both RMSNorm and GemmaRMSNorm (which uses (1 + weight) scaling).
         """
-        from sglang.srt.layers.layernorm import RMSNorm
+        from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 
         if (
             not _use_aiter
-            or not isinstance(self.post_attention_layernorm, RMSNorm)
+            or not isinstance(self.post_attention_layernorm, (RMSNorm, GemmaRMSNorm))
             or hidden_states.shape[0] == 0
             or is_dp_attention_enabled()
         ):

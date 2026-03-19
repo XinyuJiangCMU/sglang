@@ -1087,5 +1087,428 @@ class TestQwen3FusedFP8Path(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestBaiChuanFusedFP8Path(unittest.TestCase):
+    """Test BaiChuan fused RMSNorm+FP8 decoder path for AMD MI300X."""
+
+    def test_baichuan_attention_has_forward_with_fp8_input(self):
+        """BaiChuanAttention must have _forward_with_fp8_input."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.baichuan")
+        self.assertTrue(
+            hasattr(mod.BaiChuanAttention, "_forward_with_fp8_input"),
+            "BaiChuanAttention must have _forward_with_fp8_input for AMD AITER optimization",
+        )
+
+    def test_baichuan_mlp_has_forward_with_fp8_input(self):
+        """BaiChuanMLP must have _forward_with_fp8_input."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.baichuan")
+        self.assertTrue(
+            hasattr(mod.BaiChuanMLP, "_forward_with_fp8_input"),
+            "BaiChuanMLP must have _forward_with_fp8_input for AMD AITER optimization",
+        )
+
+    def test_baichuan_decoder_layer_has_forward_aiter_fp8(self):
+        """BaiChuanDecoderLayer must have _forward_aiter_fp8."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.baichuan")
+        self.assertTrue(
+            hasattr(mod.BaiChuanDecoderLayer, "_forward_aiter_fp8"),
+            "BaiChuanDecoderLayer must have _forward_aiter_fp8 for AMD AITER optimization",
+        )
+
+    def test_baichuan_uses_w_pack_for_aiter_fp8_detection(self):
+        """BaiChuanDecoderLayer._aiter_fp8 must use W_pack (not qkv_proj) for detection."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.baichuan")
+        src = inspect.getsource(mod.BaiChuanDecoderLayer.__init__)
+        self.assertIn(
+            "W_pack", src,
+            "BaiChuanDecoderLayer must use W_pack for _aiter_fp8 detection (BaiChuan has no qkv_proj)",
+        )
+
+    def test_baichuan_attention_handles_alibi(self):
+        """BaiChuanAttention._forward_with_fp8_input must skip rotary for ALIBI."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.baichuan")
+        src = inspect.getsource(mod.BaiChuanAttention._forward_with_fp8_input)
+        self.assertIn(
+            "ALIBI", src,
+            "BaiChuanAttention._forward_with_fp8_input must check for ALIBI to skip rotary_emb",
+        )
+
+    def test_baichuan_aiter_fp8_check_includes_w8a8fp8(self):
+        """BaiChuanDecoderLayer._aiter_fp8 check must include W8A8Fp8LinearMethod."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.baichuan")
+        src = inspect.getsource(mod.BaiChuanDecoderLayer.__init__)
+        self.assertIn(
+            "W8A8Fp8LinearMethod", src,
+            "BaiChuanDecoderLayer must check W8A8Fp8LinearMethod for _aiter_fp8",
+        )
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestDeepSeekV1FusedFP8Path(unittest.TestCase):
+    """Test DeepSeek V1 fused RMSNorm+FP8 decoder path (dense layers only)."""
+
+    def test_deepseek_attention_has_forward_with_fp8_input(self):
+        """DeepseekAttention must have _forward_with_fp8_input."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.deepseek")
+        self.assertTrue(
+            hasattr(mod.DeepseekAttention, "_forward_with_fp8_input"),
+            "DeepseekAttention must have _forward_with_fp8_input for AMD AITER optimization",
+        )
+
+    def test_deepseek_mlp_has_forward_with_fp8_input(self):
+        """DeepseekMLP must have _forward_with_fp8_input."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.deepseek")
+        self.assertTrue(
+            hasattr(mod.DeepseekMLP, "_forward_with_fp8_input"),
+            "DeepseekMLP must have _forward_with_fp8_input for AMD AITER optimization",
+        )
+
+    def test_deepseek_decoder_layer_has_forward_aiter_fp8(self):
+        """DeepseekDecoderLayer must have _forward_aiter_fp8."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.deepseek")
+        self.assertTrue(
+            hasattr(mod.DeepseekDecoderLayer, "_forward_aiter_fp8"),
+            "DeepseekDecoderLayer must have _forward_aiter_fp8 for AMD AITER optimization",
+        )
+
+    def test_deepseek_aiter_fp8_dense_only_guard(self):
+        """DeepseekDecoderLayer._aiter_fp8 must only be enabled for dense (DeepseekMLP) layers."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.deepseek")
+        src = inspect.getsource(mod.DeepseekDecoderLayer.__init__)
+        self.assertIn(
+            "DeepseekMLP", src,
+            "DeepseekDecoderLayer must guard _aiter_fp8 with isinstance(..., DeepseekMLP) "
+            "to skip MoE layers",
+        )
+
+    def test_deepseek_aiter_fp8_check_includes_w8a8fp8(self):
+        """DeepseekDecoderLayer._aiter_fp8 check must include W8A8Fp8LinearMethod."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.deepseek")
+        src = inspect.getsource(mod.DeepseekDecoderLayer.__init__)
+        self.assertIn(
+            "W8A8Fp8LinearMethod", src,
+            "DeepseekDecoderLayer must check W8A8Fp8LinearMethod for _aiter_fp8",
+        )
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestERNIE4FusedFP8Path(unittest.TestCase):
+    """Test ERNIE4 fused RMSNorm+FP8 decoder path (dense layers only)."""
+
+    def test_deepseekv2_mlp_has_forward_with_fp8_input(self):
+        """DeepseekV2MLP (aliased as Ernie4MLP) must have _forward_with_fp8_input."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.deepseek_v2")
+        self.assertTrue(
+            hasattr(mod.DeepseekV2MLP, "_forward_with_fp8_input"),
+            "DeepseekV2MLP must have _forward_with_fp8_input (used by ERNIE4 via alias)",
+        )
+
+    def test_ernie4_decoder_layer_has_forward_aiter_fp8(self):
+        """ERNIE4DecoderLayer must have _forward_aiter_fp8."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.ernie4")
+        self.assertTrue(
+            hasattr(mod.ERNIE4DecoderLayer, "_forward_aiter_fp8"),
+            "ERNIE4DecoderLayer must have _forward_aiter_fp8 for AMD AITER optimization",
+        )
+
+    def test_ernie4_aiter_fp8_dense_only_guard(self):
+        """ERNIE4DecoderLayer._aiter_fp8 must only be enabled for dense (Ernie4MLP) layers."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.ernie4")
+        src = inspect.getsource(mod.ERNIE4DecoderLayer.__init__)
+        self.assertIn(
+            "Ernie4MLP", src,
+            "ERNIE4DecoderLayer must guard _aiter_fp8 with isinstance(..., Ernie4MLP) "
+            "to skip MoE layers",
+        )
+
+    def test_ernie4_aiter_fp8_check_includes_w8a8fp8(self):
+        """ERNIE4DecoderLayer._aiter_fp8 check must include W8A8Fp8LinearMethod."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.ernie4")
+        src = inspect.getsource(mod.ERNIE4DecoderLayer.__init__)
+        self.assertIn(
+            "W8A8Fp8LinearMethod", src,
+            "ERNIE4DecoderLayer must check W8A8Fp8LinearMethod for _aiter_fp8",
+        )
+
+    def test_ernie4_mlp_alias_has_forward_with_fp8_input(self):
+        """Ernie4MLP alias must also expose _forward_with_fp8_input."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.ernie4")
+        self.assertTrue(
+            hasattr(mod.Ernie4MLP, "_forward_with_fp8_input"),
+            "Ernie4MLP (alias of DeepseekV2MLP) must expose _forward_with_fp8_input",
+        )
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestNemotronNASFusedFP8Path(unittest.TestCase):
+    """Test Nemotron NAS (DeciLM) fused RMSNorm+FP8 decoder path."""
+
+    def test_decilm_decoder_layer_has_forward_aiter_fp8(self):
+        """DeciLMDecoderLayer must have _forward_aiter_fp8."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.nemotron_nas")
+        self.assertTrue(
+            hasattr(mod.DeciLMDecoderLayer, "_forward_aiter_fp8"),
+            "DeciLMDecoderLayer must have _forward_aiter_fp8 for AMD AITER optimization",
+        )
+
+    def test_decilm_aiter_fp8_no_op_guard(self):
+        """DeciLMDecoderLayer._aiter_fp8 must be disabled for no-op attention/ffn layers."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.nemotron_nas")
+        src = inspect.getsource(mod.DeciLMDecoderLayer.__init__)
+        self.assertIn(
+            "_is_no_op_attention", src,
+            "DeciLMDecoderLayer must guard _aiter_fp8 with _is_no_op_attention check",
+        )
+        self.assertIn(
+            "_is_no_op_ffn", src,
+            "DeciLMDecoderLayer must guard _aiter_fp8 with _is_no_op_ffn check",
+        )
+
+    def test_decilm_aiter_fp8_check_includes_w8a8fp8(self):
+        """DeciLMDecoderLayer._aiter_fp8 check must include W8A8Fp8LinearMethod."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.nemotron_nas")
+        src = inspect.getsource(mod.DeciLMDecoderLayer.__init__)
+        self.assertIn(
+            "W8A8Fp8LinearMethod", src,
+            "DeciLMDecoderLayer must check W8A8Fp8LinearMethod for _aiter_fp8",
+        )
+
+    def test_decilm_uses_llama_attention_with_fp8_support(self):
+        """DeciLMDecoderLayer should reuse LlamaAttention which has _forward_with_fp8_input."""
+        import importlib
+        llama_mod = importlib.import_module("sglang.srt.models.llama")
+        self.assertTrue(
+            hasattr(llama_mod.LlamaAttention, "_forward_with_fp8_input"),
+            "LlamaAttention (used by DeciLMDecoderLayer) must have _forward_with_fp8_input",
+        )
+
+    def test_decilm_uses_llama_mlp_with_fp8_support(self):
+        """DeciLMDecoderLayer should reuse LlamaMLP which has _forward_with_fp8_input."""
+        import importlib
+        llama_mod = importlib.import_module("sglang.srt.models.llama")
+        self.assertTrue(
+            hasattr(llama_mod.LlamaMLP, "_forward_with_fp8_input"),
+            "LlamaMLP (used by DeciLMDecoderLayer) must have _forward_with_fp8_input",
+        )
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestAITERFP8KVDecodeOptimization(unittest.TestCase):
+    """Test that FP8 KV cache is passed natively to paged_attention_ragged decode."""
+
+    def test_aiter_backend_passes_fp8_kv_cache_dtype(self):
+        """aiter_backend decode path must pass 'fp8' kv_cache_dtype for FP8 KV caches."""
+        import inspect
+        import importlib
+        mod = importlib.import_module(
+            "sglang.srt.layers.attention.aiter_backend"
+        )
+        # Find the class with paged_attention_ragged
+        cls = None
+        for name in dir(mod):
+            obj = getattr(mod, name)
+            if isinstance(obj, type) and hasattr(obj, "forward"):
+                try:
+                    src = inspect.getsource(obj.forward)
+                    if "paged_attention_ragged" in src:
+                        cls = obj
+                        break
+                except (TypeError, OSError):
+                    continue
+        self.assertIsNotNone(cls, "No class with paged_attention_ragged found in aiter_backend")
+        src = inspect.getsource(cls.forward)
+        self.assertIn(
+            '"fp8"', src,
+            "aiter_backend decode path must pass 'fp8' kv_cache_dtype string for FP8 KV",
+        )
+
+    def test_aiter_backend_no_fp8_to_bf16_cast_in_decode(self):
+        """aiter_backend decode path must NOT cast FP8 KV cache to BF16 as workaround."""
+        import inspect
+        import importlib
+        mod = importlib.import_module(
+            "sglang.srt.layers.attention.aiter_backend"
+        )
+        cls = None
+        for name in dir(mod):
+            obj = getattr(mod, name)
+            if isinstance(obj, type) and hasattr(obj, "forward"):
+                try:
+                    src = inspect.getsource(obj.forward)
+                    if "paged_attention_ragged" in src:
+                        cls = obj
+                        break
+                except (TypeError, OSError):
+                    continue
+        self.assertIsNotNone(cls, "No class with paged_attention_ragged found in aiter_backend")
+        src = inspect.getsource(cls.forward)
+        # The old workaround cast k_cache/v_cache .to(dtype) before paged_attention_ragged
+        # This should no longer be present once FP8 KV is handled natively
+        self.assertNotIn(
+            "k_cache.to(dtype)", src,
+            "aiter_backend decode path must not cast k_cache to bf16 (FP8 KV now handled natively)",
+        )
+        self.assertNotIn(
+            "v_cache.to(dtype)", src,
+            "aiter_backend decode path must not cast v_cache to bf16 (FP8 KV now handled natively)",
+        )
+
+    def test_aiter_backend_fp8_kv_dtype_conditional(self):
+        """aiter_backend must use conditional: 'fp8' only when kv_cache_dtype is FP8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module(
+            "sglang.srt.layers.attention.aiter_backend"
+        )
+        cls = None
+        for name in dir(mod):
+            obj = getattr(mod, name)
+            if isinstance(obj, type) and hasattr(obj, "forward"):
+                try:
+                    src = inspect.getsource(obj.forward)
+                    if "paged_attention_ragged" in src:
+                        cls = obj
+                        break
+                except (TypeError, OSError):
+                    continue
+        self.assertIsNotNone(cls)
+        src = inspect.getsource(cls.forward)
+        # Must have "auto" fallback for non-FP8 caches
+        self.assertIn(
+            '"auto"', src,
+            "aiter_backend must keep 'auto' for non-FP8 kv_cache_dtype in paged_attention_ragged",
+        )
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestGemmaRMSNormFP8(unittest.TestCase):
+    """Test GemmaRMSNorm.forward_aiter_fp8_out for AMD AITER path."""
+
+    def test_gemma_rms_norm_has_forward_aiter_fp8_out(self):
+        """GemmaRMSNorm must have forward_aiter_fp8_out for AMD AITER FP8 path."""
+        from sglang.srt.layers.layernorm import GemmaRMSNorm
+        self.assertTrue(
+            hasattr(GemmaRMSNorm, "forward_aiter_fp8_out"),
+            "GemmaRMSNorm must have forward_aiter_fp8_out for AMD AITER optimization",
+        )
+
+    def test_gemma_rms_norm_fp8_uses_effective_weight(self):
+        """GemmaRMSNorm.forward_aiter_fp8_out must use (1 + weight) as effective weight."""
+        import inspect
+        from sglang.srt.layers.layernorm import GemmaRMSNorm
+        src = inspect.getsource(GemmaRMSNorm.forward_aiter_fp8_out)
+        self.assertIn(
+            "1.0 + self.weight.data",
+            src,
+            "GemmaRMSNorm.forward_aiter_fp8_out must use (1.0 + self.weight.data) as effective weight",
+        )
+
+    def test_communicator_prepare_attn_fp8_accepts_gemma_rms_norm(self):
+        """LayerCommunicator.prepare_attn_fp8_out must accept GemmaRMSNorm."""
+        import inspect
+        from sglang.srt.layers.communicator import LayerCommunicator
+        src = inspect.getsource(LayerCommunicator.prepare_attn_fp8_out)
+        self.assertIn(
+            "GemmaRMSNorm",
+            src,
+            "prepare_attn_fp8_out must accept GemmaRMSNorm (not just RMSNorm)",
+        )
+
+    def test_communicator_prepare_mlp_fp8_accepts_gemma_rms_norm(self):
+        """LayerCommunicator.prepare_mlp_fp8_out must accept GemmaRMSNorm."""
+        import inspect
+        from sglang.srt.layers.communicator import LayerCommunicator
+        src = inspect.getsource(LayerCommunicator.prepare_mlp_fp8_out)
+        self.assertIn(
+            "GemmaRMSNorm",
+            src,
+            "prepare_mlp_fp8_out must accept GemmaRMSNorm (not just RMSNorm)",
+        )
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestQwen3_5FusedFP8Path(unittest.TestCase):
+    """Test Qwen3.5 AttentionDecoderLayer fused RMSNorm+FP8 path for AMD MI300X."""
+
+    def test_qwen3_5_attention_decoder_has_aiter_fp8(self):
+        """Qwen3_5AttentionDecoderLayer must have _aiter_fp8 flag."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen3_5")
+        self.assertTrue(
+            hasattr(mod.Qwen3_5AttentionDecoderLayer, "_forward_aiter_fp8"),
+            "Qwen3_5AttentionDecoderLayer must have _forward_aiter_fp8 for AMD AITER optimization",
+        )
+
+    def test_qwen3_5_attention_decoder_has_forward_with_fp8_input(self):
+        """Qwen3_5AttentionDecoderLayer must have _forward_with_fp8_input."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen3_5")
+        self.assertTrue(
+            hasattr(mod.Qwen3_5AttentionDecoderLayer, "_forward_with_fp8_input"),
+            "Qwen3_5AttentionDecoderLayer must have _forward_with_fp8_input for AMD AITER optimization",
+        )
+
+    def test_qwen2_moe_mlp_has_forward_with_fp8_input(self):
+        """Qwen2MoeMLP must have _forward_with_fp8_input for dense MLP FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen2_moe")
+        self.assertTrue(
+            hasattr(mod.Qwen2MoeMLP, "_forward_with_fp8_input"),
+            "Qwen2MoeMLP must have _forward_with_fp8_input for AMD AITER optimization",
+        )
+
+    def test_qwen3_5_forward_with_fp8_handles_attn_output_gate(self):
+        """_forward_with_fp8_input must handle attn_output_gate branch."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen3_5")
+        src = inspect.getsource(mod.Qwen3_5AttentionDecoderLayer._forward_with_fp8_input)
+        self.assertIn(
+            "attn_output_gate",
+            src,
+            "_forward_with_fp8_input must handle attn_output_gate branch (Qwen3.5 gated attention)",
+        )
+
+    def test_qwen3_5_aiter_fp8_moe_uses_standard_path(self):
+        """_forward_aiter_fp8 must use standard MLP path for MoE layers."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.qwen3_5")
+        src = inspect.getsource(mod.Qwen3_5AttentionDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "Qwen2MoeMLP",
+            src,
+            "_forward_aiter_fp8 must check isinstance(self.mlp, Qwen2MoeMLP) to skip FP8 for MoE",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

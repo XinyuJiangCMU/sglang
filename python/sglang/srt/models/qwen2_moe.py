@@ -145,6 +145,28 @@ class Qwen2MoeMLP(nn.Module):
         )
         return x
 
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        """MLP forward using pre-quantized FP8 input for gate_up_proj (AMD AITER path).
+
+        Skips redundant per_token_quant_hip inside gemm_a8w8_bpreshuffle by
+        reusing FP8 already computed by the preceding fused RMSNorm+FP8 op.
+        x is the BF16 tensor (used for output dtype/context), fp8_input is the
+        pre-quantized FP8 activation, fp8_scale is the per-token scale.
+        """
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        out = self.act_fn(gate_up)
+        out, _ = self.down_proj(
+            out, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        )
+        return out
+
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
