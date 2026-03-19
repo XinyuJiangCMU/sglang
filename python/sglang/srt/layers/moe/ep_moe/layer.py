@@ -773,6 +773,10 @@ class MoriEPMoE(DeepEPMoE):
             num_local_tokens=dispatch_recv_token_num,
             dtype=output_dtype,
         )
+        # aiter.fused_moe does not accept routed_scaling_factor; apply separately.
+        rsf = self.moe_runner_config.routed_scaling_factor
+        if rsf is not None and rsf != 1.0:
+            hidden_states = hidden_states * rsf
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
