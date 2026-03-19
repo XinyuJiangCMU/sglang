@@ -321,11 +321,18 @@ class TritonRunnerCore(MoeRunnerCore):
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
                 )
+                # aiter.moe_sum does not support routed_scaling_factor;
+                # apply it as a separate multiply when needed (e.g. DeepSeek).
+                if routed_scaling_factor != 1.0:
+                    out_hidden_states.mul_(routed_scaling_factor)
             elif _has_vllm:
                 vllm_ops.moe_sum(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
                 )
+                # vllm_ops.moe_sum does not accept routed_scaling_factor.
+                if routed_scaling_factor != 1.0:
+                    out_hidden_states.mul_(routed_scaling_factor)
             else:
                 # Fallback: use triton moe_sum when vllm is not available
                 moe_sum_reduce_triton(
