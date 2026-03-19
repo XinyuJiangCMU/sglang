@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlia
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
@@ -536,7 +537,8 @@ class NativeSparseAttnBackend(
             # Check if MHA FP8 dequantization is needed
             mha_dequantize_needed = (
                 self.use_mha
-                and forward_batch.token_to_kv_pool.dtype == torch.float8_e4m3fn
+                and forward_batch.token_to_kv_pool.dtype
+                in (torch.float8_e4m3fn, fp8_dtype)
             )
             forward_batch.using_mha_one_shot_fp8_dequant = mha_dequantize_needed
 
@@ -1910,7 +1912,7 @@ class NativeSparseAttnBackend(
         metadata = self.forward_metadata
 
         merge_query = q_rope is not None
-        if self.kv_cache_dtype == torch.float8_e4m3fn:
+        if self.kv_cache_dtype in (torch.float8_e4m3fn, fp8_dtype):
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert q_rope is not None, "For FP8 path q_rope should not be None."
