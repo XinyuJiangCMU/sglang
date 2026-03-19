@@ -107,9 +107,11 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
                 use_scaled_mm = K > N or N * K > 200_000_000
                 layer._use_ck = use_scaled_mm
                 if use_scaled_mm:
-                    layer.weight = Parameter(
-                        weight.contiguous(), requires_grad=False
-                    )
+                    w = weight.contiguous()
+                    layer.weight = Parameter(w, requires_grad=False)
+                    # Pre-compute for scaled_mm hot path
+                    layer.weight_t = w.t()
+                    layer.weight_scale_row = weight_scale.view(1, -1).contiguous()
                 else:
                     layer.weight = Parameter(
                         shuffle_weight(weight.contiguous(), (16, 16)),
@@ -209,6 +211,8 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
                     bias=bias,
                     prequantized_fp8=prequantized_fp8,
                     prequantized_fp8_scale=prequantized_fp8_scale,
+                    weight_t=getattr(layer, "weight_t", None),
+                    weight_scale_row=getattr(layer, "weight_scale_row", None),
                 )
             return apply_fp8_ptpc_linear(
                 input=x,

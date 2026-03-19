@@ -573,6 +573,10 @@ class Fp8LinearMethod(LinearMethodBase):
                         # weight_scale already has shape (N, 1) from per_token_group_quant_fp8
                         layer.weight = Parameter(qweight, requires_grad=False)
                         layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                        if use_scaled_mm:
+                            # Pre-compute for scaled_mm hot path
+                            layer.weight_t = qweight.t()
+                            layer.weight_scale_row = weight_scale.view(1, -1).contiguous()
                         layer.input_scale = None
                         return
                     weight_scale = weight_scale.t().contiguous()
@@ -631,6 +635,10 @@ class Fp8LinearMethod(LinearMethodBase):
                             weight = shuffle_weight(weight.contiguous(), (16, 16))
                         layer.weight = Parameter(weight, requires_grad=False)
                         layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                        if use_scaled_mm:
+                            # Pre-compute for scaled_mm hot path
+                            layer.weight_t = weight.t()
+                            layer.weight_scale_row = weight_scale.view(1, -1).contiguous()
                         # fall through to input_scale handling below
                     else:
                         # CUTLASS/Marlin path, or static-activation AITER path.
@@ -772,6 +780,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     bias=bias,
                     prequantized_fp8=prequantized_fp8,
                     prequantized_fp8_scale=prequantized_fp8_scale,
+                    weight_t=getattr(layer, "weight_t", None),
+                    weight_scale_row=getattr(layer, "weight_scale_row", None),
                 )
             return apply_fp8_ptpc_linear(
                 input=x,
