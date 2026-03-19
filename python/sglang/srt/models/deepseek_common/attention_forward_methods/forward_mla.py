@@ -268,7 +268,7 @@ class DeepseekMLAForwardMixin:
                         self.w_kc.to(torch.bfloat16) * self.w_scale,
                     )
 
-        elif self.w_kc.dtype in (torch.float8_e4m3fn, fp8_dtype):
+        elif self.w_kc.dtype == torch.float8_e4m3fn:
             # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
                 q_nope.transpose(0, 1),
@@ -455,7 +455,7 @@ class DeepseekMLAForwardMixin:
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
-        elif self.w_vc.dtype in (torch.float8_e4m3fn, fp8_dtype):
+        elif self.w_vc.dtype == torch.float8_e4m3fn:
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
                 attn_output.transpose(0, 1),
                 (
@@ -507,10 +507,7 @@ class DeepseekMLAForwardMixin:
             return (
                 get_global_server_args().nsa_decode_backend == "trtllm"
                 or get_global_server_args().nsa_prefill_backend == "trtllm"
-            ) and forward_batch.attn_backend.kv_cache_dtype in (
-                torch.float8_e4m3fn,
-                fp8_dtype,
-            )
+            ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
 
         return (
             self.current_attention_backend == "trtllm_mla"
@@ -518,6 +515,5 @@ class DeepseekMLAForwardMixin:
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
             )
-            and forward_batch.attn_backend.data_type
-            in (torch.float8_e4m3fn, fp8_dtype)
+            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
         )
