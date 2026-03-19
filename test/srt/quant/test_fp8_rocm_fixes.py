@@ -800,9 +800,11 @@ class TestFBGEMMFp8AITERPath(unittest.TestCase):
         config = FBGEMMFp8Config(ignore_list=[], input_scale_ub=1.0)
         method = FBGEMMFp8LinearMethod(config)
 
-        # Create a mock layer with weight in (N, K) = (256, 256) before loading
+        # Create a mock layer with weight in (N, K) = (256, 256) before loading.
+        # Always allocate as float8_e4m3fn (mimics checkpoint loading);
+        # process_weights_after_loading normalizes to e4m3fnuz on AMD.
         N, K = 256, 256
-        weight = torch.randn(N, K, device="cuda").to(fp8_dtype)
+        weight = torch.randn(N, K, device="cuda").to(torch.float8_e4m3fn)
         weight_scale = torch.ones(N, 1, device="cuda", dtype=torch.float32) * 0.01
 
         from torch.nn import Parameter
@@ -889,24 +891,24 @@ class TestRoutedScalingFactorMoE(unittest.TestCase):
                       "W8A8FP8MoEMethod.apply should reference routed_scaling_factor")
 
     def test_quark_w8a8_fp8_moe_rsf_applied(self):
-        """QuarkW8A8Fp8MoEMethod AITER path must apply routed_scaling_factor."""
+        """QuarkW8A8FP8MoE AITER path must apply routed_scaling_factor."""
         import inspect
         from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8_moe import (
-            QuarkW8A8Fp8MoEMethod,
+            QuarkW8A8FP8MoE,
         )
-        src = inspect.getsource(QuarkW8A8Fp8MoEMethod.apply)
+        src = inspect.getsource(QuarkW8A8FP8MoE.apply_weights)
         self.assertIn("routed_scaling_factor", src,
-                      "QuarkW8A8Fp8MoEMethod.apply should reference routed_scaling_factor")
+                      "QuarkW8A8FP8MoE.apply_weights should reference routed_scaling_factor")
 
     def test_compressed_tensors_moe_rsf_applied(self):
-        """W8A8FP8MoEMethod (compressed_tensors) AITER path must apply routed_scaling_factor."""
+        """compressed_tensors W8A8 FP8 MoE AITER path must apply routed_scaling_factor."""
         import inspect
         from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe import (
-            W8A8FP8MoEMethod,
+            CompressedTensorsW8A8Fp8MoE,
         )
-        src = inspect.getsource(W8A8FP8MoEMethod.apply)
+        src = inspect.getsource(CompressedTensorsW8A8Fp8MoE.apply_weights)
         self.assertIn("routed_scaling_factor", src,
-                      "compressed_tensors W8A8FP8MoEMethod.apply should reference routed_scaling_factor")
+                      "CompressedTensorsW8A8Fp8MoE.apply_weights should reference routed_scaling_factor")
 
     def test_triton_moe_runner_rsf_applied(self):
         """TritonRunnerCore.run should apply routed_scaling_factor after moe_sum."""
