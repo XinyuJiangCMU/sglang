@@ -3418,6 +3418,116 @@ class TestKimiLinearFusedFP8Path(unittest.TestCase):
 
 
 @unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestGlm4MoeLiteFusedFP8Path(unittest.TestCase):
+    """Tests for fused post_attention_layernorm+FP8 MLP path in Glm4MoeLiteDecoderLayer (AMD AITER)."""
+
+    def test_glm4_moe_lite_mlp_has_forward_with_fp8_input(self):
+        """Glm4MoeLiteMLP must implement _forward_with_fp8_input."""
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteMLP
+
+        self.assertTrue(
+            hasattr(Glm4MoeLiteMLP, "_forward_with_fp8_input"),
+            "Glm4MoeLiteMLP must have _forward_with_fp8_input method",
+        )
+
+    def test_glm4_moe_lite_decoder_layer_has_aiter_fp8_flag(self):
+        """Glm4MoeLiteDecoderLayer must set _aiter_fp8 in __init__."""
+        import inspect
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteDecoderLayer
+
+        src = inspect.getsource(Glm4MoeLiteDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "Glm4MoeLiteDecoderLayer.__init__ must set _aiter_fp8 flag",
+        )
+
+    def test_glm4_moe_lite_decoder_layer_has_forward_aiter_fp8(self):
+        """Glm4MoeLiteDecoderLayer must implement _forward_aiter_fp8 method."""
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteDecoderLayer
+
+        self.assertTrue(
+            hasattr(Glm4MoeLiteDecoderLayer, "_forward_aiter_fp8"),
+            "Glm4MoeLiteDecoderLayer must have _forward_aiter_fp8 method",
+        )
+
+    def test_glm4_moe_lite_forward_dispatches_to_aiter_fp8(self):
+        """Glm4MoeLiteDecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteDecoderLayer
+
+        src = inspect.getsource(Glm4MoeLiteDecoderLayer.forward)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "Glm4MoeLiteDecoderLayer.forward must check _aiter_fp8 to dispatch",
+        )
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "Glm4MoeLiteDecoderLayer.forward must call _forward_aiter_fp8",
+        )
+
+    def test_glm4_moe_lite_aiter_fp8_fuses_post_attention_layernorm(self):
+        """_forward_aiter_fp8 must call prepare_mlp_fp8_out for the MLP sub-layer."""
+        import inspect
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteDecoderLayer
+
+        src = inspect.getsource(Glm4MoeLiteDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "prepare_mlp_fp8_out",
+            src,
+            "_forward_aiter_fp8 must call prepare_mlp_fp8_out for fused MLP norm",
+        )
+
+    def test_glm4_moe_lite_aiter_fp8_passes_fp8_to_mlp(self):
+        """_forward_aiter_fp8 must call mlp._forward_with_fp8_input."""
+        import inspect
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteDecoderLayer
+
+        src = inspect.getsource(Glm4MoeLiteDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "mlp._forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must pass FP8 to mlp._forward_with_fp8_input",
+        )
+
+    def test_glm4_moe_lite_aiter_fp8_only_for_dense_mlp(self):
+        """_aiter_fp8 must check Glm4MoeLiteMLP type to guard MoE layers."""
+        import inspect
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteDecoderLayer
+
+        src = inspect.getsource(Glm4MoeLiteDecoderLayer.__init__)
+        self.assertIn(
+            "Glm4MoeLiteMLP",
+            src,
+            "__init__ must check isinstance(self.mlp, Glm4MoeLiteMLP) before enabling _aiter_fp8",
+        )
+
+    def test_glm4_moe_lite_module_has_use_aiter_import(self):
+        """glm4_moe_lite module must import _use_aiter from fp8_utils."""
+        import importlib
+
+        mod = importlib.import_module("sglang.srt.models.glm4_moe_lite")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "glm4_moe_lite module must import _use_aiter from fp8_utils",
+        )
+
+    def test_glm4_moe_lite_forward_delegates_to_super_when_not_fp8(self):
+        """Glm4MoeLiteDecoderLayer.forward must call super().forward for non-FP8 path."""
+        import inspect
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteDecoderLayer
+
+        src = inspect.getsource(Glm4MoeLiteDecoderLayer.forward)
+        self.assertIn(
+            "super().forward",
+            src,
+            "Glm4MoeLiteDecoderLayer.forward must delegate to super().forward on non-FP8 path",
+        )
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
 class TestBailingMoELinearFusedFP8Path(unittest.TestCase):
     """Tests for fused post_attention_layernorm+FP8 MLP path in BailingMoELinearDecoderLayer (AMD AITER)."""
 
