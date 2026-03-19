@@ -867,6 +867,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 bias1=layer.w13_weight_bias,
                 bias2=layer.w2_weight_bias,
             )
+            # aiter.fused_moe does not accept routed_scaling_factor; apply separately.
+            rsf = self.moe_runner_config.routed_scaling_factor
+            if rsf is not None and rsf != 1.0:
+                output = output * rsf
             return StandardCombineInput(hidden_states=output)
 
         backend = self.runner.runner_backend
@@ -1047,4 +1051,8 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
             doweight_stage1=False,
             expert_mask=layer.expert_mask_gpu,
         )
+        # aiter.fused_moe does not accept routed_scaling_factor; apply separately.
+        rsf = self.moe_runner_config.routed_scaling_factor
+        if rsf is not None and rsf != 1.0:
+            output = output * rsf
         return StandardCombineInput(hidden_states=output)
