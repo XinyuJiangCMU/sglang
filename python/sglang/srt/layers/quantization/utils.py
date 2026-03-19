@@ -192,7 +192,8 @@ def replace_parameter(
 
 def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
     assert a.shape == b.shape
-    assert a.dtype == b.dtype == torch.float8_e4m3fn
+    assert a.dtype == b.dtype
+    assert a.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
     a_u8 = a.view(torch.uint8)
     b_u8 = b.view(torch.uint8)
