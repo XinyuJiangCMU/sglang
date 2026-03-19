@@ -146,6 +146,22 @@ class Glm4MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        """MLP forward using pre-quantized FP8 input (AMD AITER path)."""
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        out = self.act_fn(gate_up)
+        out, _ = self.down_proj(
+            out, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        )
+        return out
+
     def forward(
         self,
         x,
@@ -297,6 +313,38 @@ class Glm4MoeAttention(nn.Module):
             return hidden_states
         attn_output = self.attn(*inner_state)
         output, _ = self.o_proj(attn_output)
+        return output
+
+    def _forward_with_fp8_input(
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        forward_batch: ForwardBatch,
+        skip_o_reduce: bool = False,
+    ) -> torch.Tensor:
+        """Attention forward using pre-quantized FP8 input for qkv_proj (AMD AITER path).
+
+        Skips redundant per_token_quant inside gemm_a8w8_bpreshuffle by reusing
+        FP8 already computed by the preceding fused add+RMSNorm+FP8 op.
+        x is the float tensor (used only for output dtype/shape).
+        skip_o_reduce: if True, skip the o_proj all-reduce.
+        """
+        qkv, _ = self.qkv_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.use_qk_norm:
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, forward_batch)
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_o_reduce)
         return output
 
     def forward(
@@ -767,11 +815,118 @@ class Glm4MoeDecoderLayer(nn.Module):
             ),
         )
 
+        # AMD AITER fused add+RMSNorm+FP8: check if qkv_proj supports FP8.
+        # Optimizes attention sub-layer; dense MLP also uses FP8, sparse MoE uses standard path.
+        if _use_aiter:
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm,
+                    (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                )
+        else:
+            self._aiter_fp8 = False
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
             self.config.n_routed_experts is not None
             and layer_id >= self.config.first_k_dense_replace
         )
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Glm4Moe decoder forward with fused add+RMSNorm+FP8 (AMD AITER).
+
+        Attention sub-layer: fused input_layernorm+FP8 -> qkv_proj with pre-quantized input.
+        Dense MLP: fused post_attention_layernorm+FP8 -> gate_up_proj with pre-quantized input.
+        Sparse MoE MLP: always uses standard path.
+        Falls back to standard path when prepare_attn_fp8_out()/prepare_mlp_fp8_out()
+        returns None (complex TP/DP scatter modes).
+        """
+        # --- Attention sub-layer ---
+        fp8_result = self.layer_communicator.prepare_attn_fp8_out(
+            hidden_states, residual, forward_batch
+        )
+        if fp8_result is not None and hidden_states.shape[0] != 0:
+            fp8_hs, fp8_scale, residual = fp8_result
+            hidden_states = self.self_attn._forward_with_fp8_input(
+                positions, hidden_states, fp8_hs, fp8_scale, forward_batch,
+                skip_o_reduce=False,
+            )
+        else:
+            # Fallback to standard path for attention
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
+            if hidden_states.shape[0] != 0:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+
+        # --- MLP sub-layer ---
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        if not self.is_layer_sparse and hidden_states.shape[0] != 0:
+            # Dense MLP: try fused post_attention_layernorm+FP8
+            fp8_result = self.layer_communicator.prepare_mlp_fp8_out(
+                hidden_states, residual, forward_batch
+            )
+            if fp8_result is not None:
+                fp8_hs, fp8_scale, residual = fp8_result
+                hidden_states = self.mlp._forward_with_fp8_input(
+                    hidden_states, fp8_hs, fp8_scale,
+                    should_allreduce_fusion, use_reduce_scatter,
+                )
+                if should_allreduce_fusion:
+                    hidden_states._sglang_needs_allreduce_fusion = True
+                else:
+                    hidden_states, residual = self.layer_communicator.postprocess_layer(
+                        hidden_states, residual, forward_batch
+                    )
+                return hidden_states, residual
+
+        # Standard MLP path (sparse MoE or FP8 fallback)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+
+        hidden_states = self.mlp(
+            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+        )
+
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+
+        return hidden_states, residual
 
     def forward(
         self,
@@ -780,6 +935,11 @@ class Glm4MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # AMD AITER fused add+RMSNorm+FP8 path (MI300X)
+        if self._aiter_fp8 and not forward_batch.forward_mode.is_idle():
+            return self._forward_aiter_fp8(
+                positions, hidden_states, forward_batch, residual
+            )
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
