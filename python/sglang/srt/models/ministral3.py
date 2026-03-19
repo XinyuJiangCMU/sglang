@@ -113,6 +113,10 @@ class Ministral3DecoderLayer(LlamaDecoderLayer):
             bias=getattr(config, "attention_bias", False)
             or getattr(config, "bias", False),
         )
+        # Disable AMD AITER FP8 path when llama_4_scaling_beta is active since
+        # LlamaAttention._forward_with_fp8_input does not apply that scaling.
+        if self.self_attn.llama_4_scaling_beta is not None:
+            self._aiter_fp8 = False
 
 
 class Ministral3Model(LlamaModel):
