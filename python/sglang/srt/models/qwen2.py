@@ -51,6 +51,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -99,6 +100,23 @@ class Qwen2MLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """MLP forward using pre-quantized FP8 input for gate_up_proj (AMD AITER path).
+
+        Skips redundant per_token_quant_hip inside gemm_a8w8_bpreshuffle by
+        reusing FP8 already computed by the preceding fused RMSNorm+FP8 op.
+        x is the float tensor before norm, used only for output dtype/shape.
+        """
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        out = self.act_fn(gate_up)
+        out, _ = self.down_proj(out)
+        return out
 
 
 class Qwen2Attention(nn.Module):
@@ -190,6 +208,27 @@ class Qwen2Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _forward_with_fp8_input(
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Attention forward using pre-quantized FP8 input for qkv_proj (AMD AITER path).
+
+        Skips redundant per_token_quant_hip inside gemm_a8w8_bpreshuffle by
+        reusing FP8 already computed by the preceding fused RMSNorm+FP8 op.
+        x is the float tensor before norm, used only for output dtype/shape.
+        """
+        qkv, _ = self.qkv_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, forward_batch)
+        output, _ = self.o_proj(attn_output)
+        return output
+
 
 class Qwen2DecoderLayer(nn.Module):
     def __init__(
@@ -232,6 +271,50 @@ class Qwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
+        if _use_aiter:
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+            self._aiter_fp8 = isinstance(qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod))
+        else:
+            self._aiter_fp8 = False
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decoder forward with fused add+RMSNorm+FP8 quantization (AMD AITER path).
+
+        Replaces separate add+norm+per_token_quant (~26µs) with fused op (~13µs),
+        saving ~13µs per norm call per layer on MI300X.  fp8_input/scale from
+        forward_aiter_fp8_out() are passed directly to the first linear of each
+        sub-layer via forward_with_fp8_input(), skipping re-quantization.
+        """
+        # Self Attention: fused add+norm+fp8 into qkv_proj
+        if residual is None:
+            residual = hidden_states
+            fp8_hs, fp8_scale, _ = self.input_layernorm.forward_aiter_fp8_out(
+                hidden_states
+            )
+        else:
+            fp8_hs, fp8_scale, residual = self.input_layernorm.forward_aiter_fp8_out(
+                hidden_states, residual
+            )
+        hidden_states = self.self_attn._forward_with_fp8_input(
+            positions, hidden_states, fp8_hs, fp8_scale, forward_batch
+        )
+
+        # Fully Connected: fused add+norm+fp8 into gate_up_proj
+        fp8_hs, fp8_scale, residual = self.post_attention_layernorm.forward_aiter_fp8_out(
+            hidden_states, residual
+        )
+        hidden_states = self.mlp._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
+        return hidden_states, residual
 
     def forward(
         self,
@@ -240,6 +323,9 @@ class Qwen2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._aiter_fp8:
+            return self._forward_aiter_fp8(positions, hidden_states, forward_batch, residual)
+
         # Self Attention
         if residual is None:
             residual = hidden_states
