@@ -54,8 +54,10 @@ from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.utils import (
     add_prefix,
     fast_topk,
+    get_bool_env_var,
     get_compiler_backend,
     is_cuda,
+    is_hip,
     is_npu,
     make_layers,
 )
@@ -63,6 +65,7 @@ from sglang.srt.utils.common import get_current_device_stream_fast
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -354,6 +357,46 @@ class Llama4Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _forward_with_fp8_input(
+        self,
+        positions: torch.Tensor,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        forward_batch: ForwardBatch,
+        skip_o_reduce: bool = False,
+    ) -> torch.Tensor:
+        """Attention forward using pre-quantized FP8 input for qkv_proj (AMD AITER path).
+
+        Reuses FP8 already computed by the preceding fused RMSNorm+FP8 op,
+        skipping redundant per_token_quant_hip inside gemm_a8w8_bpreshuffle
+        (~14µs saved per call on MI300X).
+        """
+        if x.shape[0] == 0:
+            return x
+        qkv, _ = self.qkv_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+
+        qk, v = qkv.split([self.q_size + self.kv_size, self.kv_size], dim=-1)
+
+        if self.rotary_emb is not None:
+            q_view, k_view = qk.split([self.q_size, self.kv_size], dim=-1)
+            q_out_unused, k_out_unused = self.rotary_emb(positions, q_view, k_view)
+            del q_view, k_view, q_out_unused, k_out_unused
+
+        if self.qk_norm is not None:
+            qk = qk.reshape(-1, self.head_dim).contiguous().bfloat16()
+            qk = self.qk_norm(qk).to(torch.bfloat16)
+            qk = qk.reshape(-1, self.q_size + self.kv_size)
+
+        q, k = qk.split([self.q_size, self.kv_size], dim=-1)
+
+        if self.attn_temperature_tuning and not self.use_rope:
+            q = self._mul_attn_scale(positions=positions, q=q)
+
+        attn_output = self.attn(q, k, v, forward_batch)
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_o_reduce)
+        return output
+
 
 class Llama4DecoderLayer(nn.Module):
     def __init__(
@@ -426,6 +469,42 @@ class Llama4DecoderLayer(nn.Module):
             allow_reduce_scatter=True,
         )
 
+        # Fused add+RMSNorm+FP8 path for AMD AITER (gfx942 / MI300X).
+        if _use_aiter:
+            try:
+                from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                    CompressedTensorsLinearMethod,
+                )
+                from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+                from sglang.srt.layers.quantization.fpgemm_fp8 import (
+                    FBGEMMFp8LinearMethod,
+                )
+                from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+                from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+                qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+                if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                    scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
+                    self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+                else:
+                    self._aiter_fp8 = isinstance(
+                        qm,
+                        (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                    )
+            except ImportError:
+                from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+                from sglang.srt.layers.quantization.fpgemm_fp8 import (
+                    FBGEMMFp8LinearMethod,
+                )
+                from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+                qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
+        else:
+            self._aiter_fp8 = False
+
     def _is_moe_layer(self, layer_id: int) -> bool:
         if self.config.interleave_moe_layer_step == 0:
             return self.config.num_local_experts > 0
@@ -437,6 +516,73 @@ class Llama4DecoderLayer(nn.Module):
         else:
             return self.config.intermediate_size_mlp
 
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Llama4 decoder forward with fused add+RMSNorm+FP8 (AMD AITER path).
+
+        Fuses the input_layernorm → qkv_proj quantization step.
+        For dense (LlamaMLP) feed-forward layers, also fuses post_attention_layernorm.
+        For MoE (Llama4MoE) feed-forward layers, uses standard norm path.
+        Falls back to standard path when prepare_attn_fp8_out() returns None.
+        """
+        # Input layernorm: fused add+RMSNorm+FP8 for qkv_proj
+        fp8_result = self.layer_communicator.prepare_attn_fp8_out(
+            hidden_states, residual, forward_batch
+        )
+        if fp8_result is not None and hidden_states.shape[0] != 0:
+            fp8_hs, fp8_scale, residual = fp8_result
+            hidden_states = self.self_attn._forward_with_fp8_input(
+                positions, hidden_states, fp8_hs, fp8_scale, forward_batch,
+                skip_o_reduce=True,
+            )
+        else:
+            # Fallback to standard path for attention
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
+            if hidden_states.shape[0] != 0:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        # Dense MLP: try fused post_attention_layernorm+FP8 path
+        if isinstance(self.feed_forward, LlamaMLP):
+            mlp_fp8 = self.layer_communicator.prepare_mlp_fp8_out(
+                hidden_states, residual, forward_batch
+            )
+            if mlp_fp8 is not None:
+                fp8_hs, fp8_scale, residual = mlp_fp8
+                hidden_states = self.feed_forward._forward_with_fp8_input(
+                    hidden_states, fp8_hs, fp8_scale
+                )
+                hidden_states, residual = self.layer_communicator.postprocess_layer(
+                    hidden_states, residual, forward_batch
+                )
+                return hidden_states, residual
+
+        # Standard MLP path (MoE or FP8 MLP unavailable)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        hidden_states = self.feed_forward(
+            hidden_states, forward_batch, use_reduce_scatter
+        )
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+        return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -444,6 +590,10 @@ class Llama4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # AMD AITER fused add+RMSNorm+FP8 path (MI300X)
+        if self._aiter_fp8 and hidden_states.shape[0] != 0:
+            return self._forward_aiter_fp8(positions, hidden_states, forward_batch, residual)
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
