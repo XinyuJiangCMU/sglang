@@ -4,7 +4,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
 tilelang.set_log_level("WARNING")
@@ -118,7 +118,7 @@ def act_quant(
     if _is_fp8_fnuz:
         y = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
     else:
-        y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        y = torch.empty_like(x, dtype=fp8_dtype)
     s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
     kernel = act_quant_kernel(N, round_scale=scale_fmt is not None)
     kernel(x.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
