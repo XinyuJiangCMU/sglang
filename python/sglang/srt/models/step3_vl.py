@@ -43,6 +43,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -106,6 +107,22 @@ class Step3TextMLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """MLP forward using pre-quantized FP8 input (AMD AITER path).
+
+        Skips redundant per_token_quant_hip inside gemm_a8w8_bpreshuffle by reusing
+        the FP8 tensor already computed by the preceding fused add+RMSNorm+FP8 op.
+        """
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        out = self.act_fn(gate_up)
+        out, _ = self.down_proj(out)
+        return out
 
 
 class Step3TextMoEMLP(nn.Module):
@@ -387,6 +404,31 @@ class Step3TextDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
+        # AMD AITER fused add+RMSNorm+FP8 for dense MLP layers (MI300X).
+        # Step3 attention has share_q_dim two-stage Q projection; MLP FP8 only.
+        if _use_aiter and not self.is_layer_sparse and isinstance(
+            self.mlp, Step3TextMLP
+        ):
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.mlp.gate_up_proj, "quant_method", None)
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                scheme = getattr(self.mlp.gate_up_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm,
+                    (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                )
+        else:
+            self._aiter_fp8 = False
+
     def moe_mlp_forward(self, hidden_states):
         if not self.num_fused_shared_experts:
             h = hidden_states.clone()
@@ -396,6 +438,54 @@ class Step3TextDecoderLayer(nn.Module):
             hidden_states = self.moe(hidden_states)
         return hidden_states
 
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decoder forward with fused post_attention_layernorm+FP8 for dense MLP (AMD AITER).
+
+        Step3 attention has a share_q_dim two-stage Q projection that is too complex
+        for pre-quantized FP8 input; attention uses the standard path.
+        Dense MLP: fused add+RMSNorm+FP8 feeds gate_up_proj directly, saving one
+        redundant per_token_quant_hip call per layer on MI300X.
+        Falls back to standard MLP path when prepare_mlp_fp8_out() returns None.
+        """
+        # --- Attention sub-layer: standard path ---
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        # --- MLP sub-layer: fused post_attention_layernorm+FP8 for dense layers ---
+        fp8_result = self.layer_communicator.prepare_mlp_fp8_out(
+            hidden_states, residual, forward_batch
+        )
+        if fp8_result is not None:
+            fp8_hs, fp8_scale, residual = fp8_result
+            hidden_states = self.mlp._forward_with_fp8_input(
+                hidden_states, fp8_hs, fp8_scale
+            )
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states = self.mlp(hidden_states)
+
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
+        return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -403,6 +493,11 @@ class Step3TextDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # AMD AITER fused post_attention_layernorm+FP8 for dense MLP (MI300X)
+        if self._aiter_fp8 and hidden_states.shape[0] != 0:
+            return self._forward_aiter_fp8(
+                positions, hidden_states, forward_batch, residual
+            )
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch

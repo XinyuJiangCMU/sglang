@@ -3418,6 +3418,104 @@ class TestKimiLinearFusedFP8Path(unittest.TestCase):
 
 
 @unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestStep3VLFusedFP8Path(unittest.TestCase):
+    """Tests for fused post_attention_layernorm+FP8 MLP path in Step3TextDecoderLayer (AMD AITER)."""
+
+    def test_step3_text_mlp_has_forward_with_fp8_input(self):
+        """Step3TextMLP must implement _forward_with_fp8_input."""
+        from sglang.srt.models.step3_vl import Step3TextMLP
+
+        self.assertTrue(
+            hasattr(Step3TextMLP, "_forward_with_fp8_input"),
+            "Step3TextMLP must have _forward_with_fp8_input method",
+        )
+
+    def test_step3_decoder_layer_has_aiter_fp8_flag(self):
+        """Step3TextDecoderLayer must set _aiter_fp8 in __init__."""
+        import inspect
+        from sglang.srt.models.step3_vl import Step3TextDecoderLayer
+
+        src = inspect.getsource(Step3TextDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "Step3TextDecoderLayer.__init__ must set _aiter_fp8 flag",
+        )
+
+    def test_step3_decoder_layer_has_forward_aiter_fp8(self):
+        """Step3TextDecoderLayer must implement _forward_aiter_fp8 method."""
+        from sglang.srt.models.step3_vl import Step3TextDecoderLayer
+
+        self.assertTrue(
+            hasattr(Step3TextDecoderLayer, "_forward_aiter_fp8"),
+            "Step3TextDecoderLayer must have _forward_aiter_fp8 method",
+        )
+
+    def test_step3_forward_dispatches_to_aiter_fp8(self):
+        """Step3TextDecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        from sglang.srt.models.step3_vl import Step3TextDecoderLayer
+
+        src = inspect.getsource(Step3TextDecoderLayer.forward)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "Step3TextDecoderLayer.forward must check _aiter_fp8 to dispatch",
+        )
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "Step3TextDecoderLayer.forward must call _forward_aiter_fp8",
+        )
+
+    def test_step3_aiter_fp8_fuses_post_attention_layernorm(self):
+        """_forward_aiter_fp8 must call prepare_mlp_fp8_out for MLP sub-layer."""
+        import inspect
+        from sglang.srt.models.step3_vl import Step3TextDecoderLayer
+
+        src = inspect.getsource(Step3TextDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "prepare_mlp_fp8_out",
+            src,
+            "_forward_aiter_fp8 must call prepare_mlp_fp8_out for fused MLP norm",
+        )
+
+    def test_step3_aiter_fp8_passes_fp8_to_mlp(self):
+        """_forward_aiter_fp8 must call mlp._forward_with_fp8_input."""
+        import inspect
+        from sglang.srt.models.step3_vl import Step3TextDecoderLayer
+
+        src = inspect.getsource(Step3TextDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "mlp._forward_with_fp8_input",
+            src,
+            "_forward_aiter_fp8 must pass FP8 to mlp._forward_with_fp8_input",
+        )
+
+    def test_step3_aiter_fp8_only_for_dense_mlp(self):
+        """_aiter_fp8 must check Step3TextMLP type to guard MoE layers."""
+        import inspect
+        from sglang.srt.models.step3_vl import Step3TextDecoderLayer
+
+        src = inspect.getsource(Step3TextDecoderLayer.__init__)
+        self.assertIn(
+            "Step3TextMLP",
+            src,
+            "__init__ must check isinstance(self.mlp, Step3TextMLP) before enabling _aiter_fp8",
+        )
+
+    def test_step3_module_has_use_aiter_import(self):
+        """step3_vl module must import _use_aiter from fp8_utils."""
+        import importlib
+
+        mod = importlib.import_module("sglang.srt.models.step3_vl")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "step3_vl module must import _use_aiter from fp8_utils",
+        )
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
 class TestDeepseekV2MLPFusedFP8Path(unittest.TestCase):
     """Tests for fused post_attention_layernorm+FP8 MLP path in DeepseekV2DecoderLayer (AMD AITER)."""
 
