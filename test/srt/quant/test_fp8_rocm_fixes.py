@@ -1607,5 +1607,71 @@ class TestAiterGemmCoverage(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestBailingMoEFusedFP8Path(unittest.TestCase):
+    """Test BailingMoE fused RMSNorm+FP8 decoder path for AMD MI300X."""
+
+    def test_bailing_moe_attention_has_forward_with_fp8_input(self):
+        """BailingMoEAttention must have _forward_with_fp8_input."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.bailing_moe")
+        self.assertTrue(
+            hasattr(mod.BailingMoEAttention, "_forward_with_fp8_input"),
+            "BailingMoEAttention must have _forward_with_fp8_input for AMD AITER optimization",
+        )
+
+    def test_bailing_moe_mlp_has_forward_with_fp8_input(self):
+        """BailingMoEMLP must have _forward_with_fp8_input."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.bailing_moe")
+        self.assertTrue(
+            hasattr(mod.BailingMoEMLP, "_forward_with_fp8_input"),
+            "BailingMoEMLP must have _forward_with_fp8_input for AMD AITER optimization",
+        )
+
+    def test_bailing_moe_block_has_forward_aiter_fp8(self):
+        """BailingMoEBlock must have _forward_aiter_fp8."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.bailing_moe")
+        self.assertTrue(
+            hasattr(mod.BailingMoEBlock, "_forward_aiter_fp8"),
+            "BailingMoEBlock must have _forward_aiter_fp8 for AMD AITER optimization",
+        )
+
+    def test_bailing_moe_uses_query_key_value_for_detection(self):
+        """BailingMoEBlock._aiter_fp8 must use query_key_value (not qkv_proj) for detection."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.bailing_moe")
+        src = inspect.getsource(mod.BailingMoEBlock.__init__)
+        self.assertIn(
+            "query_key_value", src,
+            "BailingMoEBlock must use query_key_value for _aiter_fp8 detection "
+            "(BailingMoE uses query_key_value, not qkv_proj)",
+        )
+
+    def test_bailing_moe_aiter_fp8_check_includes_w8a8fp8(self):
+        """BailingMoEBlock._aiter_fp8 check must include W8A8Fp8LinearMethod."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.bailing_moe")
+        src = inspect.getsource(mod.BailingMoEBlock.__init__)
+        self.assertIn(
+            "W8A8Fp8LinearMethod", src,
+            "BailingMoEBlock must check W8A8Fp8LinearMethod for _aiter_fp8",
+        )
+
+    def test_bailing_moe_forward_dispatches_to_aiter_fp8(self):
+        """BailingMoEBlock.forward() must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.bailing_moe")
+        src = inspect.getsource(mod.BailingMoEBlock.forward)
+        self.assertIn(
+            "_forward_aiter_fp8", src,
+            "BailingMoEBlock.forward must dispatch to _forward_aiter_fp8 when _aiter_fp8 is set",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
