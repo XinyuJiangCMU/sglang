@@ -2128,6 +2128,85 @@ class TestMiMoV2MTPFusedFP8Path(unittest.TestCase):
         )
 
 
+class TestGlm4FusedFP8Path(unittest.TestCase):
+    """Tests for GLM4 fused RMSNorm+FP8 decoder path (AMD AITER)."""
+
+    def test_glm4_attention_has_forward_with_fp8_input(self):
+        """Glm4Attention must have _forward_with_fp8_input for FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4")
+        self.assertTrue(
+            hasattr(mod.Glm4Attention, "_forward_with_fp8_input"),
+            "Glm4Attention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_glm4_decoder_layer_has_forward_aiter_fp8(self):
+        """Glm4DecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4")
+        self.assertTrue(
+            hasattr(mod.Glm4DecoderLayer, "_forward_aiter_fp8"),
+            "Glm4DecoderLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_glm4_decoder_layer_has_aiter_fp8_flag(self):
+        """Glm4DecoderLayer.__init__ must set _aiter_fp8 flag."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4")
+        src = inspect.getsource(mod.Glm4DecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "Glm4DecoderLayer.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_glm4_forward_dispatches_to_aiter_fp8(self):
+        """Glm4DecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4")
+        src = inspect.getsource(mod.Glm4DecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "Glm4DecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_glm4_aiter_fp8_fuses_input_layernorm(self):
+        """_forward_aiter_fp8 must call forward_aiter_fp8_out for fused norm+quant."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4")
+        src = inspect.getsource(mod.Glm4DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must use forward_aiter_fp8_out for fused norm+FP8",
+        )
+
+    def test_glm4_aiter_fp8_handles_post_self_attn_norm(self):
+        """_forward_aiter_fp8 must apply post_self_attn_layernorm after attention."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4")
+        src = inspect.getsource(mod.Glm4DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "post_self_attn_layernorm",
+            src,
+            "_forward_aiter_fp8 must apply post_self_attn_layernorm (GLM4 post-attn norm)",
+        )
+
+    def test_glm4_module_has_use_aiter_flag(self):
+        """glm4 module must have _use_aiter module-level flag."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.glm4")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "glm4 module must have _use_aiter flag for AMD AITER detection",
+        )
+
+
 class TestStep3p5FusedFP8Path(unittest.TestCase):
     """Tests for Step3p5 fused GemmaRMSNorm+FP8 decoder path (AMD AITER)."""
 
@@ -2477,6 +2556,85 @@ class TestOlmoeFusedFP8Path(unittest.TestCase):
         self.assertTrue(
             hasattr(mod, "_use_aiter"),
             "olmoe module must have _use_aiter flag for AMD AITER detection",
+        )
+
+
+class TestGemma2FusedFP8Path(unittest.TestCase):
+    """Tests for Gemma2 fused GemmaRMSNorm+FP8 decoder path (AMD AITER)."""
+
+    def test_gemma2_attention_has_forward_with_fp8_input(self):
+        """Gemma2Attention must have _forward_with_fp8_input for FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gemma2")
+        self.assertTrue(
+            hasattr(mod.Gemma2Attention, "_forward_with_fp8_input"),
+            "Gemma2Attention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_gemma2_decoder_layer_has_aiter_fp8_flag(self):
+        """Gemma2DecoderLayer.__init__ must set _aiter_fp8 flag."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gemma2")
+        src = inspect.getsource(mod.Gemma2DecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "Gemma2DecoderLayer.__init__ must set _aiter_fp8 for AMD AITER detection",
+        )
+
+    def test_gemma2_decoder_layer_has_forward_aiter_fp8(self):
+        """Gemma2DecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gemma2")
+        self.assertTrue(
+            hasattr(mod.Gemma2DecoderLayer, "_forward_aiter_fp8"),
+            "Gemma2DecoderLayer must have _forward_aiter_fp8 for AMD AITER path",
+        )
+
+    def test_gemma2_forward_dispatches_to_aiter_fp8(self):
+        """Gemma2DecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gemma2")
+        src = inspect.getsource(mod.Gemma2DecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "Gemma2DecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_gemma2_aiter_fp8_fuses_input_layernorm(self):
+        """_forward_aiter_fp8 must call forward_aiter_fp8_out for fused norm+quant."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gemma2")
+        src = inspect.getsource(mod.Gemma2DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must use forward_aiter_fp8_out for fused GemmaRMSNorm+FP8",
+        )
+
+    def test_gemma2_module_has_use_aiter_flag(self):
+        """gemma2 module must have _use_aiter module-level flag."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gemma2")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "gemma2 module must have _use_aiter flag for AMD AITER detection",
+        )
+
+    def test_gemma2_aiter_fp8_preserves_post_attention_norm(self):
+        """_forward_aiter_fp8 must apply post_attention_layernorm after allreduce."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.gemma2")
+        src = inspect.getsource(mod.Gemma2DecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "post_attention_layernorm",
+            src,
+            "_forward_aiter_fp8 must apply post_attention_layernorm (Gemma2 architecture)",
         )
 
 
