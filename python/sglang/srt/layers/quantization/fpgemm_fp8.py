@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
+    USE_ROWWISE_TORCH_SCALED_MM,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
@@ -28,10 +29,14 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.utils import get_bool_env_var, is_cuda
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
+
+if _is_hip:
+    import aiter
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +200,27 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+
+        # On AMD with rowwise FP8 GEMM support (torch >= 2.7, gfx942+), use
+        # per-token activation quantization + hipBLAS rowwise scaled_mm.
+        # This avoids the float32 fallback that the channel-scale + per-tensor
+        # activation path uses, giving ~1.3x speedup on MI300X.
+        # weight layout: (K, N) non-contiguous (transposed from original (N, K)).
+        if _is_hip and USE_ROWWISE_TORCH_SCALED_MM:
+            input_2d = x.view(-1, x.shape[-1])
+            output_shape = [*x.shape[:-1], layer.weight.shape[1]]
+            q_input, x_scale = aiter.per_token_quant_hip(
+                input_2d, quant_dtype=aiter.dtypes.fp8
+            )
+            output = torch._scaled_mm(
+                q_input,
+                layer.weight,
+                scale_a=x_scale,
+                scale_b=layer.weight_scale.t(),
+                out_dtype=x.dtype,
+                bias=bias,
+            )
+            return output.view(*output_shape)
 
         return apply_fp8_linear(
             input=x,
