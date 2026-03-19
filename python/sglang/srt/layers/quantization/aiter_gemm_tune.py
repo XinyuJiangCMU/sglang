@@ -3,9 +3,13 @@
 
 This script identifies and tunes missing kernel configurations in AITER's
 a8w8_bpreshuffle_tuned_gemm.csv.  Shapes with K not divisible by 512
-(e.g. K=9472 for Qwen2.5-7B down_proj, K=7392/3696 for Qwen2.5-72B at TP=4/8)
+(e.g. K=9472 for Qwen2.5-7B down_proj, K=14784/29568 for Qwen2.5-72B at TP=1/2)
 cannot use the default CK heuristic path and must have explicit tuned configs
 or they run ~3x slower.
+
+NOTE: K values that are not divisible by 64 (e.g. K=7392 for Qwen2.5-72B TP=4,
+K=3696 for TP=8) cannot be tuned by any available CK bpreshuffle kernel and are
+excluded from SHAPES_TO_TUNE.  Those shapes will always use the slower fallback.
 
 Usage:
     python -m sglang.srt.layers.quantization.aiter_gemm_tune [--dry-run] [--mp N]
@@ -32,8 +36,12 @@ logger = logging.getLogger(__name__)
 # Shapes known to be slow without explicit AITER tuning.
 # Format: (N, K, description)
 # These shapes have K that is not divisible by 512, so the CK heuristic
-# dispatcher picks a sub-optimal kernel.  A tuned entry with KPerThread=256
-# (or other K%256==0 kernel) must be present in a8w8_bpreshuffle_tuned_gemm.csv.
+# dispatcher picks a sub-optimal kernel.  A tuned entry must be present in
+# a8w8_bpreshuffle_tuned_gemm.csv.
+#
+# Shapes NOT listed here (cannot be tuned -- no compatible CK kernel):
+#   K=7392  (Qwen2.5-72B TP=4):  7392 % 64 != 0
+#   K=3696  (Qwen2.5-72B TP=8):  3696 % 32 != 0
 SHAPES_TO_TUNE: List[Tuple[int, int, str]] = [
     # Qwen2.5-7B/14B: intermediate_size=18944 -> K=9472 at TP=2
     (3584, 9472, "Qwen2.5-7B/14B down_proj TP=2"),
@@ -43,11 +51,10 @@ SHAPES_TO_TUNE: List[Tuple[int, int, str]] = [
     (28672, 4096, "Llama3-8B fused gate_up TP=1"),
     (4096, 28672, "Llama3-8B down_proj TP=1"),
     # Qwen2.5-72B: intermediate_size=29568, hidden_size=8192.
-    # down_proj K=29568/tp is never divisible by 512 at any TP level.
+    # down_proj K=29568/tp.  TP=4 (K=7392) and TP=8 (K=3696) have no valid
+    # CK bpreshuffle kernel (K % 64 != 0) so only TP=1 and TP=2 are tunable.
     (8192, 29568, "Qwen2.5-72B down_proj TP=1"),
     (8192, 14784, "Qwen2.5-72B down_proj TP=2"),
-    (8192, 7392, "Qwen2.5-72B down_proj TP=4"),
-    (8192, 3696, "Qwen2.5-72B down_proj TP=8"),
 ]
 
 # Batch sizes (M) to tune for each shape.
@@ -144,8 +151,9 @@ def tune(mp: int = 1, dry_run: bool = False) -> None:
         logger.error(f"Tune script not found: {tune_script}")
         sys.exit(1)
 
-    with tempfile.NamedTemporaryFile(suffix="_tuned.csv", delete=False) as f:
-        tuned_csv = f.name
+    # Use a path that does not yet exist so the tuner creates it fresh
+    # (some tuner versions fail when given a pre-existing empty file).
+    tuned_csv = tempfile.mktemp(suffix="_tuned.csv")
 
     cmd = (
         f"cd {os.path.dirname(tune_script)} && "
@@ -160,13 +168,30 @@ def tune(mp: int = 1, dry_run: bool = False) -> None:
     )
     logger.info(f"Running: {cmd}")
     ret = os.system(cmd)
-    if ret != 0:
-        logger.error("Tune script failed.")
+
+    # The tuner exits 1 if any shape fails, even when others succeed and were
+    # written to the output file.  Merge whatever was successfully tuned.
+    if not os.path.exists(tuned_csv):
+        logger.error("Tune script produced no output file.")
         sys.exit(1)
+
+    import pandas as pd
+
+    tuned_df = pd.read_csv(tuned_csv) if os.path.getsize(tuned_csv) > 0 else None
+    if tuned_df is None or len(tuned_df) == 0:
+        logger.error("Tune script produced an empty output file; nothing to merge.")
+        sys.exit(1)
+
+    if ret != 0:
+        logger.warning(
+            f"Tune script exited with code {ret}; some shapes may not have been tuned. "
+            f"Merging {len(tuned_df)} successfully tuned entries."
+        )
 
     merge_tuned_results(tuned_csv)
     os.unlink(untuned_csv)
-    os.unlink(tuned_csv)
+    if os.path.exists(tuned_csv):
+        os.unlink(tuned_csv)
 
     logger.info(
         "Tuning complete.  Set AITER_REBUILD=1 and restart SGLang to rebuild "

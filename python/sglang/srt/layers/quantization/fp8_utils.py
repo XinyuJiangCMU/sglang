@@ -141,12 +141,11 @@ _AITER_FP8_EXPECTED_GEMM_SHAPES = [
     (9472, 3584, "Qwen2.5-7B/14B gate_up (TP=2)"),
     (28672, 4096, "Llama3-8B fused gate_up (TP=1)"),
     (4096, 28672, "Llama3-8B down_proj (TP=1)"),
-    # Qwen2.5-72B (intermediate_size=29568, hidden_size=8192): all TP sizes
-    # have K not divisible by 512 for down_proj (K=29568/tp).
+    # Qwen2.5-72B (intermediate_size=29568, hidden_size=8192).
+    # TP=4 (K=7392) and TP=8 (K=3696) omitted: K % 64 != 0 means no compatible
+    # CK bpreshuffle kernel exists -- those shapes always use the slow fallback.
     (8192, 29568, "Qwen2.5-72B down_proj (TP=1)"),
     (8192, 14784, "Qwen2.5-72B down_proj (TP=2)"),
-    (8192, 7392, "Qwen2.5-72B down_proj (TP=4)"),
-    (8192, 3696, "Qwen2.5-72B down_proj (TP=8)"),
 ]
 
 
