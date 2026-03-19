@@ -57,6 +57,7 @@ elif _is_hip:
     try:
         from aiter import silu_and_mul as _aiter_silu_and_mul
         from aiter import gelu_and_mul as _aiter_gelu_and_mul
+        from aiter import gelu_tanh_and_mul as _aiter_gelu_tanh_and_mul
 
         _has_aiter_activation = True
     except ImportError:
@@ -146,11 +147,16 @@ class GeluAndMul(MultiPlatformOp):
         return self._forward_impl(x)
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
-        if _is_hip and _has_aiter_activation and self.approximate == "none":
+        if _is_hip and _has_aiter_activation:
             d = x.shape[-1] // 2
             output_shape = x.shape[:-1] + (d,)
             out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-            _aiter_gelu_and_mul(out, x)
+            if self.approximate == "none":
+                _aiter_gelu_and_mul(out, x)
+            elif self.approximate == "tanh":
+                _aiter_gelu_tanh_and_mul(out, x)
+            else:
+                return self._forward_impl(x)
             return out
         return self._forward_impl(x)
 

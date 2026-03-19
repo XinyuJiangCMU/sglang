@@ -4825,5 +4825,36 @@ class TestFP8KVCachePrefill(unittest.TestCase):
                          "BF16 path should not pass k_descale")
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestAITERActivationKernels(unittest.TestCase):
+    """Test AITER activation kernel integration."""
+
+    def test_silu_and_mul_uses_aiter(self):
+        """SiluAndMul.forward_hip uses AITER kernel."""
+        import inspect
+        from sglang.srt.layers.activation import SiluAndMul
+        src = inspect.getsource(SiluAndMul.forward_hip)
+        self.assertIn("_aiter_silu_and_mul", src)
+
+    def test_gelu_and_mul_none_uses_aiter(self):
+        """GeluAndMul.forward_hip uses AITER for approximate='none'."""
+        import inspect
+        from sglang.srt.layers.activation import GeluAndMul
+        src = inspect.getsource(GeluAndMul.forward_hip)
+        self.assertIn("_aiter_gelu_and_mul", src)
+
+    def test_gelu_tanh_and_mul_uses_aiter(self):
+        """GeluAndMul.forward_hip uses AITER for approximate='tanh'."""
+        import inspect
+        from sglang.srt.layers.activation import GeluAndMul
+        src = inspect.getsource(GeluAndMul.forward_hip)
+        self.assertIn("_aiter_gelu_tanh_and_mul", src)
+
+    def test_aiter_activation_imports(self):
+        """AITER activation kernels are importable."""
+        from sglang.srt.layers.activation import _has_aiter_activation
+        self.assertTrue(_has_aiter_activation, "AITER activation kernels should be available")
+
+
 if __name__ == "__main__":
     unittest.main()
