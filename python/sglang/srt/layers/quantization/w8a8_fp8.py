@@ -212,6 +212,8 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        prequantized_fp8: Optional[torch.Tensor] = None,
+        prequantized_fp8_scale: Optional[torch.Tensor] = None,
     ):
         if _use_aiter:
             return apply_fp8_ptpc_linear(
@@ -220,6 +222,8 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
                 layer.weight_scale,
                 bias=bias,
                 use_per_token_if_dynamic=True,
+                prequantized_fp8=prequantized_fp8,
+                prequantized_fp8_scale=prequantized_fp8_scale,
             )
         return apply_fp8_linear(
             x,

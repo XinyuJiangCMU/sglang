@@ -268,6 +268,29 @@ class ReplicatedLinear(LinearBase):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
+    def forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Forward with pre-quantized FP8 input for AMD AITER W8A8-FP8 path.
+
+        Use when the preceding RMSNorm has already computed FP8 quantization
+        via forward_aiter_fp8_out(), avoiding a redundant per_token_quant_hip
+        call inside apply_fp8_ptpc_linear (saves ~14µs per layer on MI300X).
+        Only valid when quant_method is W8A8Fp8LinearMethod with _use_aiter.
+        """
+        bias = self.bias if not self.skip_bias_add else None
+        assert self.quant_method is not None
+        output = self.quant_method.apply(
+            self, x, bias,
+            prequantized_fp8=fp8_input,
+            prequantized_fp8_scale=fp8_scale,
+        )
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
         s += f", output_features={self.output_size}"
