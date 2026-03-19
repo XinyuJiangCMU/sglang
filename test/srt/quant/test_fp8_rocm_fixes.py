@@ -2128,6 +2128,73 @@ class TestMiMoV2MTPFusedFP8Path(unittest.TestCase):
         )
 
 
+class TestNemotronHFusedFP8Path(unittest.TestCase):
+    """Tests for NemotronH fused RMSNorm+FP8 attention decoder path (AMD AITER)."""
+
+    def test_nemotron_h_attention_has_forward_with_fp8_input(self):
+        """NemotronHAttention must have _forward_with_fp8_input for FP8 path."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.nemotron_h")
+        self.assertTrue(
+            hasattr(mod.NemotronHAttention, "_forward_with_fp8_input"),
+            "NemotronHAttention must have _forward_with_fp8_input for AMD AITER FP8 path",
+        )
+
+    def test_nemotron_h_attn_decoder_has_forward_aiter_fp8(self):
+        """NemotronHAttentionDecoderLayer must have _forward_aiter_fp8 method."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.nemotron_h")
+        self.assertTrue(
+            hasattr(mod.NemotronHAttentionDecoderLayer, "_forward_aiter_fp8"),
+            "NemotronHAttentionDecoderLayer must have _forward_aiter_fp8 for AMD AITER",
+        )
+
+    def test_nemotron_h_attn_decoder_has_aiter_fp8_flag(self):
+        """NemotronHAttentionDecoderLayer.__init__ must set _aiter_fp8 flag."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.nemotron_h")
+        src = inspect.getsource(mod.NemotronHAttentionDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "NemotronHAttentionDecoderLayer.__init__ must set _aiter_fp8",
+        )
+
+    def test_nemotron_h_forward_dispatches_to_aiter_fp8(self):
+        """NemotronHAttentionDecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.nemotron_h")
+        src = inspect.getsource(mod.NemotronHAttentionDecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "NemotronHAttentionDecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_nemotron_h_fp8_no_rope(self):
+        """NemotronHAttention._forward_with_fp8_input must not require positions (no RoPE)."""
+        import inspect
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.nemotron_h")
+        src = inspect.getsource(mod.NemotronHAttention._forward_with_fp8_input)
+        self.assertNotIn(
+            "rotary_emb",
+            src,
+            "NemotronHAttention._forward_with_fp8_input must not call rotary_emb (no RoPE)",
+        )
+
+    def test_nemotron_h_module_has_use_aiter_flag(self):
+        """nemotron_h module must have _use_aiter module-level flag."""
+        import importlib
+        mod = importlib.import_module("sglang.srt.models.nemotron_h")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "nemotron_h module must have _use_aiter flag for AMD AITER detection",
+        )
+
+
 class TestGlm4FusedFP8Path(unittest.TestCase):
     """Tests for GLM4 fused RMSNorm+FP8 decoder path (AMD AITER)."""
 
