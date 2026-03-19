@@ -39,6 +39,8 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe import fused_moe as aiter_fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
 
@@ -245,12 +247,17 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         # WEIGHTS
+        # Always allocate as float8_e4m3fn so checkpoint bytes are loaded via
+        # bitwise copy (no value conversion).  On AMD we normalize to
+        # float8_e4m3fnuz in process_weights_after_loading, which correctly
+        # handles the NaN-bit pattern and doubles the scale.  Allocating as
+        # float8_e4m3fnuz directly would cause values 240-448 to become NaN.
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
-                dtype=fp8_dtype,
+                dtype=torch.float8_e4m3fn,
             ),
             requires_grad=False,
         )
@@ -262,7 +269,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
-                dtype=fp8_dtype,
+                dtype=torch.float8_e4m3fn,
             ),
             requires_grad=False,
         )
@@ -296,14 +303,29 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
-        layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
-        layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
-        )
-        layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
-        )
+        if is_fp8_fnuz():
+            # Weights were loaded as float8_e4m3fn (bitwise copy from checkpoint).
+            # Normalize to float8_e4m3fnuz: zero the NaN bit-pattern and double
+            # the scale to account for the different bit-value mapping.
+            w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                layer.w13_weight, layer.w13_weight_scale
+            )
+            w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                layer.w2_weight, layer.w2_weight_scale
+            )
+            layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+            layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+            layer.w13_weight_scale = Parameter(w13_weight_scale, requires_grad=False)
+            layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
+        else:
+            layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
+            layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.data, requires_grad=False
+            )
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data, requires_grad=False
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -316,6 +338,40 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+
+        if _use_aiter:
+            # AITER fused MoE: per-token dynamic FP8 quantization, much faster
+            # than Triton on AMD MI300X for w8a8_fp8 inference
+            if self.moe_runner_config.apply_router_weight_on_input:
+                _, topk = topk_weights.shape
+                assert (
+                    topk == 1
+                ), "apply_router_weight_on_input only supported with topk=1 in AITER path"
+                x = x * topk_weights.to(x.dtype)
+                topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
+            output = aiter_fused_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                activation=(
+                    ActivationType.Silu
+                    if self.moe_runner_config.activation == "silu"
+                    else ActivationType.Gelu
+                ),
+                quant_type=QuantType.per_Token,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
+            return StandardCombineInput(hidden_states=output)
 
         quant_info = TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
