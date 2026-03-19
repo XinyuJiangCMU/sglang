@@ -205,6 +205,8 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        prequantized_fp8: Optional[torch.Tensor] = None,
+        prequantized_fp8_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         if self.quant_config.use_marlin:
@@ -221,6 +223,8 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
         # On AMD with AITER, use gemm_a8w8_bpreshuffle via apply_fp8_ptpc_linear.
         # Weight is stored in (N, K) preshuffled layout by process_weights_after_loading.
         # This is faster than torch._scaled_mm + manual scale reshape on MI300X.
+        # Accepts prequantized_fp8/prequantized_fp8_scale from fused RMSNorm+FP8 path
+        # (forward_with_fp8_input in decoder layers) to skip redundant per_token_quant_hip.
         if _use_aiter:
             return apply_fp8_ptpc_linear(
                 input=x,
@@ -228,6 +232,8 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale,
                 bias=bias,
                 use_per_token_if_dynamic=True,
+                prequantized_fp8=prequantized_fp8,
+                prequantized_fp8_scale=prequantized_fp8_scale,
             )
 
         # On AMD without AITER but with rowwise FP8 GEMM support (torch >= 2.7,
