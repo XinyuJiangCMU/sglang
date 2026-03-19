@@ -167,8 +167,12 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # For checkpoint FP8, always allocate as float8_e4m3fn so bytes are
+        # loaded verbatim.  On AMD, normalize_e4m3fn_to_e4m3fnuz in
+        # process_weights_after_loading safely bitcasts to float8_e4m3fnuz.
+        # fp8_dtype (fnuz on AMD) would NaN-ify values in [240, 448] on copy_.
         weight_dtype = (
-            fp8_dtype
+            torch.float8_e4m3fn
             if self.quantization_config.is_checkpoint_fp8_serialized
             else params_dtype
         )

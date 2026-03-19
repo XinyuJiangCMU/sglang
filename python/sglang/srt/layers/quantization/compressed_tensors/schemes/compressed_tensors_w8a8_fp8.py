@@ -16,7 +16,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_ptpc_linear,
@@ -86,11 +86,16 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             )
 
         # WEIGHT
+        # Always allocate as float8_e4m3fn so checkpoint bytes are loaded via
+        # bitwise copy (no value conversion).  normalize_e4m3fn_to_e4m3fnuz in
+        # process_weights_after_loading safely bitcasts to float8_e4m3fnuz on AMD.
+        # Allocating as fp8_dtype (fnuz on AMD) would let copy_ silently
+        # NaN-ify values in [240, 448] when loading from NVIDIA FP8 checkpoints.
         weight = ModelWeightParameter(
             data=torch.empty(
                 output_size_per_partition,
                 input_size_per_partition,
-                dtype=fp8_dtype,
+                dtype=torch.float8_e4m3fn,
             ),
             input_dim=1,
             output_dim=0,
