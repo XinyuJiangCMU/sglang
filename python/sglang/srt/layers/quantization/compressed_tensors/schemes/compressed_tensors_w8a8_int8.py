@@ -20,13 +20,20 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 
 __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
+if _use_aiter:
+    try:
+        from aiter import gemm_a8w8 as aiter_gemm_a8w8
+    except ImportError:
+        raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
@@ -172,6 +179,24 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     ) -> torch.Tensor:
         # TODO: add cutlass_scaled_mm_azp support
         x_q, x_scale = per_token_quant_int8(x)
+
+        x_q_2d = x_q.view(-1, x_q.shape[-1])
+        x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
+        output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
+
+        if _use_aiter:
+            # aiter.gemm_a8w8(XQ, WQ, x_scale, w_scale, bias, dtype)
+            # layer.weight is stored as (K, N) after process_weights (.t())
+            # so we pass layer.weight.t() which is (N, K) as required by aiter.gemm_a8w8
+            output = aiter_gemm_a8w8(
+                x_q_2d,
+                layer.weight.t(),
+                x_scale_2d,
+                layer.weight_scale,
+                bias,
+                x.dtype,
+            )
+            return output.view(output_shape)
 
         return int8_scaled_mm(
             x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
