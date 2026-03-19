@@ -179,8 +179,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             else:
                 weight_scale = layer.weight_scale.data
 
-            if _use_aiter:
-                # keep the weight as (N, K)
+            if _use_aiter and not self.is_static_input_scheme:
+                # Keep (N, K) layout for AITER per-token-per-channel GEMM.
+                # Static input scheme uses apply_fp8_linear with (K, N) layout.
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)), requires_grad=False
                 )
@@ -227,7 +228,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 bias=bias,
             )
 
-        if _use_aiter and self.strategy == QuantizationStrategy.CHANNEL:
+        if _use_aiter and self.strategy == QuantizationStrategy.CHANNEL and not self.is_static_input_scheme:
             return apply_fp8_ptpc_linear(
                 input=x,
                 weight=layer.weight,
