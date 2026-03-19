@@ -38,6 +38,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -106,6 +107,18 @@ class AfmoeMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """MLP forward with pre-quantized FP8 input for AMD AITER path."""
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -385,6 +398,32 @@ class AfmoeAttention(nn.Module):
         k = k_heads.view(k.shape)
         return q, k
 
+    def _forward_with_fp8_input(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        forward_batch: ForwardBatch,
+        skip_o_reduce: bool = False,
+    ) -> torch.Tensor:
+        """Attention forward with pre-quantized FP8 input for AMD AITER path.
+
+        Uses fp8_input/fp8_scale for qkv_proj; gate_proj still uses BF16 hidden_states.
+        """
+        qkv, _ = self.qkv_proj.forward_with_fp8_input(hidden_states, fp8_input, fp8_scale)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self._apply_qk_norm(q, k)
+
+        if self.is_local_attention:
+            q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, forward_batch)
+
+        gate_vals, _ = self.gate_proj(hidden_states)
+        attn_output = attn_output * torch.sigmoid(gate_vals)
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_o_reduce)
+        return output
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -462,12 +501,86 @@ class AfmoeDecoderLayer(nn.Module):
         self.pre_mlp_layernorm = RMSNorm(config.hidden_size, eps=eps)
         self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=eps)
 
+        # AMD AITER fused RMSNorm+FP8 path: fuse input_layernorm and pre_mlp_layernorm
+        # norm+quant for both qkv_proj and gate_up_proj. Only dense MLP layers benefit
+        # (MoE uses fused_moe which handles quantization internally).
+        if _use_aiter:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fbgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            try:
+                from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                    CompressedTensorsLinearMethod,
+                )
+                from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+
+                qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+                if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                    scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
+                    attn_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+                else:
+                    attn_fp8 = isinstance(
+                        qm,
+                        (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                    )
+            except ImportError:
+                qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
+                attn_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
+
+            # For MoE layers, skip the MLP FP8 fused path
+            is_dense_mlp = isinstance(self.mlp, AfmoeMLP)
+            self._aiter_fp8 = attn_fp8 and is_dense_mlp
+        else:
+            self._aiter_fp8 = False
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """AfMoE decoder forward with fused RMSNorm+FP8 (AMD AITER).
+
+        Fuses input_layernorm and pre_mlp_layernorm norm+per_token_quant into
+        single AITER kernels. post_attention_layernorm and post_mlp_layernorm
+        remain in BF16. Only active for dense MLP layers.
+        """
+        attn_residual = hidden_states
+
+        # Attention: fused RMSNorm+FP8 into qkv_proj
+        fp8_hs, fp8_scale, _ = self.input_layernorm.forward_aiter_fp8_out(hidden_states)
+        hidden_states = self.self_attn._forward_with_fp8_input(
+            positions, hidden_states, fp8_hs, fp8_scale, forward_batch,
+            skip_o_reduce=True,
+        )
+
+        # Allreduce (TP>1), post_attention_layernorm, residual add
+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = attn_residual + hidden_states
+
+        mlp_residual = hidden_states
+
+        # MLP: fused RMSNorm+FP8 into gate_up_proj
+        fp8_hs, fp8_scale, _ = self.pre_mlp_layernorm.forward_aiter_fp8_out(hidden_states)
+        hidden_states = self.mlp._forward_with_fp8_input(hidden_states, fp8_hs, fp8_scale)
+        hidden_states = self.post_mlp_layernorm(hidden_states)
+        hidden_states = mlp_residual + hidden_states
+
+        return hidden_states
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if self._aiter_fp8:
+            return self._forward_aiter_fp8(positions, hidden_states, forward_batch)
+
         attn_residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(positions, hidden_states, forward_batch)

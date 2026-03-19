@@ -4392,5 +4392,97 @@ class TestGemma3FP8AiterPath(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestAfmoeFP8AiterPath(unittest.TestCase):
+    """Verify AfMoE FP8 AITER path implementation structure."""
+
+    def test_afmoe_mlp_has_forward_with_fp8_input(self):
+        """AfmoeMLP must have _forward_with_fp8_input method."""
+        from sglang.srt.models.afmoe import AfmoeMLP
+
+        self.assertTrue(
+            hasattr(AfmoeMLP, "_forward_with_fp8_input"),
+            "AfmoeMLP must have _forward_with_fp8_input method",
+        )
+
+    def test_afmoe_attention_has_forward_with_fp8_input(self):
+        """AfmoeAttention must have _forward_with_fp8_input method."""
+        from sglang.srt.models.afmoe import AfmoeAttention
+
+        self.assertTrue(
+            hasattr(AfmoeAttention, "_forward_with_fp8_input"),
+            "AfmoeAttention must have _forward_with_fp8_input method",
+        )
+
+    def test_afmoe_decoder_layer_has_aiter_fp8_attr(self):
+        """AfmoeDecoderLayer must set _aiter_fp8 in __init__."""
+        import inspect
+        from sglang.srt.models.afmoe import AfmoeDecoderLayer
+
+        src = inspect.getsource(AfmoeDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "AfmoeDecoderLayer.__init__ must set self._aiter_fp8",
+        )
+
+    def test_afmoe_decoder_layer_has_forward_aiter_fp8(self):
+        """AfmoeDecoderLayer must have _forward_aiter_fp8 method."""
+        from sglang.srt.models.afmoe import AfmoeDecoderLayer
+
+        self.assertTrue(
+            hasattr(AfmoeDecoderLayer, "_forward_aiter_fp8"),
+            "AfmoeDecoderLayer must have _forward_aiter_fp8 method",
+        )
+
+    def test_afmoe_forward_dispatches_to_aiter_fp8(self):
+        """AfmoeDecoderLayer.forward must dispatch to _forward_aiter_fp8 when set."""
+        import inspect
+        from sglang.srt.models.afmoe import AfmoeDecoderLayer
+
+        src = inspect.getsource(AfmoeDecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "AfmoeDecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_afmoe_aiter_fp8_only_for_dense_mlp(self):
+        """AfmoeDecoderLayer._aiter_fp8 must only be set for dense MLP layers."""
+        import inspect
+        from sglang.srt.models.afmoe import AfmoeDecoderLayer
+
+        src = inspect.getsource(AfmoeDecoderLayer.__init__)
+        self.assertIn(
+            "AfmoeMLP",
+            src,
+            "__init__ must check isinstance(self.mlp, AfmoeMLP) before setting _aiter_fp8",
+        )
+
+    def test_afmoe_uses_fp8_utils_use_aiter(self):
+        """afmoe.py must import _use_aiter from fp8_utils."""
+        import inspect
+        import sglang.srt.models.afmoe as m
+
+        src = inspect.getsource(m)
+        self.assertIn(
+            "_use_aiter",
+            src,
+            "afmoe.py must import and use _use_aiter",
+        )
+
+    def test_afmoe_aiter_fp8_uses_forward_aiter_fp8_out(self):
+        """_forward_aiter_fp8 must use input_layernorm.forward_aiter_fp8_out."""
+        import inspect
+        from sglang.srt.models.afmoe import AfmoeDecoderLayer
+
+        src = inspect.getsource(AfmoeDecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "forward_aiter_fp8_out",
+            src,
+            "_forward_aiter_fp8 must call forward_aiter_fp8_out",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
