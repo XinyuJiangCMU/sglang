@@ -13,6 +13,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    apply_fp8_ptpc_linear,
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
@@ -97,8 +98,10 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
             if self.per_token:
                 weight_scale = weight_scale.view(-1, 1)
             if _use_aiter:
+                # Keep (N, K) layout for AITER GEMM; apply_fp8_ptpc_linear expects
+                # pre-shuffled, non-transposed weight
                 layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)).t(), requires_grad=False
+                    shuffle_weight(weight, (16, 16)), requires_grad=False
                 )
             else:
                 layer.weight = Parameter(weight.t(), requires_grad=False)
@@ -174,6 +177,16 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+
+        if _use_aiter and self.weight_qscheme == "per_channel":
+            return apply_fp8_ptpc_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+                use_per_token_if_dynamic=self.per_token,
+            )
 
         return apply_fp8_linear(
             x,
