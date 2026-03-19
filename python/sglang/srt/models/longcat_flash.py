@@ -432,6 +432,38 @@ class LongcatFlashDecoderLayer(nn.Module):
             qkv_latent_func=self.self_attn[0].prepare_qkv_latent,
         )
 
+        # AMD AITER fused RMSNorm+FP8 path: only applied to mlps[1] via
+        # mlp_layer_communicator[1].prepare_mlp_fp8_out() which handles the
+        # second dense MLP (fusing allreduce+add+norm+fp8_quant into one kernel).
+        # mlps[0] and the MoE layer are left on the BF16 path.
+        if _use_aiter:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fbgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            try:
+                from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                    CompressedTensorsLinearMethod,
+                )
+                from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+
+                qm = getattr(self.mlps[1].gate_up_proj, "quant_method", None)
+                if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                    scheme = getattr(self.mlps[1].gate_up_proj, "scheme", None)
+                    self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+                else:
+                    self._aiter_fp8 = isinstance(
+                        qm,
+                        (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod),
+                    )
+            except ImportError:
+                qm = getattr(self.mlps[1].gate_up_proj, "quant_method", None)
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
+        else:
+            self._aiter_fp8 = False
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -440,6 +472,11 @@ class LongcatFlashDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        if self._aiter_fp8 and not forward_batch.forward_mode.is_idle():
+            return self._forward_aiter_fp8(
+                positions, hidden_states, forward_batch, residual, zero_allocator
+            )
+
         # first_attn
         hidden_states, residual = self.moe_layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
@@ -468,6 +505,91 @@ class LongcatFlashDecoderLayer(nn.Module):
         )
 
         hidden_states = moe_hidden_states + hidden_states
+        return hidden_states, residual
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+    ):
+        """Decoder forward with fused post_attention_layernorm+FP8 for mlps[1] (AMD AITER).
+
+        Uses prepare_mlp_fp8_out for the second dense MLP (mlps[1]), saving ~13µs
+        per norm call on MI300X. mlps[0] and the MoE layer stay on the BF16 path.
+        """
+        # first_attn (same as non-FP8 path)
+        hidden_states, residual = self.moe_layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn[0](
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
+
+        # moe (BF16 path)
+        hidden_states, residual = self.moe_layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        moe_hidden_states = hidden_states.clone()
+        moe_residual = residual.clone()
+        moe_hidden_states = self.mlp(moe_hidden_states)
+        moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
+            moe_hidden_states, moe_residual, forward_batch
+        )
+
+        hidden_states, residual = self._forward_mlp_aiter_fp8(
+            hidden_states, positions, residual, forward_batch, zero_allocator
+        )
+
+        hidden_states = moe_hidden_states + hidden_states
+        return hidden_states, residual
+
+    def _forward_mlp_aiter_fp8(
+        self, hidden_states, positions, residual, forward_batch, zero_allocator
+    ):
+        """Dense MLP path with FP8 fusion for mlps[1]."""
+        # first_mlp (BF16)
+        hidden_states = self.mlps[0](hidden_states)
+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+
+        # second_attn
+        hidden_states, residual = self.mlp_layer_communicator[1].prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn[1](
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
+
+        # second_mlp: use prepare_mlp_fp8_out for fused norm+FP8
+        result = self.mlp_layer_communicator[1].prepare_mlp_fp8_out(
+            hidden_states, residual, forward_batch
+        )
+        if result is not None:
+            fp8_hs, fp8_scale, residual = result
+            hidden_states = self.mlps[1]._forward_with_fp8_input(
+                hidden_states, fp8_hs, fp8_scale
+            )
+        else:
+            hidden_states, residual = self.mlp_layer_communicator[1].prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states = self.mlps[1](hidden_states)
+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+
+        hidden_states, residual = self.mlp_layer_communicator[1].postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
         return hidden_states, residual
 
     def forward_mlp(

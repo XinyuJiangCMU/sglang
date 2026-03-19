@@ -4484,5 +4484,79 @@ class TestAfmoeFP8AiterPath(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestLongcatFlashFP8AiterPath(unittest.TestCase):
+    """Verify LongcatFlashDecoderLayer FP8 AITER path implementation structure."""
+
+    def test_longcat_flash_decoder_layer_has_aiter_fp8_attr(self):
+        """LongcatFlashDecoderLayer must set _aiter_fp8 in __init__."""
+        import inspect
+        from sglang.srt.models.longcat_flash import LongcatFlashDecoderLayer
+
+        src = inspect.getsource(LongcatFlashDecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "LongcatFlashDecoderLayer.__init__ must set self._aiter_fp8",
+        )
+
+    def test_longcat_flash_decoder_layer_has_forward_aiter_fp8(self):
+        """LongcatFlashDecoderLayer must have _forward_aiter_fp8 method."""
+        from sglang.srt.models.longcat_flash import LongcatFlashDecoderLayer
+
+        self.assertTrue(
+            hasattr(LongcatFlashDecoderLayer, "_forward_aiter_fp8"),
+            "LongcatFlashDecoderLayer must have _forward_aiter_fp8 method",
+        )
+
+    def test_longcat_flash_forward_dispatches_to_aiter_fp8(self):
+        """LongcatFlashDecoderLayer.forward must dispatch to _forward_aiter_fp8 when set."""
+        import inspect
+        from sglang.srt.models.longcat_flash import LongcatFlashDecoderLayer
+
+        src = inspect.getsource(LongcatFlashDecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "LongcatFlashDecoderLayer.forward must dispatch to _forward_aiter_fp8",
+        )
+
+    def test_longcat_flash_aiter_fp8_uses_prepare_mlp_fp8_out(self):
+        """_forward_aiter_fp8 or helper must use prepare_mlp_fp8_out."""
+        import inspect
+        from sglang.srt.models.longcat_flash import LongcatFlashDecoderLayer
+
+        src = inspect.getsource(LongcatFlashDecoderLayer._forward_mlp_aiter_fp8)
+        self.assertIn(
+            "prepare_mlp_fp8_out",
+            src,
+            "_forward_mlp_aiter_fp8 must call prepare_mlp_fp8_out",
+        )
+
+    def test_longcat_flash_aiter_fp8_guards_idle_mode(self):
+        """forward must guard _forward_aiter_fp8 dispatch against idle forward mode."""
+        import inspect
+        from sglang.srt.models.longcat_flash import LongcatFlashDecoderLayer
+
+        src = inspect.getsource(LongcatFlashDecoderLayer.forward)
+        self.assertIn(
+            "is_idle",
+            src,
+            "forward must guard _aiter_fp8 dispatch with is_idle() check",
+        )
+
+    def test_longcat_flash_aiter_fp8_uses_mlp1_forward_with_fp8_input(self):
+        """_forward_mlp_aiter_fp8 must use mlps[1]._forward_with_fp8_input."""
+        import inspect
+        from sglang.srt.models.longcat_flash import LongcatFlashDecoderLayer
+
+        src = inspect.getsource(LongcatFlashDecoderLayer._forward_mlp_aiter_fp8)
+        self.assertIn(
+            "_forward_with_fp8_input",
+            src,
+            "_forward_mlp_aiter_fp8 must call _forward_with_fp8_input",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
