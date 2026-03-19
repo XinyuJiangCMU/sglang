@@ -273,11 +273,14 @@ class Qwen2DecoderLayer(nn.Module):
         )
         # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
         if _use_aiter:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
             from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
             from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
 
             qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
-            self._aiter_fp8 = isinstance(qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod))
+            self._aiter_fp8 = isinstance(
+                qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+            )
         else:
             self._aiter_fp8 = False
 

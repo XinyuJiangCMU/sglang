@@ -687,6 +687,8 @@ class Fp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        prequantized_fp8: Optional[torch.Tensor] = None,
+        prequantized_fp8_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
@@ -764,6 +766,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 input_scale=None,
                 bias=bias,
                 use_per_token_if_dynamic=True,
+                prequantized_fp8=prequantized_fp8,
+                prequantized_fp8_scale=prequantized_fp8_scale,
             )
 
         return apply_fp8_linear(

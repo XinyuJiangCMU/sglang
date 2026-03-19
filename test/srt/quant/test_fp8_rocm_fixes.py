@@ -933,5 +933,48 @@ class TestRoutedScalingFactorMoE(unittest.TestCase):
                       "Should guard routed_scaling_factor multiply with != 1.0 check")
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestFp8LinearMethodPrequantized(unittest.TestCase):
+    """Test Fp8LinearMethod.apply() accepts prequantized_fp8 parameters (AMD AITER)."""
+
+    def test_apply_signature_has_prequantized_params(self):
+        """Fp8LinearMethod.apply() must accept prequantized_fp8/prequantized_fp8_scale."""
+        import inspect
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+        sig = inspect.signature(Fp8LinearMethod.apply)
+        params = list(sig.parameters.keys())
+        self.assertIn(
+            "prequantized_fp8", params,
+            "Fp8LinearMethod.apply must accept prequantized_fp8 for fused RMSNorm+FP8 path",
+        )
+        self.assertIn(
+            "prequantized_fp8_scale", params,
+            "Fp8LinearMethod.apply must accept prequantized_fp8_scale for fused RMSNorm+FP8 path",
+        )
+
+    def test_apply_passes_prequantized_to_ptpc(self):
+        """Fp8LinearMethod.apply() must forward prequantized args to apply_fp8_ptpc_linear."""
+        import inspect
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+        src = inspect.getsource(Fp8LinearMethod.apply)
+        self.assertIn(
+            "prequantized_fp8=prequantized_fp8", src,
+            "Fp8LinearMethod.apply must pass prequantized_fp8 to apply_fp8_ptpc_linear",
+        )
+
+    def test_fused_rmsnorm_fp8_linear_method_check(self):
+        """LlamaDecoderLayer._aiter_fp8 check should include Fp8LinearMethod."""
+        import inspect
+        import importlib
+        llama_mod = importlib.import_module("sglang.srt.models.llama")
+        src = inspect.getsource(llama_mod.LlamaDecoderLayer.__init__)
+        self.assertIn(
+            "Fp8LinearMethod", src,
+            "LlamaDecoderLayer._aiter_fp8 check must include Fp8LinearMethod",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
