@@ -46,6 +46,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    apply_fp8_ptpc_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
@@ -557,15 +558,25 @@ class Fp8LinearMethod(LinearMethodBase):
                     qweight, weight_scale = per_token_group_quant_fp8(
                         layer.weight, layer.weight.shape[-1]
                     )
-                    weight_scale = weight_scale.t().contiguous()
                     if _use_aiter and self.use_aiter_fp8_per_token:
+                        # AITER gemm_a8w8_bpreshuffle expects:
+                        #   WQ: (N, K) preshuffled  (NOT transposed)
+                        #   w_scale: (N, 1)           (NOT transposed)
+                        # Store weight in (N, K) shuffled layout; apply method uses
+                        # apply_fp8_ptpc_linear which passes weight directly (no .T).
                         self.use_per_token_if_dynamic = True
                         qweight = shuffle_weight(qweight.contiguous(), (16, 16))
+                        # weight_scale already has shape (N, 1) from per_token_group_quant_fp8
+                        layer.weight = Parameter(qweight, requires_grad=False)
+                        layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                        layer.input_scale = None
+                        return
+                    weight_scale = weight_scale.t().contiguous()
                 else:
                     # per-tensor quantization
                     qweight, weight_scale = input_to_float8(layer.weight)
 
-                # Update the layer with the new values.
+                # Update the layer with the new values (CUTLASS/Marlin/per-tensor path).
                 layer.weight = Parameter(qweight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 layer.input_scale = None
@@ -598,7 +609,10 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.weight_scale, layer.logical_widths
                     )
                     if _use_aiter and self.use_aiter_fp8_per_token:
-                        # Otherwise, by default, aiter only uses per-tensor quantization
+                        # AITER gemm_a8w8_bpreshuffle expects:
+                        #   WQ: (N, K) preshuffled  (NOT transposed)
+                        #   w_scale: (N, 1)           (from convert_to_channelwise, already (N,1))
+                        # apply method uses apply_fp8_ptpc_linear which passes weight directly.
                         self.use_per_token_if_dynamic = True
                         if _is_fp8_fnuz:
                             weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
@@ -606,6 +620,13 @@ class Fp8LinearMethod(LinearMethodBase):
                                 weight_scale=weight_scale,
                             )
                         weight = shuffle_weight(weight.contiguous(), (16, 16))
+                        layer.weight = Parameter(weight, requires_grad=False)
+                        layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                        # fall through to input_scale handling below
+                    else:
+                        # Update layer with new values for CUTLASS/Marlin path.
+                        layer.weight = Parameter(weight.t(), requires_grad=False)
+                        layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 else:
                     # Dequant -> Quant with max scale so we can run per tensor.
                     weight = layer.weight
@@ -630,9 +651,9 @@ class Fp8LinearMethod(LinearMethodBase):
                         logical_widths=layer.logical_widths,
                     )
 
-                # Update layer with new values.
-                layer.weight = Parameter(weight.t(), requires_grad=False)
-                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                    # Update layer with new values.
+                    layer.weight = Parameter(weight.t(), requires_grad=False)
+                    layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 if (
                     hasattr(self.quant_config, "activation_scheme")
                     and self.quant_config.activation_scheme == "static"
@@ -718,6 +739,19 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
+            )
+
+        # AITER per-token-per-channel path: weight is stored as (N, K) preshuffled,
+        # weight_scale is (N, 1).  apply_fp8_ptpc_linear uses gemm_a8w8_bpreshuffle
+        # which expects this layout directly (no additional transpose).
+        if _use_aiter and self.use_per_token_if_dynamic:
+            return apply_fp8_ptpc_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+                use_per_token_if_dynamic=True,
             )
 
         return apply_fp8_linear(
