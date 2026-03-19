@@ -1489,12 +1489,14 @@ def apply_fp8_linear(
             # For CUDA platform please validate if the
             # torch._scaled_mm support rowwise scaled GEMM
             # Fused GEMM_DQ Rowwise GEMM
+            # hipBLASLt requires scale_b to be a contiguous (1, N) tensor.
+            w_scale_1n = weight_scale.reshape(-1).unsqueeze(0).contiguous()
             output = torch._scaled_mm(
                 qinput,
                 weight,
                 out_dtype=input.dtype,
                 scale_a=x_scale,
-                scale_b=weight_scale.t(),
+                scale_b=w_scale_1n,
                 bias=bias,
             )
             return _process_scaled_mm_output(output, input_2d.shape, output_shape)
@@ -1534,22 +1536,24 @@ def apply_fp8_linear(
         return _process_scaled_mm_output(output, input_2d.shape, output_shape)
 
     # AMD-specific: channel-wise weight scale + per-tensor (static) activation scale.
-    # hipBLAS rowwise scaled_mm requires scale_a of shape (M, 1) and scale_b of
-    # shape (1, N).  Broadcast the per-tensor activation scalar to (M, 1) and
-    # transpose the (N, 1) channel weight scale to (1, N).
+    # hipBLAS rowwise scaled_mm requires scale_a of shape (M_padded, 1) and scale_b
+    # of shape (1, N), both contiguous.  qinput may be padded (num_token_padding),
+    # so use qinput.shape[0] (not input_2d.shape[0]) for the scale broadcast.
     if (
         not per_tensor_weights
         and per_tensor_activations
         and USE_ROWWISE_TORCH_SCALED_MM
     ):
-        m = input_2d.shape[0]
-        x_scale_mn = x_scale.reshape(1, 1).expand(m, 1).contiguous()
+        m_padded = qinput.shape[0]
+        x_scale_mn = x_scale.reshape(1, 1).expand(m_padded, 1).contiguous()
+        # weight_scale is (N, 1); hipBLASLt requires contiguous (1, N).
+        w_scale_1n = weight_scale.reshape(-1).unsqueeze(0).contiguous()
         output = torch._scaled_mm(
             qinput,
             weight,
             out_dtype=input.dtype,
             scale_a=x_scale_mn,
-            scale_b=weight_scale.t(),
+            scale_b=w_scale_1n,
             bias=bias,
         )
         return _process_scaled_mm_output(output, input_2d.shape, output_shape)

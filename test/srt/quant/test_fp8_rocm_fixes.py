@@ -622,5 +622,162 @@ class TestFP8PerformanceSanity(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestFP8AMDRowwisePaths(unittest.TestCase):
+    """Test the AMD-specific rowwise scaled_mm paths in apply_fp8_linear."""
+
+    def setUp(self):
+        from sglang.srt.layers.quantization.fp8_utils import USE_ROWWISE_TORCH_SCALED_MM
+        if not USE_ROWWISE_TORCH_SCALED_MM:
+            self.skipTest("USE_ROWWISE_TORCH_SCALED_MM is False (requires gfx942+ and torch>=2.7)")
+
+    def _make_channel_weight(self, N, K, fp8_dtype):
+        """Create channel-wise quantized weight in (K, N) non-contiguous layout."""
+        fp8_max = torch.finfo(fp8_dtype).max
+        w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        w_scale = (w.abs().max(dim=1, keepdim=True).values / fp8_max).float()
+        w_q = (w / w_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+        return w_q.t(), w_scale  # (K, N) non-contiguous, (N, 1)
+
+    def test_channel_weight_static_activation(self):
+        """Channel-wise weight + static per-tensor activation should use rowwise scaled_mm."""
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
+
+        M, N, K = 16, 2048, 2048
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        w_KN, w_scale_N1 = self._make_channel_weight(N, K, fp8_dtype)
+
+        # Static per-tensor activation scale
+        input_scale = (x.abs().max() / torch.finfo(fp8_dtype).max).float()
+
+        # Use apply_fp8_linear with static input_scale + channel weight
+        out = apply_fp8_linear(
+            x, w_KN, w_scale_N1, input_scale=input_scale,
+            use_per_token_if_dynamic=True, compressed_tensor_quant=True,
+        )
+        self.assertEqual(out.shape, (M, N))
+        self.assertEqual(out.dtype, torch.bfloat16)
+
+    def test_pertensor_weight_pertoken_activation(self):
+        """Per-tensor weight scale + per-token activation should use rowwise scaled_mm."""
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
+
+        M, N, K = 16, 2048, 2048
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        fp8_max = torch.finfo(fp8_dtype).max
+        # Per-tensor weight scale (scalar)
+        w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        w_scale = (w.abs().max() / fp8_max).float()
+        w_q = (w / w_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+        w_KN = w_q.t()
+
+        out = apply_fp8_linear(
+            x, w_KN, w_scale, input_scale=None,
+            use_per_token_if_dynamic=True, compressed_tensor_quant=True,
+        )
+        self.assertEqual(out.shape, (M, N))
+        self.assertEqual(out.dtype, torch.bfloat16)
+
+    def test_channel_weight_static_cosine_similarity(self):
+        """Verify rowwise path produces correct results vs BF16 reference."""
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+        from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
+
+        M, N, K = 32, 1024, 1024
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        fp8_max = torch.finfo(fp8_dtype).max
+        w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        w_scale = (w.abs().max(dim=1, keepdim=True).values / fp8_max).float()
+        w_q = (w / w_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+        w_KN = w_q.t()
+
+        # BF16 reference
+        w_dq = w_q.float() * w_scale
+        ref = (x.float() @ w_dq.t()).to(torch.bfloat16)
+
+        input_scale = (x.abs().max() / fp8_max).float()
+        out = apply_fp8_linear(
+            x, w_KN, w_scale, input_scale=input_scale,
+            use_per_token_if_dynamic=True, compressed_tensor_quant=True,
+        )
+        cos = torch.nn.functional.cosine_similarity(
+            ref.flatten().float().unsqueeze(0),
+            out.flatten().float().unsqueeze(0),
+        ).item()
+        self.assertGreater(cos, 0.99, f"Cosine similarity too low: {cos:.4f}")
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestFusedRMSNormFP8(unittest.TestCase):
+    """Test fused RMSNorm + FP8 dynamic quantization on AMD."""
+
+    def setUp(self):
+        try:
+            from aiter import rmsnorm2d_fwd_with_dynamicquant  # noqa: F401
+        except (ImportError, AttributeError):
+            self.skipTest("aiter.rmsnorm2d_fwd_with_dynamicquant not available")
+        try:
+            from sglang.srt.utils import get_bool_env_var
+            if not get_bool_env_var("SGLANG_USE_AITER"):
+                self.skipTest("SGLANG_USE_AITER not set")
+        except Exception:
+            pass
+
+    def test_forward_aiter_fp8_out_no_residual(self):
+        """RMSNorm.forward_aiter_fp8_out without residual returns correct FP8."""
+        from sglang.srt.layers.layernorm import RMSNorm
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        M, N = 16, 2048
+        x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+        norm = RMSNorm(N, eps=1e-5).to(device="cuda", dtype=torch.bfloat16)
+
+        fp8_out, fp8_scale, residual_out = norm.forward_aiter_fp8_out(x)
+
+        self.assertEqual(fp8_out.shape, (M, N))
+        self.assertEqual(fp8_out.dtype, fp8_dtype)
+        self.assertEqual(fp8_scale.shape, (M, 1))
+        self.assertEqual(fp8_scale.dtype, torch.float32)
+        self.assertIsNone(residual_out)
+
+        # Verify cosine similarity with plain RMSNorm
+        norm_ref = norm.forward(x)
+        dq = fp8_out.float() * fp8_scale
+        cos = torch.nn.functional.cosine_similarity(
+            norm_ref.float().flatten().unsqueeze(0),
+            dq.flatten().unsqueeze(0),
+        ).item()
+        self.assertGreater(cos, 0.99, f"Cosine similarity too low: {cos:.4f}")
+
+    def test_forward_aiter_fp8_out_with_residual(self):
+        """RMSNorm.forward_aiter_fp8_out with residual updates residual correctly."""
+        from sglang.srt.layers.layernorm import RMSNorm
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        M, N = 16, 2048
+        x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+        res = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+        norm = RMSNorm(N, eps=1e-5).to(device="cuda", dtype=torch.bfloat16)
+
+        fp8_out, fp8_scale, residual_out = norm.forward_aiter_fp8_out(x, res)
+
+        self.assertEqual(fp8_out.shape, (M, N))
+        self.assertEqual(fp8_out.dtype, fp8_dtype)
+        self.assertEqual(fp8_scale.shape, (M, 1))
+        self.assertIsNotNone(residual_out)
+        self.assertEqual(residual_out.shape, (M, N))
+        self.assertEqual(residual_out.dtype, torch.bfloat16)
+
+        # Verify residual is x + res (add before norm)
+        expected_res = (x + res)
+        cos_res = torch.nn.functional.cosine_similarity(
+            expected_res.float().flatten().unsqueeze(0),
+            residual_out.float().flatten().unsqueeze(0),
+        ).item()
+        self.assertGreater(cos_res, 0.9999, f"Residual cosine too low: {cos_res:.6f}")
+
+
 if __name__ == "__main__":
     unittest.main()

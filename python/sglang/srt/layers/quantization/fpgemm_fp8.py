@@ -212,11 +212,13 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
             q_input, x_scale = aiter.per_token_quant_hip(
                 input_2d, quant_dtype=aiter.dtypes.fp8
             )
+            # hipBLASLt requires scale_b to be a contiguous (1, N) tensor.
+            w_scale_1n = layer.weight_scale.reshape(-1).unsqueeze(0).contiguous()
             output = torch._scaled_mm(
                 q_input,
                 layer.weight,
                 scale_a=x_scale,
-                scale_b=layer.weight_scale.t(),
+                scale_b=w_scale_1n,
                 out_dtype=x.dtype,
                 bias=bias,
             )
