@@ -1607,40 +1607,65 @@ class TestAiterGemmCoverage(unittest.TestCase):
         )
 
     def test_aiter_gemm_tune_shapes_include_qwen25_72b(self):
-        """aiter_gemm_tune.SHAPES_TO_TUNE must include Qwen2.5-72B shapes."""
+        """aiter_gemm_tune.SHAPES_TO_TUNE includes tuneable Qwen2.5-72B shapes.
+
+        K=7392 (TP=4) and K=3696 (TP=8) are NOT in SHAPES_TO_TUNE because
+        K % 64 != 0 / K % 32 != 0 means no CK bpreshuffle kernel supports them.
+        """
         import importlib
 
         mod = importlib.import_module(
             "sglang.srt.layers.quantization.aiter_gemm_tune"
         )
         nk_pairs = {(N, K) for N, K, _ in mod.SHAPES_TO_TUNE}
-        # Qwen2.5-72B: down_proj at TP=4 and TP=8 - K not divisible by 512
+        # TP=1 and TP=2 are tuneable (K=29568, K=14784 are divisible by 64)
         self.assertIn(
-            (8192, 7392),
+            (8192, 29568),
             nk_pairs,
-            "SHAPES_TO_TUNE must include N=8192 K=7392 (Qwen2.5-72B down_proj TP=4)",
+            "SHAPES_TO_TUNE must include N=8192 K=29568 (Qwen2.5-72B down_proj TP=1)",
         )
         self.assertIn(
+            (8192, 14784),
+            nk_pairs,
+            "SHAPES_TO_TUNE must include N=8192 K=14784 (Qwen2.5-72B down_proj TP=2)",
+        )
+        # TP=4 (K=7392) and TP=8 (K=3696) have no compatible CK kernel
+        self.assertNotIn(
+            (8192, 7392),
+            nk_pairs,
+            "K=7392 (K%64!=0) should NOT be in SHAPES_TO_TUNE -- no valid CK kernel",
+        )
+        self.assertNotIn(
             (8192, 3696),
             nk_pairs,
-            "SHAPES_TO_TUNE must include N=8192 K=3696 (Qwen2.5-72B down_proj TP=8)",
+            "K=3696 (K%32!=0) should NOT be in SHAPES_TO_TUNE -- no valid CK kernel",
         )
 
     def test_expected_shapes_include_qwen25_72b(self):
-        """_AITER_FP8_EXPECTED_GEMM_SHAPES must include Qwen2.5-72B down_proj shapes."""
+        """_AITER_FP8_EXPECTED_GEMM_SHAPES includes tuneable Qwen2.5-72B shapes.
+
+        K=7392 (TP=4) and K=3696 (TP=8) are NOT in the list because no CK
+        bpreshuffle kernel supports those K values (K%64!=0, K%32!=0).
+        """
         from sglang.srt.layers.quantization.fp8_utils import (
             _AITER_FP8_EXPECTED_GEMM_SHAPES,
         )
 
         nk_pairs = {(N, K) for N, K, _ in _AITER_FP8_EXPECTED_GEMM_SHAPES}
-        # Qwen2.5-72B: intermediate_size=29568, hidden_size=8192
-        # All TP variants have K not divisible by 512
-        for tp, K in [(2, 14784), (4, 7392), (8, 3696)]:
+        # TP=1 and TP=2 must be present (tuneable shapes)
+        for tp, K in [(1, 29568), (2, 14784)]:
             self.assertIn(
                 (8192, K),
                 nk_pairs,
                 f"_AITER_FP8_EXPECTED_GEMM_SHAPES must include N=8192 K={K} "
                 f"(Qwen2.5-72B down_proj TP={tp})",
+            )
+        # TP=4 and TP=8 cannot be tuned -- should not be in the list
+        for tp, K in [(4, 7392), (8, 3696)]:
+            self.assertNotIn(
+                (8192, K),
+                nk_pairs,
+                f"K={K} (K%64!=0) should NOT be in _AITER_FP8_EXPECTED_GEMM_SHAPES",
             )
 
 
