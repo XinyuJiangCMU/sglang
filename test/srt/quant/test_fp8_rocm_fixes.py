@@ -4146,5 +4146,110 @@ class TestLongcatFlashNextNFusedFP8Path(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestSarvamMoEFusedFP8Path(unittest.TestCase):
+    """Tests for SarvamMoEMLADecoderLayer fused MLP FP8 path on AMD MI300X."""
+
+    def test_sarvam_moe_module_has_use_aiter_import(self):
+        """sarvam_moe module must import _use_aiter from fp8_utils."""
+        import importlib
+
+        mod = importlib.import_module("sglang.srt.models.sarvam_moe")
+        self.assertTrue(
+            hasattr(mod, "_use_aiter"),
+            "sarvam_moe module must import _use_aiter from fp8_utils",
+        )
+
+    def test_sarvam_mlp_has_fp8_input_method(self):
+        """SarvamMoEMLP must define _forward_with_fp8_input."""
+        from sglang.srt.models.sarvam_moe import SarvamMoEMLP
+
+        self.assertTrue(
+            hasattr(SarvamMoEMLP, "_forward_with_fp8_input"),
+            "SarvamMoEMLP must define _forward_with_fp8_input for FP8 path",
+        )
+
+    def test_sarvam_decoder_has_aiter_fp8_attr(self):
+        """SarvamMoEMLADecoderLayer must set _aiter_fp8 in __init__."""
+        import inspect
+        from sglang.srt.models.sarvam_moe import SarvamMoEMLADecoderLayer
+
+        src = inspect.getsource(SarvamMoEMLADecoderLayer.__init__)
+        self.assertIn(
+            "_aiter_fp8",
+            src,
+            "SarvamMoEMLADecoderLayer.__init__ must set _aiter_fp8",
+        )
+
+    def test_sarvam_decoder_has_forward_aiter_fp8(self):
+        """SarvamMoEMLADecoderLayer must define _forward_aiter_fp8."""
+        from sglang.srt.models.sarvam_moe import SarvamMoEMLADecoderLayer
+
+        self.assertTrue(
+            hasattr(SarvamMoEMLADecoderLayer, "_forward_aiter_fp8"),
+            "SarvamMoEMLADecoderLayer must define _forward_aiter_fp8",
+        )
+
+    def test_sarvam_forward_dispatches_to_aiter_fp8(self):
+        """SarvamMoEMLADecoderLayer.forward must dispatch to _forward_aiter_fp8."""
+        import inspect
+        from sglang.srt.models.sarvam_moe import SarvamMoEMLADecoderLayer
+
+        src = inspect.getsource(SarvamMoEMLADecoderLayer.forward)
+        self.assertIn(
+            "_forward_aiter_fp8",
+            src,
+            "forward must dispatch to _forward_aiter_fp8 when _aiter_fp8 is set",
+        )
+
+    def test_sarvam_aiter_fp8_uses_prepare_mlp_fp8_out(self):
+        """_forward_aiter_fp8 must use prepare_mlp_fp8_out for norm+FP8 fusion."""
+        import inspect
+        from sglang.srt.models.sarvam_moe import SarvamMoEMLADecoderLayer
+
+        src = inspect.getsource(SarvamMoEMLADecoderLayer._forward_aiter_fp8)
+        self.assertIn(
+            "prepare_mlp_fp8_out",
+            src,
+            "_forward_aiter_fp8 must use prepare_mlp_fp8_out",
+        )
+
+    def test_sarvam_aiter_fp8_only_for_dense_layers(self):
+        """_aiter_fp8 must only be set for non-sparse (dense) layers."""
+        import inspect
+        from sglang.srt.models.sarvam_moe import SarvamMoEMLADecoderLayer
+
+        src = inspect.getsource(SarvamMoEMLADecoderLayer.__init__)
+        self.assertIn(
+            "is_layer_sparse",
+            src,
+            "__init__ must guard _aiter_fp8 with not self.is_layer_sparse",
+        )
+
+    def test_sarvam_aiter_fp8_guards_idle_mode(self):
+        """forward must guard _forward_aiter_fp8 against idle forward mode."""
+        import inspect
+        from sglang.srt.models.sarvam_moe import SarvamMoEMLADecoderLayer
+
+        src = inspect.getsource(SarvamMoEMLADecoderLayer.forward)
+        self.assertIn(
+            "is_idle",
+            src,
+            "forward must guard _aiter_fp8 dispatch with is_idle() check",
+        )
+
+    def test_sarvam_mlp_fp8_propagates_allreduce_fusion(self):
+        """SarvamMoEMLP._forward_with_fp8_input must propagate allreduce fusion params."""
+        import inspect
+        from sglang.srt.models.sarvam_moe import SarvamMoEMLP
+
+        src = inspect.getsource(SarvamMoEMLP._forward_with_fp8_input)
+        self.assertIn(
+            "should_allreduce_fusion",
+            src,
+            "_forward_with_fp8_input must accept and use should_allreduce_fusion",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

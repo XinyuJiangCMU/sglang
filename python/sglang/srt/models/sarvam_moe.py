@@ -45,6 +45,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import get_layer_id
@@ -213,6 +214,26 @@ class SarvamMoEMLP(nn.Module):
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
         return x
+
+    def _forward_with_fp8_input(
+        self,
+        x: torch.Tensor,
+        fp8_input: torch.Tensor,
+        fp8_scale: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        """MLP forward using pre-quantized FP8 input for gate_up_proj (AMD AITER path).
+
+        Skips redundant per_token_quant_hip inside gemm_a8w8_bpreshuffle by
+        reusing FP8 already computed by the preceding fused RMSNorm+FP8 op.
+        """
+        gate_up, _ = self.gate_up_proj.forward_with_fp8_input(x, fp8_input, fp8_scale)
+        out = self.act_fn(gate_up)
+        out, _ = self.down_proj(
+            out, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        )
+        return out
 
 
 class SarvamMoESparseMoeBlock(nn.Module):
@@ -1094,6 +1115,96 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
+        # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
+        # MLA attention is incompatible with qkv_proj FP8 input; only MLP norm
+        # fusion is applied via prepare_mlp_fp8_out + mlp._forward_with_fp8_input.
+        # Only dense (non-MoE) layers have SarvamMoEMLP with gate_up_proj.
+        if _use_aiter and not self.is_layer_sparse:
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8LinearMethod
+            from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+
+            qm = getattr(self.mlp.gate_up_proj, "quant_method", None)
+            if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
+                scheme = getattr(self.mlp.gate_up_proj, "scheme", None)
+                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+            else:
+                self._aiter_fp8 = isinstance(
+                    qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
+                )
+        else:
+            self._aiter_fp8 = False
+
+    def _forward_aiter_fp8(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decoder forward with fused post_attention_layernorm+FP8 for dense MLP (AMD AITER path).
+
+        MLA attention is incompatible with qkv_proj FP8 input; only
+        prepare_mlp_fp8_out fuses allreduce+add+RMSNorm+FP8 into a single kernel.
+        Falls back to standard MLP path when prepare_mlp_fp8_out() returns None.
+        """
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        fp8_result = self.layer_communicator.prepare_mlp_fp8_out(
+            hidden_states, residual, forward_batch
+        )
+        if fp8_result is not None:
+            fp8_hs, fp8_scale, residual = fp8_result
+            hidden_states = self.mlp._forward_with_fp8_input(
+                hidden_states, fp8_hs, fp8_scale,
+                should_allreduce_fusion=should_allreduce_fusion,
+                use_reduce_scatter=use_reduce_scatter,
+            )
+        else:
+            # Fallback: standard MLP path
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            hidden_states = self.mlp(
+                hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
+            )
+
+        if (
+            not self.is_layer_sparse
+            and self.attn_tp_size > 1
+            and not use_reduce_scatter
+            and not should_allreduce_fusion
+        ):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+        return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1101,6 +1212,9 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._aiter_fp8 and not forward_batch.forward_mode.is_idle():
+            return self._forward_aiter_fp8(positions, hidden_states, forward_batch, residual)
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
