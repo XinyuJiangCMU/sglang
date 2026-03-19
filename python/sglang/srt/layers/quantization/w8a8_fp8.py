@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_ck_linear,
     apply_fp8_linear,
     apply_fp8_ptpc_linear,
     cutlass_fp8_supported,
@@ -126,10 +127,20 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
                 )
 
             if _use_aiter:
-                layer.weight = Parameter(
-                    shuffle_weight(weight.contiguous(), (16, 16)),
-                    requires_grad=False,
-                )
+                N, K = weight.shape
+                # gemm_a8w8_CK is ~2x faster than bpreshuffle for K > N
+                # (e.g. down_proj) on MI300X decode. Use CK for those shapes.
+                use_ck = K > N
+                layer._use_ck = use_ck
+                if use_ck:
+                    layer.weight = Parameter(
+                        weight.contiguous(), requires_grad=False
+                    )
+                else:
+                    layer.weight = Parameter(
+                        shuffle_weight(weight.contiguous(), (16, 16)),
+                        requires_grad=False,
+                    )
             else:
                 layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
@@ -152,11 +163,19 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
 
             # Update the layer with the new values.
             if _use_aiter:
-                # AITER gemm_a8w8_bpreshuffle expects (N, K) preshuffled weight + (N, 1) scale.
-                layer.weight = Parameter(
-                    shuffle_weight(qweight.contiguous(), (16, 16)),
-                    requires_grad=False,
-                )
+                N, K = qweight.shape
+                use_ck = K > N
+                layer._use_ck = use_ck
+                if use_ck:
+                    layer.weight = Parameter(
+                        qweight.contiguous(), requires_grad=False
+                    )
+                else:
+                    # AITER gemm_a8w8_bpreshuffle expects (N, K) preshuffled weight + (N, 1) scale.
+                    layer.weight = Parameter(
+                        shuffle_weight(qweight.contiguous(), (16, 16)),
+                        requires_grad=False,
+                    )
             else:
                 layer.weight = Parameter(qweight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
@@ -216,6 +235,15 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         prequantized_fp8_scale: Optional[torch.Tensor] = None,
     ):
         if _use_aiter:
+            if getattr(layer, "_use_ck", False):
+                return apply_fp8_ck_linear(
+                    x,
+                    layer.weight,
+                    layer.weight_scale,
+                    bias=bias,
+                    prequantized_fp8=prequantized_fp8,
+                    prequantized_fp8_scale=prequantized_fp8_scale,
+                )
             return apply_fp8_ptpc_linear(
                 x,
                 layer.weight,

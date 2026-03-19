@@ -45,6 +45,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_ck_linear,
     apply_fp8_linear,
     apply_fp8_ptpc_linear,
     can_auto_enable_marlin_fp8,
@@ -559,13 +560,16 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.weight, layer.weight.shape[-1]
                     )
                     if _use_aiter and self.use_aiter_fp8_per_token:
-                        # AITER gemm_a8w8_bpreshuffle expects:
-                        #   WQ: (N, K) preshuffled  (NOT transposed)
-                        #   w_scale: (N, 1)           (NOT transposed)
-                        # Store weight in (N, K) shuffled layout; apply method uses
-                        # apply_fp8_ptpc_linear which passes weight directly (no .T).
+                        # AITER path: use CK kernel for K > N shapes (e.g. down_proj),
+                        # bpreshuffle for N >= K shapes.
                         self.use_per_token_if_dynamic = True
-                        qweight = shuffle_weight(qweight.contiguous(), (16, 16))
+                        N, K = qweight.shape
+                        use_ck = K > N
+                        layer._use_ck = use_ck
+                        if use_ck:
+                            qweight = qweight.contiguous()
+                        else:
+                            qweight = shuffle_weight(qweight.contiguous(), (16, 16))
                         # weight_scale already has shape (N, 1) from per_token_group_quant_fp8
                         layer.weight = Parameter(qweight, requires_grad=False)
                         layer.weight_scale = Parameter(weight_scale, requires_grad=False)
@@ -610,19 +614,21 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.weight_scale, layer.logical_widths
                     )
                     if _use_aiter and self.use_aiter_fp8_per_token and not is_static_activation:
-                        # AITER gemm_a8w8_bpreshuffle expects:
-                        #   WQ: (N, K) preshuffled  (NOT transposed)
-                        #   w_scale: (N, 1)           (from convert_to_channelwise, already (N,1))
-                        # apply() uses apply_fp8_ptpc_linear which passes weight directly.
-                        # Only use for dynamic activation: static input_scale checkpoints
-                        # use apply_fp8_linear which expects (K, N) layout.
+                        # AITER path: use CK kernel for K > N shapes (e.g. down_proj),
+                        # bpreshuffle for N >= K shapes.
                         self.use_per_token_if_dynamic = True
                         if _is_fp8_fnuz:
                             weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                                 weight=weight,
                                 weight_scale=weight_scale,
                             )
-                        weight = shuffle_weight(weight.contiguous(), (16, 16))
+                        N, K = weight.shape
+                        use_ck = K > N
+                        layer._use_ck = use_ck
+                        if use_ck:
+                            weight = weight.contiguous()
+                        else:
+                            weight = shuffle_weight(weight.contiguous(), (16, 16))
                         layer.weight = Parameter(weight, requires_grad=False)
                         layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                         # fall through to input_scale handling below
@@ -753,12 +759,20 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        # AITER per-token-per-channel path: weight is stored as (N, K) preshuffled,
-        # weight_scale is (N, 1).  apply_fp8_ptpc_linear uses gemm_a8w8_bpreshuffle
-        # which expects this layout directly (no additional transpose).
+        # AITER per-token-per-channel path: dispatch between CK and bpreshuffle.
+        # CK is faster for K > N shapes (e.g. down_proj); bpreshuffle for N >= K.
         # Only use this path for dynamic quantization; static input_scale checkpoints
         # need apply_fp8_linear which respects the static scale.
         if _use_aiter and self.use_per_token_if_dynamic and layer.input_scale is None:
+            if getattr(layer, "_use_ck", False):
+                return apply_fp8_ck_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    bias=bias,
+                    prequantized_fp8=prequantized_fp8,
+                    prequantized_fp8_scale=prequantized_fp8_scale,
+                )
             return apply_fp8_ptpc_linear(
                 input=x,
                 weight=layer.weight,

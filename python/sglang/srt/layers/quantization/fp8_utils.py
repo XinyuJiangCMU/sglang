@@ -1690,6 +1690,34 @@ def apply_fp8_ptpc_linear(
     return output.view(*output_shape)
 
 
+def apply_fp8_ck_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    prequantized_fp8: Optional[torch.Tensor] = None,
+    prequantized_fp8_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP8 GEMM using AITER gemm_a8w8_CK (non-preshuffled weight).
+
+    Faster than bpreshuffle for shapes where K > N (e.g. down_proj),
+    which can be ~2x slower with the bpreshuffle kernel on MI300X.
+    Weight is stored as (N, K) without shuffle_weight preprocessing.
+    """
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    if prequantized_fp8 is not None:
+        q_input, x_scale = prequantized_fp8, prequantized_fp8_scale
+    else:
+        input_2d = input.view(-1, input.shape[-1])
+        q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
+
+    output = aiter.gemm_a8w8_CK(q_input, weight, x_scale, weight_scale)
+    if bias is not None:
+        output = output + bias
+    return output.view(*output_shape)
+
+
 def validate_fp8_block_shape(
     layer: torch.nn.Module,
     input_size: int,

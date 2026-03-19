@@ -12,6 +12,7 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_ck_linear,
     apply_fp8_linear,
     apply_fp8_ptpc_linear,
     cutlass_fp8_supported,
@@ -98,13 +99,22 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
             if self.per_token:
                 weight_scale = weight_scale.view(-1, 1)
             if _use_aiter and self.per_token:
-                # Keep (N, K) layout for AITER per-token-per-channel GEMM;
-                # apply_fp8_ptpc_linear expects pre-shuffled, non-transposed weight.
+                # AITER path: use CK kernel for K > N shapes (e.g. down_proj),
+                # bpreshuffle for N >= K shapes.
                 # Only for dynamic per-token input quant; static input scheme uses
                 # apply_fp8_linear which expects (K, N) via weight.T internally.
-                layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)), requires_grad=False
-                )
+                N, K = weight.shape
+                use_ck = K > N
+                layer._use_ck = use_ck
+                if use_ck:
+                    layer.weight = Parameter(
+                        weight.contiguous(), requires_grad=False
+                    )
+                else:
+                    layer.weight = Parameter(
+                        shuffle_weight(weight.contiguous(), (16, 16)),
+                        requires_grad=False,
+                    )
             else:
                 layer.weight = Parameter(weight.t(), requires_grad=False)
             # required by torch.compile to be torch.nn.Parameter
@@ -191,6 +201,15 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
     ) -> torch.Tensor:
 
         if _use_aiter and self.weight_qscheme == "per_channel" and self.per_token:
+            if getattr(layer, "_use_ck", False):
+                return apply_fp8_ck_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    bias=bias,
+                    prequantized_fp8=prequantized_fp8,
+                    prequantized_fp8_scale=prequantized_fp8_scale,
+                )
             return apply_fp8_ptpc_linear(
                 input=x,
                 weight=layer.weight,

@@ -19,6 +19,7 @@ from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     USE_ROWWISE_TORCH_SCALED_MM,
     _use_aiter,
+    apply_fp8_ck_linear,
     apply_fp8_linear,
     apply_fp8_ptpc_linear,
     can_auto_enable_marlin_fp8,
@@ -180,14 +181,22 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
         if _use_aiter and not self.quant_config.use_marlin:
-            # AITER gemm_a8w8_bpreshuffle expects weight in (N, K) preshuffled layout.
-            # Store in that layout so apply() can call apply_fp8_ptpc_linear directly.
-            # weight_scale is already (N, 1) from ChannelQuantScaleParameter.
+            # AITER path: use CK kernel for K > N shapes (e.g. down_proj),
+            # bpreshuffle for N >= K shapes.
             from aiter.ops.shuffle import shuffle_weight
 
-            layer.weight = Parameter(
-                shuffle_weight(weight.contiguous(), (16, 16)), requires_grad=False
-            )
+            N, K = weight.shape
+            use_ck = K > N
+            layer._use_ck = use_ck
+            if use_ck:
+                layer.weight = Parameter(
+                    weight.contiguous(), requires_grad=False
+                )
+            else:
+                layer.weight = Parameter(
+                    shuffle_weight(weight.contiguous(), (16, 16)),
+                    requires_grad=False,
+                )
             # input_scale_ub is not used by aiter.per_token_quant_hip; delete to
             # avoid confusion and save memory.
             if hasattr(layer, "input_scale_ub"):
@@ -220,12 +229,20 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        # On AMD with AITER, use gemm_a8w8_bpreshuffle via apply_fp8_ptpc_linear.
-        # Weight is stored in (N, K) preshuffled layout by process_weights_after_loading.
-        # This is faster than torch._scaled_mm + manual scale reshape on MI300X.
+        # On AMD with AITER, dispatch between CK and bpreshuffle kernels.
+        # CK is faster for K > N shapes (e.g. down_proj); bpreshuffle for N >= K.
         # Accepts prequantized_fp8/prequantized_fp8_scale from fused RMSNorm+FP8 path
         # (forward_with_fp8_input in decoder layers) to skip redundant per_token_quant_hip.
         if _use_aiter:
+            if getattr(layer, "_use_ck", False):
+                return apply_fp8_ck_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    bias=bias,
+                    prequantized_fp8=prequantized_fp8,
+                    prequantized_fp8_scale=prequantized_fp8_scale,
+                )
             return apply_fp8_ptpc_linear(
                 input=x,
                 weight=layer.weight,

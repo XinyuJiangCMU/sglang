@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_ck_linear,
     apply_fp8_linear,
     apply_fp8_ptpc_linear,
     dispatch_w8a8_block_fp8_linear,
@@ -183,11 +184,21 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter and not self.is_static_input_scheme:
-                # Keep (N, K) layout for AITER per-token-per-channel GEMM.
+                # AITER path: use CK kernel for K > N shapes (e.g. down_proj),
+                # bpreshuffle for N >= K shapes.
                 # Static input scheme uses apply_fp8_linear with (K, N) layout.
-                layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)), requires_grad=False
-                )
+                N, K = weight.shape
+                use_ck = K > N
+                layer._use_ck = use_ck
+                if use_ck:
+                    layer.weight = Parameter(
+                        weight.contiguous(), requires_grad=False
+                    )
+                else:
+                    layer.weight = Parameter(
+                        shuffle_weight(weight.contiguous(), (16, 16)),
+                        requires_grad=False,
+                    )
             else:
                 layer.weight = Parameter(weight.t(), requires_grad=False)
 
@@ -234,6 +245,15 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             )
 
         if _use_aiter and self.strategy == QuantizationStrategy.CHANNEL and not self.is_static_input_scheme:
+            if getattr(layer, "_use_ck", False):
+                return apply_fp8_ck_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    bias=bias,
+                    prequantized_fp8=prequantized_fp8,
+                    prequantized_fp8_scale=prequantized_fp8_scale,
+                )
             return apply_fp8_ptpc_linear(
                 input=x,
                 weight=layer.weight,
