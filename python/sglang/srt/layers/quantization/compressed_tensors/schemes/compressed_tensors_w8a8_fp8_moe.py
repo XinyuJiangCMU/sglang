@@ -386,6 +386,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
             )
+            # aiter.fused_moe does not accept routed_scaling_factor; apply separately.
+            # The caller model code skips it when _use_aiter=True.
+            rsf = moe_runner_config.routed_scaling_factor
+            if rsf is not None and rsf != 1.0:
+                output = output * rsf
             return StandardCombineInput(hidden_states=output)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
             if self.use_flashinfer_trtllm:

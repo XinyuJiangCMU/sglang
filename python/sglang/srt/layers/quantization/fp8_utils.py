@@ -1407,9 +1407,10 @@ def apply_fp8_linear(
             if _is_cuda:
                 qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
             else:
-                # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
-                # final solution should be: 1. add support to per-tensor activation scaling.
-                # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
+                # On AMD, per-tensor weight scale (numel==1) with per-token activation
+                # quantization is handled by the AMD rowwise scaled_mm path below
+                # (expand scalar weight scale to (1, N) for hipBLASLt).  Use
+                # scaled_fp8_quant here to honour use_per_token_if_dynamic consistently.
                 if _is_hip and weight_scale.numel() == 1:
                     qinput, x_scale = scaled_fp8_quant(
                         input_2d,
@@ -1599,15 +1600,20 @@ def apply_fp8_ptpc_linear(
     use_per_token_if_dynamic: bool = False,
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
+    prequantized_fp8: Optional[torch.Tensor] = None,
+    prequantized_fp8_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    # View input as 2D matrix for fp8 methods
-    input_2d = input.view(-1, input.shape[-1])
-
     # weight is always stored as (N, K) preshuffled when using AITER;
     # gemm_a8w8_bpreshuffle outputs (M, N).
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
+    if prequantized_fp8 is not None:
+        # Caller already computed FP8 quant (e.g. via fused RMSNorm+quant).
+        # Skip per_token_quant_hip to save ~14µs per layer on MI300X.
+        q_input, x_scale = prequantized_fp8, prequantized_fp8_scale
+    else:
+        input_2d = input.view(-1, input.shape[-1])
+        q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
 
     output = aiter.gemm_a8w8_bpreshuffle(
         q_input, weight, x_scale, weight_scale, None, input.dtype

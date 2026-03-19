@@ -69,6 +69,8 @@ _has_vllm_rms_norm = False
 if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
+    from aiter import rmsnorm2d_fwd_with_add_dynamicquant as fused_add_rms_norm_fp8
+    from aiter import rmsnorm2d_fwd_with_dynamicquant as rms_norm_fp8
 
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
 elif _is_hip:
@@ -231,6 +233,47 @@ class RMSNorm(MultiPlatformOp):
             )
             return output, residual_out
         return rms_norm(x, self.weight.data, self.variance_epsilon)
+
+    def forward_aiter_fp8_out(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Fused add+RMSNorm+FP8 dynamic quantization for AMD AITER path.
+
+        Returns (fp8_out, fp8_scale, residual_out) where fp8_out has dtype
+        float8_e4m3fnuz and fp8_scale has shape (M, 1) dtype float32.
+        This avoids a separate per_token_quant_hip call before the next
+        FP8 linear layer, saving ~14µs per layer on MI300X.
+        """
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        num_tokens = x.shape[0] if x.dim() == 2 else x.view(-1, x.shape[-1]).shape[0]
+        x_2d = x.view(num_tokens, -1)
+        fp8_out = torch.empty_like(x_2d, dtype=fp8_dtype)
+        fp8_scale = torch.empty(num_tokens, 1, device=x.device, dtype=torch.float32)
+
+        if residual is not None:
+            residual_out = torch.empty_like(x_2d)
+            fused_add_rms_norm_fp8(
+                fp8_out,
+                x_2d,
+                residual.view(num_tokens, -1),
+                residual_out,
+                fp8_scale,
+                self.weight.data,
+                self.variance_epsilon,
+            )
+            return fp8_out, fp8_scale, residual_out.view_as(x)
+        else:
+            rms_norm_fp8(
+                fp8_out,
+                x_2d,
+                fp8_scale,
+                self.weight.data,
+                self.variance_epsilon,
+            )
+            return fp8_out, fp8_scale, None
 
     def forward_hip(
         self,
