@@ -292,7 +292,7 @@ class DeepEPMoE(FusedMoE):
         topk_ids_copy = topk_ids.to(torch.int32)
         topk_ids_copy[topk_ids_copy == -1] = self.num_local_experts
 
-        return fused_moe(
+        output = fused_moe(
             hidden_states,
             self.w13_weight,
             self.w2_weight,
@@ -308,6 +308,13 @@ class DeepEPMoE(FusedMoE):
             ),
             expert_mask=self.expert_mask,
         )
+        # aiter.fused_moe does not accept routed_scaling_factor; apply separately.
+        # DeepEP combine_a/b ignores topk_weights for the AITER path, so topk_weights
+        # passed to combine does not include routed_scaling_factor.
+        rsf = self.moe_runner_config.routed_scaling_factor
+        if rsf is not None and rsf != 1.0:
+            output = output * rsf
+        return output
 
     def forward_flashinfer_cutedsl(
         self,
