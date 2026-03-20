@@ -4898,6 +4898,19 @@ class TestStaticActivationGuard(unittest.TestCase):
         src = inspect.getsource(Qwen2DecoderLayer.__init__)
         self.assertIn("is_static_input_scheme", src)
 
+    def test_llama_aiter_fp8_checks_block_quant(self):
+        """LlamaDecoderLayer _aiter_fp8 detection guards against block_quant."""
+        import inspect
+        from sglang.srt.models.llama import LlamaDecoderLayer
+        src = inspect.getsource(LlamaDecoderLayer.__init__)
+        self.assertIn("block_quant", src)
+
+    def test_qwen2_aiter_fp8_checks_block_quant(self):
+        import inspect
+        from sglang.srt.models.qwen2 import Qwen2DecoderLayer
+        src = inspect.getsource(Qwen2DecoderLayer.__init__)
+        self.assertIn("block_quant", src)
+
 
 if __name__ == "__main__":
     unittest.main()
