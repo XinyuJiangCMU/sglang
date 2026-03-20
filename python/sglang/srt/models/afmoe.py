@@ -518,7 +518,10 @@ class AfmoeDecoderLayer(nn.Module):
                 qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
                 if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
                     scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
-                    attn_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+                    attn_fp8 = (
+                        hasattr(scheme, "_supports_prequantized_fp8")
+                        and not getattr(scheme, "is_static_input_scheme", False)
+                    )
                 else:
                     attn_fp8 = isinstance(
                         qm,

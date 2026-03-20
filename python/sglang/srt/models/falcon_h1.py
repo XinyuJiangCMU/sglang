@@ -270,7 +270,10 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             qm = getattr(self.feed_forward.gate_up_proj, "quant_method", None)
             if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
                 scheme = getattr(self.feed_forward.gate_up_proj, "scheme", None)
-                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+                self._aiter_fp8 = (
+                    hasattr(scheme, "_supports_prequantized_fp8")
+                    and not getattr(scheme, "is_static_input_scheme", False)
+                )
             else:
                 self._aiter_fp8 = isinstance(
                     qm,

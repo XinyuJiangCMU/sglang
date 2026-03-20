@@ -289,7 +289,10 @@ class BaiChuanDecoderLayer(nn.Module):
             qm = getattr(self.self_attn.W_pack, "quant_method", None)
             if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
                 scheme = getattr(self.self_attn.W_pack, "scheme", None)
-                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+                self._aiter_fp8 = (
+                    hasattr(scheme, "_supports_prequantized_fp8")
+                    and not getattr(scheme, "is_static_input_scheme", False)
+                )
             else:
                 self._aiter_fp8 = isinstance(
                     qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)

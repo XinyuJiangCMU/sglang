@@ -250,7 +250,10 @@ class InternLMDecoderLayer(nn.Module):
             qm = getattr(self.attention.wqkv, "quant_method", None)
             if isinstance(qm, (CompressedTensorsLinearMethod, QuarkLinearMethod)):
                 scheme = getattr(self.attention.wqkv, "scheme", None)
-                self._aiter_fp8 = hasattr(scheme, "_supports_prequantized_fp8")
+                self._aiter_fp8 = (
+                    hasattr(scheme, "_supports_prequantized_fp8")
+                    and not getattr(scheme, "is_static_input_scheme", False)
+                )
             else:
                 self._aiter_fp8 = isinstance(
                     qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
