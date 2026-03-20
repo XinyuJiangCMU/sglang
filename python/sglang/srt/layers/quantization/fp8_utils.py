@@ -86,7 +86,13 @@ if _use_aiter:
         gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     )
 
-    aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+    # get_hip_quant(per_1x128) uses per_1x32_f8_scale_f8_quant which produces
+    # NaN on gfx942.  Use per_group_quant_hip as a working alternative.
+    from functools import partial
+
+    aiter_per1x128_quant = partial(
+        aiter.per_group_quant_hip, group_size=128, quant_dtype=aiter.dtypes.fp8
+    )
 
 
 if _is_cuda:
