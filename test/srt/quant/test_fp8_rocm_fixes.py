@@ -4914,3 +4914,29 @@ class TestStaticActivationGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestTPGuardConsistency(unittest.TestCase):
+    """Verify all models with _aiter_fp8 have TP>1 guard."""
+
+    def test_all_models_have_tp_guard(self):
+        """Every model with _aiter_fp8 should check TP world size."""
+        import os
+        import glob
+        models_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+            "python", "sglang", "srt", "models"
+        )
+        missing = []
+        for f in glob.glob(os.path.join(models_dir, "*.py")):
+            if "__pycache__" in f or "__init__" in f:
+                continue
+            with open(f) as fh:
+                content = fh.read()
+            if "_aiter_fp8" in content and "_forward_aiter_fp8" in content:
+                if "get_tensor_model_parallel_world_size" not in content:
+                    missing.append(os.path.basename(f))
+        self.assertEqual(missing, [],
+                         f"Models with _aiter_fp8 but no TP guard: {missing}")
+
