@@ -258,7 +258,9 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         # AMD AITER fused add+RMSNorm+FP8 for MLP (MI300X).
         # Hybrid attention+Mamba block is too complex for pre-quantized FP8 input;
         # only fused pre_ff_layernorm+MLP FP8 is applied.
-        if _use_aiter:
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1:
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsLinearMethod,
             )

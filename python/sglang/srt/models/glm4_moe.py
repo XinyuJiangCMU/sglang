@@ -817,7 +817,9 @@ class Glm4MoeDecoderLayer(nn.Module):
 
         # AMD AITER fused add+RMSNorm+FP8: check if qkv_proj supports FP8.
         # Optimizes attention sub-layer; dense MLP also uses FP8, sparse MoE uses standard path.
-        if _use_aiter:
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1:
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsLinearMethod,
             )

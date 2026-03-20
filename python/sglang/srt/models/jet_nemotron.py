@@ -481,7 +481,9 @@ class JetNemotronDecoderLayer(nn.Module):
         # which is incompatible with qkv_proj FP8 input path; only dense attn
         # layers (attn/swa) with qkv_proj support full fusion.
         self._is_attn_layer = config.layer_types[layer_id] in ("attn", "swa")
-        if _use_aiter:
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1:
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsLinearMethod,
             )

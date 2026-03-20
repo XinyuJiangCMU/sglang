@@ -21,7 +21,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -128,7 +128,7 @@ class DeciLMDecoderLayer(nn.Module):
 
         # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
         # Requires both attention and FFN to be present (no no-op layers).
-        if _use_aiter and not self._is_no_op_attention and not self._is_no_op_ffn:
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1 and not self._is_no_op_attention and not self._is_no_op_ffn:
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsLinearMethod,
             )

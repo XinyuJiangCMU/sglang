@@ -578,7 +578,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         # Fused add+RMSNorm+FP8 path for AMD AITER (gfx942 / MI300X).
         # Only optimizes the attention sub-layer (input_layernorm → qkv_proj).
         # MLP is always MoE (sparse) so cannot use the FP8 MLP path.
-        if _use_aiter:
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1:
             try:
                 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                     CompressedTensorsLinearMethod,

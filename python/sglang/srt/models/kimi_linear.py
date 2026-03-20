@@ -479,7 +479,7 @@ class KimiDecoderLayer(nn.Module):
         # use forward_with_allreduce_fusion_fp8_out here; we fall back to
         # forward_aiter_fp8_out for the post_attention_layernorm alone.
         self._aiter_fp8 = False
-        if _use_aiter and isinstance(self.mlp, KimiMLP):
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1 and isinstance(self.mlp, KimiMLP):
             quant_method = getattr(self.mlp.gate_up_proj, "quant_method", None)
             if quant_method is not None:
                 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod

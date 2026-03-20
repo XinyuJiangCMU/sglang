@@ -310,7 +310,7 @@ class Qwen3DecoderLayer(nn.Module):
 
         # Fused add+RMSNorm+FP8 path for AMD AITER (gfx942 / MI300X).
         # Disabled when rl_on_policy_target uses fp32 norms (norm_kwargs non-empty).
-        if _use_aiter and not norm_kwargs:
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1 and not norm_kwargs:
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsLinearMethod,
             )

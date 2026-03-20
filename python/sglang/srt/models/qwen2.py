@@ -275,7 +275,10 @@ class Qwen2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
-        if _use_aiter:
+        # Currently only validated for TP=1; TP>1 has allreduce fusion issues.
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1:
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsLinearMethod,
             )

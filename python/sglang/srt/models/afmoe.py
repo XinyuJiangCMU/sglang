@@ -504,7 +504,9 @@ class AfmoeDecoderLayer(nn.Module):
         # AMD AITER fused RMSNorm+FP8 path: fuse input_layernorm and pre_mlp_layernorm
         # norm+quant for both qkv_proj and gate_up_proj. Only dense MLP layers benefit
         # (MoE uses fused_moe which handles quantization internally).
-        if _use_aiter:
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1:
             from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
             from sglang.srt.layers.quantization.fbgemm_fp8 import FBGEMMFp8LinearMethod
             from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod

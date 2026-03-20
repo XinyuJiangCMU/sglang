@@ -301,7 +301,9 @@ class MixtralDecoderLayer(nn.Module):
 
         # AMD AITER fused RMSNorm+FP8 path: enabled when SGLANG_USE_AITER=1 (ROCm)
         # and qkv_proj uses a supported FP8 quant method.
-        if _use_aiter:
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1:
             from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
             from sglang.srt.layers.quantization.fbgemm_fp8 import FBGEMMFp8LinearMethod
             from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod

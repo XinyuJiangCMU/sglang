@@ -451,7 +451,7 @@ class SDARMoeBlock(nn.Module):
         # AMD AITER fused RMSNorm+FP8 path: enabled when SGLANG_USE_AITER=1 (ROCm)
         # and qkv_proj uses a supported FP8 quant method.
         # Disabled when norm_kwargs is non-empty (rl_on_policy_target mode).
-        if _use_aiter and not norm_kwargs:
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1 and not norm_kwargs:
             from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
             from sglang.srt.layers.quantization.fbgemm_fp8 import FBGEMMFp8LinearMethod
             from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod

@@ -504,7 +504,7 @@ class HunYuanDecoderLayer(nn.Module):
         # Fused add+RMSNorm+FP8 path for AMD AITER (gfx942 / MI300X).
         # Only enabled for self-attention layers with a dense (non-MoE) MLP.
         self._aiter_fp8 = False
-        if _use_aiter and isinstance(self.mlp, HunYuanMLP):
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1 and isinstance(self.mlp, HunYuanMLP):
             quant_method = getattr(self.mlp.gate_up_proj, "quant_method", None)
             if quant_method is not None:
                 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod

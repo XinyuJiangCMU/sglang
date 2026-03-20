@@ -252,7 +252,7 @@ class ExaoneDecoderLayer(nn.Module):
         self.ln_1 = RMSNorm(config.hidden_size, eps=rms_norm_eps)
         self.ln_2 = RMSNorm(config.hidden_size, eps=rms_norm_eps)
         # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
-        if _use_aiter and isinstance(self.ln_1, RMSNorm):
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1 and isinstance(self.ln_1, RMSNorm):
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsLinearMethod,
             )

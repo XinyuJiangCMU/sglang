@@ -697,7 +697,9 @@ class LLaDA2MoeBlock(nn.Module):
 
         # AMD AITER fused add+RMSNorm+FP8: check if query_key_value supports FP8.
         # Attention sub-layer uses FP8; dense MLP also uses FP8; sparse MoE uses standard path.
-        if _use_aiter:
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1:
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsLinearMethod,
             )

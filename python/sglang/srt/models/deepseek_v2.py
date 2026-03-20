@@ -1637,7 +1637,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # AMD AITER fused add+RMSNorm+FP8 for dense MLP layers (MI300X).
         # MLA attention is too complex for pre-quantized FP8 input;
         # only post_attention_layernorm+MLP FP8 fusion is applied.
-        if _use_aiter and not self.is_layer_sparse and isinstance(
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1 and not self.is_layer_sparse and isinstance(
             self.mlp, DeepseekV2MLP
         ):
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (

@@ -549,7 +549,7 @@ class ExaoneMoEDecoderLayer(nn.Module):
         )
         self._is_moe_layer = config.is_moe_layer[layer_id]
         # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
-        if _use_aiter:
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1:
             try:
                 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                     CompressedTensorsLinearMethod,

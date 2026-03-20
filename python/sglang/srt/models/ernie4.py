@@ -212,7 +212,7 @@ class Ernie4DecoderLayer(nn.Module):
         )
         # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
         # Only enable for dense MLP layers; MoE layers are not supported.
-        if _use_aiter and isinstance(self.mlp, Ernie4MLP):
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1 and isinstance(self.mlp, Ernie4MLP):
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsLinearMethod,
             )

@@ -172,7 +172,9 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
         # Check if fused RMSNorm+FP8 quantization path is available (AMD AITER).
         # MLA attention is too complex for qkv_proj FP8 input; only MLP norm fusion
         # is applied via prepare_mlp_fp8_out + mlp._forward_with_fp8_input.
-        if _use_aiter:
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1:
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsLinearMethod,
             )

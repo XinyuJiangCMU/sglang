@@ -1119,7 +1119,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         # MLA attention is incompatible with qkv_proj FP8 input; only MLP norm
         # fusion is applied via prepare_mlp_fp8_out + mlp._forward_with_fp8_input.
         # Only dense (non-MoE) layers have SarvamMoEMLP with gate_up_proj.
-        if _use_aiter and not self.is_layer_sparse:
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1 and not self.is_layer_sparse:
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsLinearMethod,
             )

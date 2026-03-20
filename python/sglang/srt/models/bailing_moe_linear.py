@@ -830,7 +830,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
         # AMD AITER fused add+RMSNorm+FP8 for dense MLP layers (MI300X).
         # Attention types (linear/MLA/GQA) are too complex for FP8 input;
         # only post_attention_layernorm+MLP FP8 fusion is applied.
-        if _use_aiter and not is_moe_layer and isinstance(self.mlp, BailingMLP):
+        if _use_aiter and get_tensor_model_parallel_world_size() <= 1 and not is_moe_layer and isinstance(self.mlp, BailingMLP):
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
                 CompressedTensorsLinearMethod,
             )
