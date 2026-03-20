@@ -4856,5 +4856,48 @@ class TestAITERActivationKernels(unittest.TestCase):
         self.assertTrue(_has_aiter_activation, "AITER activation kernels should be available")
 
 
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestLinearBaseFP8Input(unittest.TestCase):
+    """Test forward_with_fp8_input on all linear types."""
+
+    def test_linear_base_has_method(self):
+        from sglang.srt.layers.linear import LinearBase
+        self.assertTrue(hasattr(LinearBase, 'forward_with_fp8_input'))
+
+    def test_qkv_parallel_has_method(self):
+        from sglang.srt.layers.linear import QKVParallelLinear
+        self.assertTrue(hasattr(QKVParallelLinear, 'forward_with_fp8_input'))
+
+    def test_column_parallel_has_method(self):
+        from sglang.srt.layers.linear import ColumnParallelLinear
+        self.assertTrue(hasattr(ColumnParallelLinear, 'forward_with_fp8_input'))
+
+    def test_row_parallel_has_method(self):
+        from sglang.srt.layers.linear import RowParallelLinear
+        self.assertTrue(hasattr(RowParallelLinear, 'forward_with_fp8_input'))
+
+    def test_merged_column_has_method(self):
+        from sglang.srt.layers.linear import MergedColumnParallelLinear
+        self.assertTrue(hasattr(MergedColumnParallelLinear, 'forward_with_fp8_input'))
+
+
+@unittest.skipIf(not is_hip(), "ROCm-only tests")
+class TestStaticActivationGuard(unittest.TestCase):
+    """Test that static-activation models skip fused FP8 path."""
+
+    def test_llama_aiter_fp8_checks_static(self):
+        """LlamaDecoderLayer _aiter_fp8 detection guards against static schemes."""
+        import inspect
+        from sglang.srt.models.llama import LlamaDecoderLayer
+        src = inspect.getsource(LlamaDecoderLayer.__init__)
+        self.assertIn("is_static_input_scheme", src)
+
+    def test_qwen2_aiter_fp8_checks_static(self):
+        import inspect
+        from sglang.srt.models.qwen2 import Qwen2DecoderLayer
+        src = inspect.getsource(Qwen2DecoderLayer.__init__)
+        self.assertIn("is_static_input_scheme", src)
+
+
 if __name__ == "__main__":
     unittest.main()
