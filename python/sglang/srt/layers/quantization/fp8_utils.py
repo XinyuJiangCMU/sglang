@@ -509,7 +509,9 @@ def _dispatch_auto_backend() -> Callable:
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
     elif _check_cutlass_block_fp8_hardware_support():
         return cutlass_w8a8_block_fp8_linear_with_fallback
-    elif _use_aiter:
+    elif _use_aiter and _use_aiter_gfx95:
+        # Only use AITER blockscale on gfx950+; on gfx942 the AITER Triton
+        # blockscale kernel produces incorrect results.
         return aiter_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
