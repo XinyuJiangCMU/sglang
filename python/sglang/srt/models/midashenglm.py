@@ -476,7 +476,7 @@ class MiDashengLMModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        rope_scaling = config.text_config.rope_parameters
+        rope_scaling = getattr(config.text_config, "rope_parameters", getattr(config.text_config, "rope_scaling", None))
         if rope_scaling:
             if "mrope_section" in rope_scaling:
                 # Remove mrope_section from rope_parameters so downstream

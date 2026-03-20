@@ -153,7 +153,7 @@ class Phi3SmallSelfAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        rope_scaling = self.config.rope_parameters
+        rope_scaling = getattr(self.config, "rope_parameters", getattr(self.config, "rope_scaling", None))
         if rope_scaling is not None:
             for key in rope_scaling:
                 if isinstance(rope_scaling[key], list):

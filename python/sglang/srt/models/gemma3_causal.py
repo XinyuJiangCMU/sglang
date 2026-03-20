@@ -189,7 +189,7 @@ class Gemma3Attention(nn.Module):
         # In transformers v5, rope_parameters is nested per layer type:
         #   {"sliding_attention": {"rope_theta": 10000}, "full_attention": {"rope_theta": 1000000}}
         # In v4 it was flat: {"rope_type": "default", "rope_theta": ...}
-        rope_params = config.rope_parameters
+        rope_params = getattr(config, "rope_parameters", getattr(config, "rope_scaling", None))
         is_nested = isinstance(rope_params, dict) and "full_attention" in rope_params
 
         # Initialize the rotary embedding.
@@ -488,7 +488,7 @@ class Gemma3RotaryEmbedding(nn.Module):
     def __init__(self, config: Gemma3TextConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
-        rope_scaling = config.rope_parameters
+        rope_scaling = getattr(config, "rope_parameters", getattr(config, "rope_scaling", None))
         if rope_scaling is not None:
             self.rope_type = rope_scaling.get(
                 "rope_type", rope_scaling.get("type", "default")
@@ -543,7 +543,7 @@ class Gemma3RotaryEmbedding(nn.Module):
     @staticmethod
     def compute_default_rope_parameters(config, device=None, seq_len=None):
         """Standard RoPE: no scaling, just base frequency."""
-        rope_params = config.rope_parameters
+        rope_params = getattr(config, "rope_parameters", getattr(config, "rope_scaling", None))
         if isinstance(rope_params, dict) and "rope_theta" not in rope_params:
             # Nested per-layer-type format; pick the first available theta
             for v in rope_params.values():
@@ -648,7 +648,7 @@ class Gemma3TextModel(PreTrainedModel):
         #   {"sliding_attention": {"rope_type": ..., "rope_theta": 10000},
         #    "full_attention":    {"rope_type": ..., "rope_theta": 1000000}}
         # Flatten into the format Gemma3RotaryEmbedding expects.
-        rope_params = config.rope_parameters
+        rope_params = getattr(config, "rope_parameters", getattr(config, "rope_scaling", None))
         if isinstance(rope_params, dict) and "full_attention" in rope_params:
             global_theta = rope_params["full_attention"].get("rope_theta", 1000000.0)
             local_theta = rope_params["sliding_attention"].get("rope_theta", 10000.0)

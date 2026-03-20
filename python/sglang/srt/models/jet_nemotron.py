@@ -375,8 +375,8 @@ class JetNemotronAttention(nn.Module):
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.config.max_position_embeddings,
-            base=int(self.config.rope_parameters["rope_theta"]),
-            rope_scaling=self.config.rope_parameters,
+            base=int(getattr(self.config, "rope_parameters", {}).get("rope_theta", getattr(self.config, "rope_theta", 10000))),
+            rope_scaling=getattr(self.config, "rope_parameters", getattr(self.config, "rope_scaling", None)),
         )
 
         match self.config.layer_types[layer_id]:
