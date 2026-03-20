@@ -92,6 +92,8 @@ SHAPES_TO_TUNE: List[Tuple[int, int, str]] = [
     (6144, 4096, "Llama3-8B QKV proj TP=1"),
     (8192, 4096, "Llama3-70B QKV proj TP=1"),
     (28672, 8192, "Llama3-70B gate_up TP=1"),
+    # Qwen3-30B MoE: hidden=2048, QKV with 16+2*4=24 heads * 128 = 3072
+    (5120, 2048, "Qwen3-30B-MoE QKV proj TP=1"),
 ]
 
 # Batch sizes (M) to tune for each shape.
