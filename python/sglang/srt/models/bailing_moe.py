@@ -749,7 +749,7 @@ class BailingMoEBlock(nn.Module):
                 qm = getattr(self.attention.query_key_value, "quant_method", None)
                 self._aiter_fp8 = isinstance(
                     qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
-                )
+                ) and not getattr(qm, "block_quant", False)
         else:
             self._aiter_fp8 = False
 

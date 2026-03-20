@@ -531,7 +531,7 @@ class AfmoeDecoderLayer(nn.Module):
                 qm = getattr(self.self_attn.qkv_proj, "quant_method", None)
                 attn_fp8 = isinstance(
                     qm, (W8A8Fp8LinearMethod, FBGEMMFp8LinearMethod, Fp8LinearMethod)
-                )
+                ) and not getattr(qm, "block_quant", False)
 
             # For MoE layers, skip the MLP FP8 fused path
             is_dense_mlp = isinstance(self.mlp, AfmoeMLP)
