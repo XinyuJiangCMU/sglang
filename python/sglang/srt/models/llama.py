@@ -295,8 +295,13 @@ class LlamaDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        rope_params = getattr(config, "rope_parameters", None)
+        if rope_params is not None:
+            rope_theta = rope_params["rope_theta"]
+            rope_scaling = rope_params
+        else:
+            rope_theta = getattr(config, "rope_theta", 10000)
+            rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
