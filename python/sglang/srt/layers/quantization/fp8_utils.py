@@ -509,9 +509,7 @@ def _dispatch_auto_backend() -> Callable:
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
     elif _check_cutlass_block_fp8_hardware_support():
         return cutlass_w8a8_block_fp8_linear_with_fallback
-    elif _use_aiter and _use_aiter_gfx95:
-        # Only use AITER blockscale on gfx950+; on gfx942 the AITER Triton
-        # blockscale kernel produces incorrect results.
+    elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
@@ -849,7 +847,9 @@ def aiter_w8a8_block_fp8_linear(
     if _use_aiter_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
     else:
-        use_triton = True
+        # On gfx942: AITER triton_gemm_a8w8_blockscale produces wrong results;
+        # use CK kernel which is both correct and 3.9x faster.
+        use_triton = False
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
