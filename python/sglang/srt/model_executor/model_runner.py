@@ -2420,6 +2420,57 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
+        self._prewarm_aiter_all_reduce()
+
+    def _prewarm_aiter_all_reduce(self):
+        """Pre-warm aiter cross_device_reduce_2stage path before serving.
+
+        On AMD ROCm with SGLANG_USE_AITER=1 and TP>1, the first all-reduce
+        of each new tensor size pays a 1-2 second one-time setup cost
+        (aiter IPC buffer alloc / 2-stage peer handshake). Measured on
+        MI355X tp=8 with DeepSeek-V4-Flash: the very first AR call landing
+        in a new EXTEND batch took 0.9-2.1s across all 8 ranks; subsequent
+        calls of the same shape dropped to <25ms. Trigger that one-time
+        cost here, before CUDA graph capture, so it does not surface as a
+        1-2s TTFT spike on the first user request.
+
+        Mirrors the pattern of _pre_initialize_flashinfer_allreduce_workspace
+        which does the equivalent for the flashinfer all-reduce path.
+        """
+        from sglang.srt.environ import envs as _envs
+
+        if self.tp_size <= 1:
+            return
+        if not _envs.SGLANG_USE_AITER.get():
+            return
+        if self.device != "cuda":
+            return
+
+        try:
+            from sglang.srt.distributed import tensor_model_parallel_all_reduce
+        except Exception:
+            return
+
+        hidden_size = self.model_config.hidden_size
+        chunked_prefill = self.server_args.chunked_prefill_size or 8192
+
+        # Token-count buckets cover decode (1 token) through full chunked-
+        # prefill batches. Each shape is touched once to amortize aiter's
+        # first-call setup cost.
+        token_buckets = sorted(set([1, 16, 64, 256, 1024,
+                                    max(chunked_prefill // 2, 1024),
+                                    chunked_prefill]))
+
+        for n_tokens in token_buckets:
+            dummy = torch.zeros((n_tokens, hidden_size),
+                                dtype=self.dtype, device=self.device)
+            tensor_model_parallel_all_reduce(dummy)
+        torch.cuda.synchronize()
+        logger.info(
+            "[aiter AR prewarm] warmed shapes=%s × hidden=%d dtype=%s",
+            token_buckets, hidden_size, self.dtype,
+        )
+
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
 
