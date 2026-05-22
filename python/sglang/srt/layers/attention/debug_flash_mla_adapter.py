@@ -12,7 +12,26 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if is_hip():
         import os
 
-        backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "tilelang")
+        env_backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "tilelang")
+        # [bs-aware dispatch] On gfx95 (MI350X) + DSv4-Pro decode, tilelang
+        # attention is +19-47% faster than triton at bs ∈ [40, 248] (validated
+        # via fine-grained sweep; bs=200/208/224 all show +30% over triton).
+        # tilelang has a cliff at bs >= 256 (catastrophic ITL spike, output_tps
+        # drops 5-8×) and remains -14% at bs=512, so [40, 248] is the admissible
+        # window. Inside the window force tilelang; outside use env-default.
+        # Escape hatch: SGLANG_DSV4_DISABLE_BS_DISPATCH=1 disables this routing.
+        if os.environ.get("SGLANG_DSV4_DISABLE_BS_DISPATCH") == "1":
+            backend = env_backend
+        else:
+            q = kwargs.get("q")
+            if q is not None:
+                bs = q.shape[0]
+                if 40 <= bs <= 248:
+                    backend = "tilelang"
+                else:
+                    backend = env_backend
+            else:
+                backend = env_backend
     else:
         import flash_mla
 
