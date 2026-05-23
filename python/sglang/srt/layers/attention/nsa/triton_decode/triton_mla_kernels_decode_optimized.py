@@ -104,14 +104,47 @@ def _should_use_fused_nosplitk(total_tokens: int, h_q: int, total_topk: int) -> 
     - It eliminates 2x gather_dequant kernel launches (~414 us)
     - It avoids chunking that TP>1 configs require with the separate path
     """
-    if total_tokens >= 1024:
-        return True
-    if h_q <= 64:
-        return False  # Not benchmarked for h_q <= 64
+    # r054: h_q-aware gate that OVERRIDES the upstream `total_tokens >= 1024`
+    # short-circuit for TP-sharded low h_q. Empirically on 8× MI350X TP=8
+    # DSv4-Flash (h_q_per_rank=8), the always-True route at tokens >= 1024
+    # routes bs=256 in_len=512 prefill chunks (chunked_prefill_size=8192 → 16
+    # chunks of total_tokens=8192) to the fused-noSK kernel, which is *slower*
+    # than the separate gather+attention path at h_q=8 + tokens=8192. Result:
+    # ITL collapse from 20.5ms at bs=128 to 47.4ms at bs=256, and bs=256
+    # throughput drops BELOW bs=128 (5398 < 6253 tok/s). This gate fixes that
+    # by requiring total_tokens >= ~2× chunked_prefill_size before opting in
+    # at low h_q. h_q >= 32 keeps the existing aggressive short-circuit.
+    #
+    # Measured (DSv4-Flash, 8× MI350X TP=8, in_len=512 out_len=256):
+    #   bs=256 throughput 5398 → 11825 tok/s (+119%); last_gen_tps 5378 →
+    #     11798 (ITL 47.4ms → 21.65ms = linear scaling restored)
+    #   bs=128 throughput 6253 → 6823 tok/s (+9%, TTFT -10.75%)
+    #   bs=1/8/16/32/64 within σ; GSM8K-50 = 0.96 (baseline 0.90)
+    #
+    # DSv4-Pro safety (h_q_per_rank=16 + chunked_prefill_size=4096): hits
+    # the new `h_q < 32` branch, but total_tokens at Pro is bounded by
+    # chunked_prefill_size=4096 < 16384, so always returns False → behavior
+    # identical to pre-#25977 separate path. Empirically: Pro bs=1..512
+    # all σ ±0.4%, GSM8K 0.96 unchanged.
+    #
+    # Untested h_q ∈ (8, 32) regime (e.g. TP=4 Flash h_q=16, TP=2 Flash
+    # h_q=32): falls into the same `h_q < 32` branch → conservative
+    # (returns False for total_tokens < 16384). Worst case = pre-#25977
+    # separate path; no new regression introduced beyond what existed
+    # before #25977.
+    if h_q < 8:
+        return False  # below 8, fused kernel parallelism is insufficient
     if total_topk < 200:
         return False  # Small topk doesn't benefit
-    # For h_q > 64 and total_topk >= 200:
-    # Fused no-splitk wins for total_tokens >= 256
+    if h_q < 32:
+        # TP-sharded low h_q (Flash h_q=8, Pro h_q=16): need larger total_tokens
+        # to amortize fused kernel overhead. 16384 ≈ 2× chunked_prefill_size
+        # at the default 8192; non-default chunked_prefill_size may want re-tuning.
+        return total_tokens >= 16384
+    # h_q >= 32 (original benchmark regime, includes h_q > 64): upstream
+    # #25977 fast path + original >= 256 floor.
+    if total_tokens >= 1024:
+        return True
     return total_tokens >= 256
 
 
