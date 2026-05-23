@@ -2492,17 +2492,41 @@ def dpsk_v4_fp8_attention_fwd(
     """
     Follows the original `flash_mla.flash_mla_with_kvcache` signature.
     """
-    if _is_gfx95_supported:
-        block_I, threads, num_stages, block_per_cu, cu = 64, 512, 0, 2, 256
-    else:
-        block_I, threads, num_stages, block_per_cu, cu = 32, 128, 1, 1, 304
-
     batch, seq_len, num_heads, _ = q.shape
     # Partial grid is (seq_len * REPLICATE_H * n_groups, batch, kv_group); the
     # heuristic in _pick_inner_iter assumes `total_blocks = seq * ni / inner_iter`,
     # so `seq` must include REPLICATE_H or n_groups doubles for medium batches.
     replicate_h = max((num_heads + 63) // 64, 1)
     seq = batch * seq_len * replicate_h
+
+    if _is_gfx95_supported:
+        block_I, threads, num_stages, cu = 64, 512, 0, 256
+        # r047 v3: bs-adaptive block_per_cu unified window. Covers BOTH:
+        # (a) cliff fix in seq ∈ [512, 1024): bpc=2 would let _pick_inner_iter
+        #     pick inner_iter=ni (n_groups collapse to 1) at seq>=512, measured
+        #     -88% at user bs=256 in r046_b1. bpc=4 keeps inner_iter=ni/2,
+        #     n_groups=2.
+        # (b) mid-bs boost in seq ∈ [256, 512): with bpc=2 we get n_groups=4;
+        #     bpc=4 forces n_groups=8 (more CU occupancy), worth +11-15% extra
+        #     vs the static-config tilelang baseline at user bs=128/192
+        #     (r047_b1v1 vs r047_b1v2 difference).
+        # At seq >= 1024 the original bpc=2 is preserved: r039 measured
+        # bpc=4 hurts -27% at user bs=512 (split-K combine overhead outweighs
+        # parallelism boost). Below seq=256 the original wins.
+        #
+        # num_stages stays 0: r047 attempted num_stages=1 for seq>=512 to
+        # software-pipeline K loads but tilelang's PipelineInjector rejects
+        # it ("two statements with buffer access dependency in the same stage
+        # of the software pipeline cannot be reordered", same fail mode as
+        # r038). Increasing pipelining requires restructuring the kernel
+        # body (separating K_packed / K_scale / KV loads into independent
+        # pipeline stages) — out of scope for this commit.
+        if 256 <= seq < 1024:
+            block_per_cu = 4
+        else:
+            block_per_cu = 2
+    else:
+        block_I, threads, num_stages, block_per_cu, cu = 32, 128, 1, 1, 304
 
     k1, _, bs_kv_1 = _build_fp8_combined_view(k_cache)
     topk_1 = indices.shape[-1]
