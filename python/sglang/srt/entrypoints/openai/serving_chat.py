@@ -694,6 +694,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = prompt[: -len(conv.sep)]
             if getattr(conv, "sep2", None) and prompt.endswith(conv.sep2):
                 prompt = prompt[: -len(conv.sep2)]
+            # Inject <think> for reasoning models that need an explicit start
+            # token (mirrors the else-branch below). Safety check skips
+            # injection if the user already included <think> in their partial
+            # assistant content, to avoid double-emission.
+            if (
+                self._get_reasoning_from_request(request)
+                and (
+                    self._reasoning_detector is None
+                    or not self._reasoning_detector.thinks_internally
+                )
+                and "<think>" not in prompt[-200:]
+            ):
+                prompt += "<think>"
         else:
             prompt = conv.get_prompt()
             if self._get_reasoning_from_request(request) and (
