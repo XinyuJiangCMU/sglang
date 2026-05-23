@@ -13,6 +13,41 @@ beats both tilelang AND triton across all batch sizes.
 4. Env-gated `SGLANG_FLYDSL_REAL=0` (default) delegates to tilelang for
    byte-equal correctness baseline.
 
+## Round 4: full FlyDSL K-gather kernel ✅ **BYTE-EXACT**
+
+`_r051_artifacts/test_kgather_full.py` — real K-gather FlyDSL kernel,
+not a primitive test.
+
+**Validated against real DSv4 data:**
+- 4096 workgroups (32 batches × topk=128)
+- 36 threads/wg cooperative load (each 16 bytes = dwordx4)
+- Source: 206.5 MB real FP8 K cache
+- **Correctness: 4096 / 4096 rows byte-exact vs `torch.gather` reference**
+
+**ISA per thread (ideal pattern):**
+```
+buffer_load_dwordx4 v1, s[4:7], 0 offen lds     ← WEAPON 1 (HBM→LDS)
+ds_read_b128 v[2:5], v2                         ← LDS→reg (16 bytes)
+buffer_store_dwordx4 v[2:5], v0, s[12:15], 0 offen   ← reg→HBM scratch
+```
+
+3 memory ops, zero `ds_write`, zero VGPR transit for the HBM load.
+
+**Trusted primitive available for subsequent rounds.** Next:
+- Add scale region (8 bytes per row) gather
+- FP8 dequant in registers
+- Q load + Q@K^T mfma
+- Online softmax + S@V
+
+API pattern this round established:
+- Use aiter's `GTensor(memref, dtype, shape)` from `tensor_shim.py` for typed
+  HBM access (load/store via `buffer_ops.buffer_load`/`buffer_store`).
+- For LDS→HBM stores: read LDS as `vec(4, i32)` (= dwordx4), store via
+  GTensor of dtype=i32 (NOT i8 — buffer_store of `<16xi8>` hits LLVM
+  AMDGPU backend split bug).
+- For weapon 1 source: pass `gtensor.rsrc` directly to
+  `rocdl.buffer_load_to_lds`.
+
 ## Round 3 (incremental): weapon-1 on REAL DSv4 K cache ✅
 
 `_r051_artifacts/test_weapon1_on_real_kcache.py` — same verified
