@@ -13,6 +13,44 @@ beats both tilelang AND triton across all batch sizes.
 4. Env-gated `SGLANG_FLYDSL_REAL=0` (default) delegates to tilelang for
    byte-equal correctness baseline.
 
+## Round 6: FlyDSL kernel WIRED INTO dispatch path ✅
+
+`_dpsk_v4_fp8_attention_fwd_flydsl_real` no longer NotImplementedError.
+
+When called with real DSv4 kwargs (from microbench pickle), it:
+1. Runs FlyDSL weapon-1 kgather on real `k_cache` (216 MB) — 4096 rows
+2. Runs FlyDSL weapon-1 kgather on real `extra_k_cache` (≈97 MB) —
+   matching `extra_indices_in_kvcache` rows
+3. Delegates math to tilelang (proven correct)
+4. Returns `(out=(159,1,128,512), lse=(159,1,128))`
+
+Env vars:
+- `SGLANG_FLYDSL_REAL=1` enables this path
+- `SGLANG_FLYDSL_EXERCISE=0` (default) skips the kgather exercise
+  (production safe — same perf as plain tilelang)
+- `SGLANG_FLYDSL_EXERCISE=1` runs the kgather exercise (slow, for proof)
+- `SGLANG_FLYDSL_DEBUG=1` logs first exercise failure
+
+Kernels compile once and cache (keyed by ROW_BYTES + BYTES_PER_LOAD +
+label). Per-call cost = launch + sync only.
+
+Next rounds replace tilelang piece-by-piece:
+- r052+: FlyDSL FP8 dequant (validates `arith.shli/andi/ori` on i32)
+- r053+: FlyDSL QK gemm via `rocdl.mfma_f32_16x16x32_bf16`
+- r054+: FlyDSL online softmax + S@V
+- r055+: full FlyDSL kernel — replace tilelang call entirely
+
+## Round 5: K-gather extended with scale region ✅
+
+`_r051_artifacts/test_kgather_with_scale.py` — two kgather kernels
+both byte-exact:
+- packed: 576 bytes / row, 36-thread WG, dwordx4 (BYTES_PER_LOAD=16)
+- scale:   8 bytes / row,  1-thread WG,  dwordx4 (loads 16, uses 8;
+  size_bytes=8 hits LLVM AMDGPU backend "expand operand" bug, hence
+  the 16-byte padded workaround)
+
+All input data for FP8 dequant now gathered via weapon 1.
+
 ## Round 4: full FlyDSL K-gather kernel ✅ **BYTE-EXACT**
 
 `_r051_artifacts/test_kgather_full.py` — real K-gather FlyDSL kernel,

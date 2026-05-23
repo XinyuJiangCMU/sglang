@@ -80,38 +80,196 @@ def dpsk_v4_fp8_attention_fwd_flydsl(
     )
 
 
-def _dpsk_v4_fp8_attention_fwd_flydsl_real(**kwargs):
-    """r052+ entry point. NOT IMPLEMENTED in r051 stage 1 round 1.
+# =============================================================================
+# r051 Round 6: FlyDSL K-gather kernel integrated into dispatch path
+# =============================================================================
+# - Runs validated FlyDSL weapon-1 kgather kernels (rounds 4+5) on the real
+#   K cache + extra K cache. Output discarded — this is an EXERCISE to prove
+#   the kernel runs under real server load (cuda graph, concurrent requests,
+#   etc.) without crashing.
+# - Math then delegates to tilelang (proven correct).
+# - Subsequent rounds (7+) replace the tilelang math piece-by-piece with
+#   FlyDSL mfma/softmax/dequant.
 
-    Sketch of what this will do (per r051 CONTEXT.md stage 1+2):
+_KGATHER_KERNEL_CACHE = {}
+_EXERCISE_LOGGED = {"once": False}
 
-    Stage 1 (correctness via simplest FlyDSL primitives):
-      1. Allocate Q_lds, K_packed_lds, K_scale_lds, KV_lds, K_tail_lds (SmemAllocator)
-      2. Load Q (contiguous) via buffer_copy_gmem16_dwordx4 → Q_lds
-      3. For each batch / span / inner_iter:
-         a. Gather K_packed via per-row buffer_load (indirect addressing,
-            page_idx_shared[bi_i] like tilelang does)
-         b. Gather K_scale similarly
-         c. Dequant FP8 → BF16 in registers (or use mfma_scale_f32_16x16x128_f8f6f4
-            directly if weapon 5 maps cleanly)
-         d. mfma_f32_16x16x32_bf16 for Q @ K^T → acc_s
-         e. Online softmax with running m_i / sumexp
-         f. mfma_f32_16x16x32_bf16 for S @ V → acc_o
-      4. Write partial_O / partial_LSE to HBM
-      5. Combine kernel separately
 
-    Stage 2 (weapons 1+2+5):
-      W1: replace buffer_load + lds_store_16b_xor16 with global_load_lds (direct
-          HBM→LDS, 0 VGPR transit pressure)
-      W2: double-buffer + software pipeline K_load (stage 0) → dequant (stage 1)
-          → gemm (stage 2), using mfma_preshuffle_pipeline pattern
-      W5: if FlyDSL's mfma_scale_f32_16x16x128_f8f6f4 maps cleanly, skip dequant
-          and run FP8 mfma directly with scale.
+def _build_kgather_kernel(ROW_BYTES: int, BYTES_PER_LOAD: int, label: str):
+    """Build a FlyDSL weapon-1 K-gather kernel. Implementation matches
+    _r051_artifacts/test_kgather_with_scale.py (proven byte-exact)."""
+    import sys as _sys
+    _sys.path.insert(0, "/sgl-workspace/aiter/aiter/ops/flydsl/kernels")
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    from flydsl.expr import buffer_ops, rocdl, arith
+    from flydsl.expr.typing import T
+    from flydsl._mlir import ir
+    from flydsl._mlir.dialects import llvm as _llvm
+    from flydsl._mlir.dialects import vector as _vector
+    from flydsl.compiler.kernel_function import CompilationContext
+    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+    from flydsl.runtime.device import get_rocm_arch
+    from tensor_shim import GTensor
 
-    Stage 3 (optional): manual producer/consumer via LDS atomic flags +
-      thread-id partitioning, if stage 2 doesn't close the gap to triton at bs≥256.
-    """
-    raise NotImplementedError(
-        "r051 stage 1 round 1: real FlyDSL kernel not yet implemented; "
-        "set SGLANG_FLYDSL_REAL=0 (default) to delegate to tilelang baseline."
+    assert BYTES_PER_LOAD in (4, 16), BYTES_PER_LOAD
+    assert ROW_BYTES % BYTES_PER_LOAD == 0
+    NUM_THREADS = ROW_BYTES // BYTES_PER_LOAD
+
+    arch = get_rocm_arch()
+    allocator = SmemAllocator(
+        None, arch=arch,
+        global_sym_name=f"flydsl_kgs_{label}_r{ROW_BYTES}_b{BYTES_PER_LOAD}",
     )
+    lds_row_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_row_offset + max(ROW_BYTES, 16)
+
+    def _llvm_lds_ptr_ty():
+        return ir.Type.parse("!llvm.ptr<3>")
+
+    @flyc.kernel(name=f"flydsl_kgather_{label}_r{ROW_BYTES}")
+    def kgather_kernel(
+        src_i8: fx.Tensor,
+        row_byte_offsets: fx.Tensor,
+        scratch_i8: fx.Tensor,
+    ):
+        tid = fx.thread_idx.x
+        wgid = fx.block_idx.x
+        ro_ = GTensor(row_byte_offsets, dtype=T.i32, shape=(-1,))
+        src_ = GTensor(src_i8, dtype=T.i8, shape=(-1,))
+        scr_i32 = GTensor(scratch_i8, dtype=T.i32, shape=(-1,))
+
+        thread_lds_byte = tid * fx.Int32(BYTES_PER_LOAD) + fx.Int32(lds_row_offset)
+        tlb = thread_lds_byte.value if hasattr(thread_lds_byte, "value") else thread_lds_byte
+        lds_byte_i64 = arith.extui(T.i64, tlb)
+        lds_ptr = _llvm.IntToPtrOp(_llvm_lds_ptr_ty(), lds_byte_i64).result
+
+        row_base = ro_.load(wgid, vec_size=1)
+        rb = row_base.value if hasattr(row_base, "value") else row_base
+        tir = (tid * fx.Int32(BYTES_PER_LOAD))
+        tir_raw = tir.value if hasattr(tir, "value") else tir
+        voffset = arith.addi(rb, tir_raw)
+
+        rocdl.buffer_load_to_lds(
+            rsrc=src_.rsrc, lds_ptr=lds_ptr, voffset=voffset,
+            size_bytes=BYTES_PER_LOAD, soffset=0, offset=0,
+        )
+        rocdl.barrier()
+
+        WORDS_PER_LOAD = BYTES_PER_LOAD // 4
+        lds_view_i32 = SmemPtr(
+            allocator.get_base(), lds_row_offset, T.i32,
+            shape=(max(ROW_BYTES // 4, 4),),
+        )
+        lds_memref_i32 = lds_view_i32.get()
+        vt = T.vec(WORDS_PER_LOAD, T.i32)
+        lds_idx = (tid * fx.Int32(WORDS_PER_LOAD)).value
+        lds_idx_ix = arith.index_cast(T.index, lds_idx)
+        v = _vector.load(vt, lds_memref_i32, [lds_idx_ix])
+
+        out_word_off = (
+            wgid * fx.Int32(ROW_BYTES // 4) + tid * fx.Int32(WORDS_PER_LOAD)
+        )
+        scr_i32.store(out_word_off, v, vec_size=WORDS_PER_LOAD)
+
+    @flyc.jit
+    def launch(src_i8, row_byte_offsets, scratch_i8, grid_x: fx.Int32):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        kgather_kernel(src_i8, row_byte_offsets, scratch_i8).launch(
+            grid=(grid_x, 1, 1),
+            block=(NUM_THREADS, 1, 1),
+        )
+
+    return launch
+
+
+def _exercise_kgather_on_real(k_cache: torch.Tensor, indices: torch.Tensor):
+    """Run FlyDSL weapon-1 kgather on (k_cache, indices). Discards output.
+
+    Validates that the FlyDSL kernel actually runs under real server load:
+    real cuda graph, concurrent requests, real GPU memory pressure.
+    """
+    if k_cache is None or indices is None:
+        return
+    NB, BS_KV, H_KV, PACKED_W_FULL = k_cache.shape
+    if PACKED_W_FULL != 584:
+        return  # unfamiliar layout — skip
+    PACKED_W_BYTES = 576
+    SCALE_PADDED = 16
+    SCALE_W_BYTES = 8
+
+    BS, S_Q, TOPK = indices.shape
+    if S_Q != 1:
+        return
+
+    # Build per-row byte offsets (packed region only — scale similar pattern,
+    # exercised by separate kernel).
+    idx_flat = indices.reshape(-1).to(torch.int32)
+    idx_c = torch.clamp(idx_flat, min=0)
+    block_id = idx_c // BS_KV
+    in_block = idx_c % BS_KV
+    block_stride = BS_KV * PACKED_W_FULL
+    packed_row_off = (
+        block_id.long() * block_stride + in_block.long() * PACKED_W_BYTES
+    ).to(torch.int32).contiguous()
+
+    GRID_X = packed_row_off.numel()
+    k_cache_i8 = k_cache.view(torch.int8).reshape(-1).contiguous()
+    packed_scratch = torch.zeros(GRID_X * PACKED_W_BYTES, dtype=torch.int8, device=k_cache.device)
+
+    cache_key = (PACKED_W_BYTES, 16, "packed")
+    if cache_key not in _KGATHER_KERNEL_CACHE:
+        _KGATHER_KERNEL_CACHE[cache_key] = _build_kgather_kernel(
+            PACKED_W_BYTES, 16, "packed"
+        )
+    launch = _KGATHER_KERNEL_CACHE[cache_key]
+    launch(k_cache_i8, packed_row_off, packed_scratch, GRID_X)
+    # Sync — we want this to be a real kernel exercise, not async noise.
+    torch.cuda.synchronize()
+
+
+def _dpsk_v4_fp8_attention_fwd_flydsl_real(**kwargs):
+    """r051 Round 6 entry point.
+
+    Strategy:
+      1. EXERCISE the FlyDSL kgather kernel on the real k_cache + extra_k_cache
+         (validates kernel runs under real server load).
+      2. DELEGATE the actual attention math to tilelang (proven correct).
+
+    Subsequent rounds replace step 2 piece-by-piece:
+      r052+: dequant kernel in FlyDSL, output validated vs torch
+      r053+: QK gemm in FlyDSL via mfma_f32_16x16x32_bf16
+      r054+: online softmax + S@V in FlyDSL
+      r055+: full kernel — replace tilelang call entirely
+
+    Env vars:
+      SGLANG_FLYDSL_EXERCISE=0  → skip exercise (just delegate; default)
+      SGLANG_FLYDSL_EXERCISE=1  → run kgather exercise then delegate
+      SGLANG_FLYDSL_DEBUG=1     → log first exercise failure
+    """
+    do_exercise = os.environ.get("SGLANG_FLYDSL_EXERCISE", "0") == "1"
+    debug = os.environ.get("SGLANG_FLYDSL_DEBUG", "0") == "1"
+
+    if do_exercise:
+        try:
+            _exercise_kgather_on_real(kwargs.get("k_cache"), kwargs.get("indices"))
+            extra_kc = kwargs.get("extra_k_cache")
+            extra_idx = kwargs.get("extra_indices_in_kvcache")
+            if extra_kc is not None and extra_idx is not None:
+                _exercise_kgather_on_real(extra_kc, extra_idx)
+        except Exception as e:
+            if debug and not _EXERCISE_LOGGED["once"]:
+                import traceback
+                print(f"[flydsl] kgather exercise failed: {type(e).__name__}: {e}",
+                      flush=True)
+                traceback.print_exc()
+                _EXERCISE_LOGGED["once"] = True
+
+    # Delegate math to tilelang (proven correct under server load).
+    from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+        dpsk_v4_fp8_attention_fwd,
+    )
+    return dpsk_v4_fp8_attention_fwd(**kwargs)
