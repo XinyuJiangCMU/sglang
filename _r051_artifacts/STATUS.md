@@ -13,6 +13,33 @@ beats both tilelang AND triton across all batch sizes.
 4. Env-gated `SGLANG_FLYDSL_REAL=0` (default) delegates to tilelang for
    byte-equal correctness baseline.
 
+## Rounds 7-12: ALL kernel primitives validated ✅
+
+| # | Test | Result |
+|---|---|---|
+| 7  | `test_mfma_bf16_smoke.py` | mfma `v_mfma_f32_16x16x32_bf16` ISA + correct (32.0×256) |
+| 8  | `test_mfma_qk_correctness.py` | 16x16x32 Q@K^T 256/256 byte-exact |
+| 9  | `test_mfma_qk_full_d448.py` | full D=448 Q@K^T 8192/8192 byte-exact (14 K-tiles, 32 WGs) |
+| 10 | `test_fp8_dequant.py` | FP8 e4m3 dequant 256/256 byte-exact (bit ops in registers) |
+| 11 | `test_softmax_lds.py` | LDS-based cross-lane row softmax 256/256 within 1e-4 |
+| 12 | `test_micro_attention.py` | full Q@K → softmax → S@V in ONE kernel, 256/256 within 5e-3 |
+
+**All foundational primitives proven byte-exact / within bf16 tolerance.**
+
+**CDNA3 mfma lane layouts (validated this session):**
+
+`mfma_f32_16x16x32_bf16` (M=N=16, K=32):
+- A[m][k]: lane = (k/8)*16 + m, lane holds A[m, k_lo : k_lo+8] as bf16x8
+- B[n][k]: lane = (k/8)*16 + n, lane holds B[n, k_lo : k_lo+8] as bf16x8
+- C[m][n]: lane = (m/4)*16 + n, lane holds C[m_lo : m_lo+4, n] as f32x4
+  (col-fixed, 4 rows striding by N)
+
+`mfma_f32_16x16x16bf16_1k` (M=N=K=16, legacy gfx9 ABI):
+- A[m][k]: lane = (k/4)*16 + m, lane holds A[m, k_lo : k_lo+4]
+- B[n][k]: lane = (k/4)*16 + n, lane holds B[n, k_lo : k_lo+4]
+- C: same as above (col-fixed)
+- Inputs must be `vector<4xi16>` via `vector.bitcast` from `vector<4xbf16>`
+
 ## Round 6: FlyDSL kernel WIRED INTO dispatch path ✅
 
 `_dpsk_v4_fp8_attention_fwd_flydsl_real` no longer NotImplementedError.
