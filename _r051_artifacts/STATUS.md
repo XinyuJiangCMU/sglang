@@ -13,6 +13,26 @@ beats both tilelang AND triton across all batch sizes.
 4. Env-gated `SGLANG_FLYDSL_REAL=0` (default) delegates to tilelang for
    byte-equal correctness baseline.
 
+## Round 3 (incremental): weapon-1 on REAL DSv4 K cache ✅
+
+`_r051_artifacts/test_weapon1_on_real_kcache.py` — same verified
+weapon-1 kernel pattern, but with source tensor = real 216 MB DSv4 FP8
+K cache (shape `(2897, 128, 1, 584)`, captured from microbench pickle).
+
+Same ISA emitted: `buffer_load_dwordx4 v0, s[0:3], 0 offen lds`.
+Buffer resource descriptor handles real-tensor strides correctly:
+```asm
+s_mov_b32 s3, 0x27000     ; rsrc format bits
+s_mov_b32 s2, -1          ; rsrc num_records
+buffer_load_dwordx4 v0, s[0:3], 0 offen lds
+```
+
+ISA saved to `.humanize/round-051-flydsl-attention/w1real_test_kernel.isa.s`.
+
+This unblocks the real kernel implementation in round 4+: weapon-1 K
+cache gather will work on the actual DSv4 layout without further infra
+investigation.
+
 ## Round 2: WEAPON 1 emission verification  ✅
 
 **Decisive evidence that FlyDSL can emit `buffer_load_dwordx4 ... lds` on gfx950.**
