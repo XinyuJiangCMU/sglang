@@ -57,6 +57,16 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
 
         return dpsk_v4_fp8_attention_fwd(**kwargs)
 
+    if backend == "flydsl":
+        # r051: FlyDSL backend for dpsk_v4 sparse MLA decode attention.
+        # Stage 1 round 1: delegates to tilelang for correctness baseline.
+        # Stage 1 round 2+: real FlyDSL kernel (set SGLANG_FLYDSL_REAL=1).
+        from aiter.ops.flydsl.kernels.sparse_mla_decode import (
+            dpsk_v4_fp8_attention_fwd_flydsl,
+        )
+
+        return dpsk_v4_fp8_attention_fwd_flydsl(**kwargs)
+
     if backend == "triton":
         from sglang.srt.layers.attention.nsa.triton_decode import (
             triton_fp8_attention_fwd,
