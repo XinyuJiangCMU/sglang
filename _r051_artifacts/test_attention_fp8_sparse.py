@@ -81,6 +81,10 @@ def build_fp8_sparse():
     K_V_TILES_16 = BI // 16           # 4
     OUT_N_TILES = D_V // N_TILE       # 28
 
+    # softmax_scale (constant, baked-in for now; matches DSv4 default).
+    # DSv4 default: (1.0 / (D + D_tail))^0.5 ≈ 0.04419
+    SM_SCALE = 0.044194173824159216
+
     @flyc.kernel(name="attn_fp8_sparse_kernel")
     def kernel(
         q_tensor: fx.Tensor,         # bf16 [BS * M_HEADS * D]
@@ -183,6 +187,7 @@ def build_fp8_sparse():
             arith.constant(16, type=T.i32),
         )
         log2e = arith.constant(1.4426950408889634, type=T.f32)
+        sm_scale = arith.constant(SM_SCALE, type=T.f32)
         c_neg_inf = arith.constant(-1e30, type=T.f32)
         c_zero = arith.constant(0.0, type=T.f32)
         if_op = _scf.IfOp(is_worker, [], has_else=False)
@@ -192,7 +197,9 @@ def build_fp8_sparse():
             row_vals, cur_max = [], c_neg_inf
             for j in range_constexpr(BI):
                 idx = arith.addi(rb, arith.constant(j, type=T.i32))
-                v = _memref.load(s_lds_mr, [arith.index_cast(T.index, idx)])
+                v_raw = _memref.load(s_lds_mr, [arith.index_cast(T.index, idx)])
+                # Apply softmax_scale BEFORE max for online-softmax-compatible behavior
+                v = arith.mulf(v_raw, sm_scale)
                 row_vals.append(v)
                 cur_max = arith.maxnumf(cur_max, v)
             exp_vals, cur_sum = [], c_zero
@@ -260,8 +267,22 @@ def build_fp8_sparse():
                     v_fp8 = vc_i8.load(v_byte_off, vec_size=1)
                     v_raw = v_fp8.value if hasattr(v_fp8, "value") else v_fp8
                     v_u32 = arith.extui(T.i32, v_raw)
-                    # Scale (use scale_tile based on n_col, simplified to scale=7 = no shift)
-                    s_u32_v = arith.constant(7, type=T.i32)
+                    # Real per-NOPE_TILE V scale byte (matches K's scale layout).
+                    # V scale region begins at byte ROW_BYTES_V_FP8 in the V row.
+                    # Tile id within row = n_col // NOPE_TILE.
+                    v_scale_tile_id = arith.divui(
+                        n_col_raw, arith.constant(NOPE_TILE, type=T.i32)
+                    )
+                    v_scale_off = arith.addi(
+                        v_row_byte,
+                        arith.addi(
+                            arith.constant(ROW_BYTES_V_FP8, type=T.i32),
+                            v_scale_tile_id,
+                        ),
+                    )
+                    s_v_byte = vc_i8.load(v_scale_off, vec_size=1)
+                    s_v_raw = s_v_byte.value if hasattr(s_v_byte, "value") else s_v_byte
+                    s_u32_v = arith.extui(T.i32, s_v_raw)
                     v_bf16_bits = _dequant_fp8_to_bf16(v_u32, s_u32_v)
                     v_bf16_v = arith.bitcast(T.bf16, v_bf16_bits)
                     v_elems.append(v_bf16_v)
@@ -292,6 +313,54 @@ def build_fp8_sparse():
     return launch
 
 
+def _torch_dequant_fp8_to_bf16(fp8_bytes_u8: torch.Tensor, scale_bytes_u8: torch.Tensor) -> torch.Tensor:
+    """PyTorch reference for the same bit-level dequant the kernel does.
+    fp8_bytes_u8: any shape uint8.  scale_bytes_u8: broadcastable shape uint8.
+    Returns bf16 tensor of same shape as fp8_bytes_u8.
+    """
+    b = fp8_bytes_u8.to(torch.int64) & 0xFF
+    s = scale_bytes_u8.to(torch.int64) & 0xFF
+    sign_bf = (b & 0x80) << 8
+    exp_e4  = (b & 0x78) >> 3
+    mant_bf = (b & 0x7) << 4
+    exp_c   = exp_e4 + s - 7
+    bits = sign_bf | (exp_c << 7) | mant_bf
+    bits_u16 = (bits & 0xFFFF).to(torch.int16)
+    return bits_u16.view(torch.bfloat16)
+
+
+def _torch_reference(q_bf16, k_cache_u8, v_cache_u8, indices_i32, BS_KV, D, D_V,
+                     ROW_STRIDE_K, ROW_STRIDE_V, NOPE_TILE, SM_SCALE):
+    """Mirrors what the kernel does, in PyTorch, using identical dequant bits."""
+    BS, M_HEADS, _ = q_bf16.shape
+    _, BI = indices_i32.shape
+    NB = k_cache_u8.numel() // (BS_KV * ROW_STRIDE_K)
+    kc = k_cache_u8.view(NB, BS_KV, ROW_STRIDE_K)
+    vc = v_cache_u8.view(NB, BS_KV, ROW_STRIDE_V)
+
+    block_id = (indices_i32 // BS_KV).long()
+    in_block = (indices_i32 % BS_KV).long()
+    # Gather rows: shape (BS, BI, ROW_STRIDE_K)
+    k_rows = kc[block_id, in_block]
+    v_rows = vc[block_id, in_block]
+    # Split: first D bytes = FP8 packed; next bytes = scale region (NOPE_TILE scales)
+    k_fp8 = k_rows[:, :, :D]                  # (BS, BI, D) uint8
+    v_fp8 = v_rows[:, :, :D_V]
+    # Scale bytes (D / NOPE_TILE per row; broadcast to per-element).
+    k_scales_per_tile = k_rows[:, :, D:D + (D // NOPE_TILE)]   # (BS, BI, NUM_SCALES)
+    v_scales_per_tile = v_rows[:, :, D_V:D_V + (D_V // NOPE_TILE)]
+    # Broadcast scales across NOPE_TILE consecutive elements
+    k_scales = k_scales_per_tile.repeat_interleave(NOPE_TILE, dim=2)  # (BS, BI, D)
+    v_scales = v_scales_per_tile.repeat_interleave(NOPE_TILE, dim=2)
+    k_bf16 = _torch_dequant_fp8_to_bf16(k_fp8, k_scales).float()     # (BS, BI, D)
+    v_bf16 = _torch_dequant_fp8_to_bf16(v_fp8, v_scales).float()
+    # Q @ K^T → (BS, M_HEADS, BI). Scale BEFORE softmax (matches kernel).
+    s = torch.einsum("bhd,bnd->bhn", q_bf16.float(), k_bf16) * SM_SCALE
+    sm = torch.softmax(s, dim=-1)
+    o = torch.einsum("bhn,bnv->bhv", sm, v_bf16)
+    return o
+
+
 def main():
     torch.manual_seed(2)
     BS = int(os.environ.get("BS", "159"))
@@ -301,21 +370,65 @@ def main():
     NUM_M_WGS = M_HEADS // 16
     ROW_STRIDE_K = D + 8
     ROW_STRIDE_V = D_V + 8
+    NOPE_TILE_LOCAL = 64
+    SM_SCALE_LOCAL = 0.044194173824159216
 
     print(f"[fp8] BS={BS}, NB={NB}, M_HEADS={M_HEADS}", flush=True)
     launch = build_fp8_sparse()
 
     q = torch.randn(BS, M_HEADS, D, dtype=torch.bfloat16, device="cuda") * 0.05
-    k_cache = torch.randint(0, 256, (NB * BS_KV * ROW_STRIDE_K,), dtype=torch.uint8,
-                            device="cuda").to(torch.int8)
-    v_cache = torch.randint(0, 256, (NB * BS_KV * ROW_STRIDE_V,), dtype=torch.uint8,
-                            device="cuda").to(torch.int8)
+    # Build K/V cache rows = [packed FP8 (uint8)] + [scale bytes (7..14)] + pad.
+    # FP8 bytes can be full 0..255 (most produce finite bf16 with bounded scale).
+    # Scale bytes constrained to [7,14] so exp_combined = exp_e4 + scale - 7 ∈ [0,22] for safe bf16.
+    def _make_cache(num_rows: int, row_stride: int, data_bytes: int, scales_per_row: int):
+        rows_u8 = torch.randint(0, 256, (num_rows, row_stride), dtype=torch.uint8, device="cuda")
+        # Overwrite scale region with constrained values
+        rows_u8[:, data_bytes:data_bytes + scales_per_row] = torch.randint(
+            7, 15, (num_rows, scales_per_row), dtype=torch.uint8, device="cuda"
+        )
+        return rows_u8.reshape(-1)
+    k_cache_u8 = _make_cache(NB * BS_KV, ROW_STRIDE_K, D,   D // NOPE_TILE_LOCAL)
+    v_cache_u8 = _make_cache(NB * BS_KV, ROW_STRIDE_V, D_V, D_V // NOPE_TILE_LOCAL)
+    k_cache = k_cache_u8.view(torch.int8)
+    v_cache = v_cache_u8.view(torch.int8)
     indices = torch.randint(0, NB * BS_KV, (BS, BI), dtype=torch.int32, device="cuda")
     o = torch.zeros(BS, M_HEADS, D_V, dtype=torch.float32, device="cuda")
 
     launch(q.reshape(-1), k_cache, v_cache, indices.reshape(-1), o.reshape(-1), NUM_M_WGS, BS)
     torch.cuda.synchronize()
-    print("[fp8] kernel ran OK (no correctness validation — synthetic FP8 data)", flush=True)
+    print("[fp8] kernel ran OK", flush=True)
+
+    # ---- Correctness vs torch ref using SAME dequant bit formula ----
+    # Random FP8 bytes can produce inf/NaN bf16 (FP8 e4m3 has exp=0xF=NaN; combined
+    # with random scale bytes 0..255 can push exp_combined out of bf16 normal range).
+    # Filter NaN/inf positions for comparison; require everything else to match.
+    print("[fp8] computing torch reference (bit-identical dequant)...", flush=True)
+    o_ref = _torch_reference(q, k_cache_u8, v_cache_u8, indices, BS_KV, D, D_V,
+                             ROW_STRIDE_K, ROW_STRIDE_V, NOPE_TILE_LOCAL, SM_SCALE_LOCAL)
+    got, ref = o.cpu(), o_ref.cpu()
+    # Both kernel and torch ref use same bit formula → NaN/inf in same positions.
+    finite_mask = torch.isfinite(got) & torch.isfinite(ref)
+    n_finite = finite_mask.sum().item()
+    n_total = got.numel()
+    print(f"[fp8] finite positions: {n_finite}/{n_total} ({100*n_finite/n_total:.1f}%)",
+          flush=True)
+    diff = (got - ref).abs()
+    diff_finite = diff[finite_mask]
+    print(f"[fp8] max abs diff (finite): {diff_finite.max().item():.6e}", flush=True)
+    print(f"[fp8] mean abs diff (finite): {diff_finite.mean().item():.6e}", flush=True)
+    tol = 1e-2
+    n_within = (diff_finite < tol).sum().item()
+    pct = 100 * n_within / n_finite if n_finite > 0 else 0
+    print(f"[fp8] {n_within}/{n_finite} ({pct:.2f}%) finite within abs tol {tol}", flush=True)
+    if pct < 99.0:
+        print(f"[fp8] CORRECTNESS FAIL", flush=True)
+        bad_mask = finite_mask & (diff >= tol)
+        bad = bad_mask.nonzero()[:5]
+        for b_, m_, d_ in bad.tolist():
+            print(f"   o[{b_},{m_},{d_}] got={got[b_,m_,d_]:.4e} ref={ref[b_,m_,d_]:.4e}",
+                  flush=True)
+        sys.exit(2)
+    print(f"[fp8] CORRECTNESS PASS (finite positions match within {tol})", flush=True)
 
     # Bench
     for _ in range(10):
