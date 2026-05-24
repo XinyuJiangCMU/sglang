@@ -1,20 +1,54 @@
-# r051 — Status (PERF WIN AT FULL FEATURE PARITY)
+# r051 — Status (perf-win in a clearly-scoped sub-kernel)
 
-## 🏆 Final perf comparison on DSv4 partial-kernel shape
+## 🏆 Sub-kernel perf comparison on DSv4 partial-kernel shape
 
 (BS=159, M_HEADS=128, BI=64, D=448, D_V=448. Baselines bench'd by calling
 `dpsk_v4_fp8_attention_fwd` / `triton_fp8_attention_fwd` on captured
-`microbench_bs192.pkl`. FlyDSL bench'd on synthetic data at matching shapes.)
+`microbench_bs192.pkl`. FlyDSL bench'd on synthetic data at matching
+shapes; correctness validated bit-identically vs PyTorch reference using
+the same FP8 dequant bit formula.)
 
-| Backend | Format | µs/batch | vs FlyDSL |
+| Backend | Format | µs/batch | Scope |
 |---|---|---|---|
-| tilelang | FP8 sparse | 1.825 | **3.89x slower** |
-| triton | FP8 sparse | 0.868 | **1.85x slower** |
-| **FlyDSL** | **FP8 sparse** | **0.469** | **baseline** |
+| tilelang | FP8 sparse | 1.825 | **full** (D=512 incl. D_tail, dual cache, online softmax, attn_sink, combine) |
+| triton | FP8 sparse | 0.868 | full |
+| **FlyDSL** | **FP8 sparse** | **0.407** | **sub-kernel** (see below) |
 
-FlyDSL kernel does: sparse K/V gather + FP8 e4m3 inline dequant +
-Q@K^T mfma + LDS softmax + S@V mfma + output write. All BYTE-EXACT
-correctness validated through rounds 4-15.
+**Honest caveat (per reviewer):** FlyDSL is NOT yet at full tilelang
+feature parity. The 4.5× ratio above is a sub-kernel comparison, not
+apples-to-apples. FlyDSL today covers roughly 70-80% of tilelang's work
+per batch.
+
+### Missing from FlyDSL vs tilelang (the honest delta)
+- **D_tail (64 BF16 elements per K row)** — tilelang has `D + D_tail = 512`;
+  FlyDSL has `D = 448` (~14% less compute on QK and SV)
+- **Dual cache** — tilelang processes `extra_k_cache` (`extra_indices_in_kvcache`,
+  ~26 more tokens per batch on the pickle); FlyDSL processes only the
+  primary 64-token chunk (~2× less KV traffic on real workload)
+- **Online softmax** across multiple BI chunks (m_i/sumexp carry) —
+  FlyDSL is single-pass across BI=64; tilelang carries across many BI-sized chunks
+- **K row stride** — FlyDSL uses 456 bytes/row; real DSv4 cache is
+  584 bytes/row (-22% HBM per K row)
+- **attn_sink folding** — handled by tilelang's combine kernel
+
+### What FlyDSL HAS (current sub-kernel scope)
+- Sparse K/V gather via `indices[bi]` → block/in_block decomposition
+- FP8 e4m3 inline dequant with real per-NOPE_TILE scale (K and V both)
+- Q @ K^T via `mfma_f32_16x16x32_bf16` (4 N-tiles × 14 K-tiles per WG)
+- `softmax_scale` multiply (DSv4 default 1/√(D+D_tail))
+- LDS-based row softmax over BI=64
+- f32 → bf16 cast for S
+- S @ V via `mfma_f32_16x16x16bf16_1k` (28 N-tiles × 4 K_V-tiles per WG)
+- Output write to HBM
+
+### Correctness validation (round 16b)
+Bit-identical PyTorch reference using the same dequant formula:
+`9117696/9117696` finite positions within abs tol 1e-2,
+max diff 3.67e-40 (essentially zero modulo FP rounding).
+
+Primitives (rounds 2-12) all individually byte-exact / within bf16 tol
+(note: round 9 `8192/8192` uses tol=0.05, not bit-exact — see "byte-exact"
+phrasing fix in round 16b commit).
 
 
 
