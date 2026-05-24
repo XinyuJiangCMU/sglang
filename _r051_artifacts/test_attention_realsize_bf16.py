@@ -63,10 +63,11 @@ def build_attention():
     K_MFMA = 32
     BI = 64
     D = 448
-    D_V = 16
-    N_SUBTILES = BI // N_TILE   # 4
-    K_TILES = D // K_MFMA        # 14
-    K_V_TILES_16 = BI // 16      # 4 (for S@V using mfma 16x16x16)
+    D_V = 448           # real DSv4 output dim
+    N_SUBTILES = BI // N_TILE       # 4 (QK side)
+    K_TILES = D // K_MFMA            # 14
+    K_V_TILES_16 = BI // 16          # 4 (for S@V using mfma 16x16x16)
+    OUT_N_TILES = D_V // N_TILE      # 28 (output sub-tiles in D_V direction)
 
     @flyc.kernel(name="attn_real_bf16_kernel")
     def kernel(
@@ -198,52 +199,54 @@ def build_attention():
 
         # ======================================================
         # Step 5: S @ V using mfma_f32_16x16x16bf16_1k
-        # S is 16xBI (M_TILE x 64), V is BIxD_V (64x16) → O is 16xD_V (16x16)
-        # K_v_tiles = BI / 16 = 4
+        # S is 16xBI (M_TILE x 64), V is BIxD_V (64x448) → O is 16xD_V (16x448)
+        # Loop over OUT_N_TILES=28 output sub-tiles in D_V direction; for each,
+        # do K_V_TILES_16=4 mfma's accumulating into a per-tile o_acc, then
+        # write 16x16 tile to HBM.
         # ======================================================
         i16x4_t = T.vec(4, T.i16)
         bf16x4_t = T.vec(4, T.bf16)
-        o_acc = _vector.broadcast(f32x4_t, zero_f32)
-
         m_a = tid % fx.Int32(16)
         n_b = tid % fx.Int32(16)
         k_lo_16 = (tid // fx.Int32(16)) * fx.Int32(4)
-
-        for k_tile_v in range_constexpr(K_V_TILES_16):
-            # A (S) frag: 4 bf16 at S_bf16[m_a, k_lo_16+0..3] with k_offset=k_tile_v*16
-            a_elems = []
-            for el in range_constexpr(4):
-                col = fx.Int32(k_tile_v * 16) + k_lo_16 + fx.Int32(el)
-                ix = m_a * fx.Int32(BI) + col
-                ix_raw = ix.value if hasattr(ix, "value") else ix
-                ix_ix = arith.index_cast(T.index, ix_raw)
-                a_elems.append(_memref.load(s_bf16_mr, [ix_ix]))
-            a_frag = _vector.from_elements(bf16x4_t, a_elems)
-            a_i16 = _vector.bitcast(i16x4_t, a_frag)
-
-            # B (V) frag: lane (k_lo/4)*16 + n_b holds V[k_lo:k_lo+4, n_b]
-            # V is shape (BI, D_V) row-major, so V[k, n] = v_flat[k * D_V + n].
-            # 4 scalar loads at stride D_V=16.
-            v_elems = []
-            for el in range_constexpr(4):
-                k_row = fx.Int32(k_tile_v * 16) + k_lo_16 + fx.Int32(el)
-                v_off_el = k_row * fx.Int32(D_V) + n_b
-                v_elems.append(v_.load(v_off_el, vec_size=1))
-            v_frag = _vector.from_elements(bf16x4_t, v_elems)
-            v_i16 = _vector.bitcast(i16x4_t, v_frag)
-
-            o_acc = rocdl.mfma_f32_16x16x16bf16_1k(
-                f32x4_t, [a_i16, v_i16, o_acc, 0, 0, 0]
-            )
-
-        # Write O (col-fixed lane layout) to HBM
         m_lo_o = (tid // fx.Int32(16)) * fx.Int32(4)
         n_o = tid % fx.Int32(16)
-        for el in range_constexpr(4):
-            scalar = _vector.extract(o_acc, static_position=[el], dynamic_position=[])
-            global_m_el = m_block * fx.Int32(M_TILE) + m_lo_o + fx.Int32(el)
-            o_off = global_m_el * fx.Int32(D_V) + n_o
-            o_.store(o_off, scalar, vec_size=1)
+
+        for out_n in range_constexpr(OUT_N_TILES):
+            o_acc = _vector.broadcast(f32x4_t, zero_f32)
+            for k_tile_v in range_constexpr(K_V_TILES_16):
+                # A (S) frag — same for every out_n
+                a_elems = []
+                for el in range_constexpr(4):
+                    col = fx.Int32(k_tile_v * 16) + k_lo_16 + fx.Int32(el)
+                    ix = m_a * fx.Int32(BI) + col
+                    ix_raw = ix.value if hasattr(ix, "value") else ix
+                    ix_ix = arith.index_cast(T.index, ix_raw)
+                    a_elems.append(_memref.load(s_bf16_mr, [ix_ix]))
+                a_frag = _vector.from_elements(bf16x4_t, a_elems)
+                a_i16 = _vector.bitcast(i16x4_t, a_frag)
+
+                # B (V) frag: V[k_lo+0..3, out_n*16 + n_b]
+                v_elems = []
+                for el in range_constexpr(4):
+                    k_row = fx.Int32(k_tile_v * 16) + k_lo_16 + fx.Int32(el)
+                    n_col = fx.Int32(out_n * 16) + n_b
+                    v_off_el = k_row * fx.Int32(D_V) + n_col
+                    v_elems.append(v_.load(v_off_el, vec_size=1))
+                v_frag = _vector.from_elements(bf16x4_t, v_elems)
+                v_i16 = _vector.bitcast(i16x4_t, v_frag)
+
+                o_acc = rocdl.mfma_f32_16x16x16bf16_1k(
+                    f32x4_t, [a_i16, v_i16, o_acc, 0, 0, 0]
+                )
+
+            # Write this 16x16 sub-tile to HBM
+            for el in range_constexpr(4):
+                scalar = _vector.extract(o_acc, static_position=[el], dynamic_position=[])
+                global_m_el = m_block * fx.Int32(M_TILE) + m_lo_o + fx.Int32(el)
+                global_n_el = fx.Int32(out_n * 16) + n_o
+                o_off = global_m_el * fx.Int32(D_V) + global_n_el
+                o_.store(o_off, scalar, vec_size=1)
 
     @flyc.jit
     def launch(q_t, k_t, v_t, o_t, num_m_wgs: fx.Int32):
@@ -264,7 +267,7 @@ def main():
     M = 128
     BI = 64
     D = 448
-    D_V = 16
+    D_V = 448
     M_TILE = 16
     NUM_M_WGS = M // M_TILE
 
