@@ -57,15 +57,40 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
 
         return dpsk_v4_fp8_attention_fwd(**kwargs)
 
-    if backend == "flydsl":
-        # r051: FlyDSL backend for dpsk_v4 sparse MLA decode attention.
-        # Stage 1 round 1: delegates to tilelang for correctness baseline.
-        # Stage 1 round 2+: real FlyDSL kernel (set SGLANG_FLYDSL_REAL=1).
-        from aiter.ops.flydsl.kernels.sparse_mla_decode import (
-            dpsk_v4_fp8_attention_fwd_flydsl,
+    if backend == "flydsl_kgather_only":
+        # AMD gfx950 only. This backend does NOT change attention math —
+        # it exercises a FlyDSL weapon-1 (`buffer_load_dwordx4 ... lds`)
+        # K-gather kernel against the live K cache when
+        # `SGLANG_FLYDSL_EXERCISE=1`, then delegates the actual math to
+        # the production TileLang backend. See
+        # `sglang.srt.layers.attention.nsa.flydsl_kernel` for the full
+        # scope discussion and missing pieces (D_tail, dual cache,
+        # online softmax across iter, attn_sink folding) that block
+        # productionizing the standalone full kernel.
+        from sglang.srt.layers.attention.nsa.flydsl_kernel import (
+            dpsk_v4_fp8_attention_fwd_flydsl_kgather_only,
+            is_flydsl_kgather_available,
         )
 
-        return dpsk_v4_fp8_attention_fwd_flydsl(**kwargs)
+        ok, reason = is_flydsl_kgather_available()
+        if not ok:
+            # Clean fallback to TileLang on systems without FlyDSL/AITER
+            # or on unsupported arches. Surface the reason once so that
+            # misconfiguration is debuggable.
+            import warnings
+
+            warnings.warn(
+                f"FlyDSL kgather backend unavailable ({reason}); "
+                f"falling back to TileLang backend.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+                dpsk_v4_fp8_attention_fwd,
+            )
+
+            return dpsk_v4_fp8_attention_fwd(**kwargs)
+        return dpsk_v4_fp8_attention_fwd_flydsl_kgather_only(**kwargs)
 
     if backend == "triton":
         from sglang.srt.layers.attention.nsa.triton_decode import (
