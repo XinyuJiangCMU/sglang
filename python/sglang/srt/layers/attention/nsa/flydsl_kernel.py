@@ -35,6 +35,7 @@ Environment flags (all default off; production-safe):
 from __future__ import annotations
 
 import os
+import threading
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -82,12 +83,10 @@ def is_flydsl_kgather_available() -> Tuple[bool, str]:
         return False, f"flydsl package not importable: {e}"
     try:
         # tensor_shim isn't a normal top-level import — it lives next to
-        # aiter's flydsl kernels. We try the canonical path first and only
-        # fall back to a sys.path hack if the canonical layout is absent.
-        try:
-            from aiter.ops.flydsl.kernels.tensor_shim import GTensor  # noqa: F401
-        except ImportError:
-            from .flydsl_tensor_shim import GTensor  # type: ignore  # noqa: F401
+        # aiter's flydsl kernels. We require the canonical aiter path; we
+        # don't vendor a fallback shim inside sglang so users always see a
+        # clear error if aiter is missing.
+        from aiter.ops.flydsl.kernels.tensor_shim import GTensor  # noqa: F401
     except ImportError as e:
         return False, f"aiter FlyDSL tensor_shim missing: {e}"
     return True, ""
@@ -98,9 +97,20 @@ def is_flydsl_kgather_available() -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 # Kernel cache keyed by (ROW_BYTES, BYTES_PER_LOAD) so the same compiled
-# kernel is reused across layers/decode steps.
+# kernel is reused across layers/decode steps. Guarded by a lock so two
+# decode workers cannot race on first compile (kernel build takes seconds;
+# duplicate compiles would block the request path).
 _KGATHER_KERNEL_CACHE: dict[Tuple[int, int], Any] = {}
-_EXERCISE_LOGGED = {"once": False}
+_KGATHER_KERNEL_LOCK = threading.Lock()
+
+# Scratch buffer cache so the kgather exercise doesn't allocate every call.
+# Keyed by (device_index, grid_x, packed_w_bytes).
+_KGATHER_SCRATCH_CACHE: dict[Tuple[int, int, int], torch.Tensor] = {}
+
+# Single-shot logging — capability/feature failures are logged once per
+# unique reason so a misconfigured deploy doesn't spam the request path.
+_LOGGED_FEATURE_REJECTIONS: set[str] = set()
+_LOGGED_EXERCISE_FAILURE: dict[str, bool] = {"once": False}
 
 
 def _build_kgather_kernel(row_bytes: int, bytes_per_load: int):
@@ -123,12 +133,9 @@ def _build_kgather_kernel(row_bytes: int, bytes_per_load: int):
     from flydsl.runtime.device import get_rocm_arch
     from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-    try:
-        from aiter.ops.flydsl.kernels.tensor_shim import GTensor
-    except ImportError:
-        # Local vendored fallback (kept thin — only what we need at compile
-        # time inside @flyc.kernel).
-        from .flydsl_tensor_shim import GTensor  # type: ignore
+    # tensor_shim is provided by aiter. The capability check has already
+    # confirmed availability — this import should not raise here.
+    from aiter.ops.flydsl.kernels.tensor_shim import GTensor
 
     # Only the widths we'll ever use. buffer_load_to_lds supports
     # 1/2/4/8/12/16 byte widths but the AMDGPU LLVM backend has lowering
@@ -228,12 +235,22 @@ def _build_kgather_kernel(row_bytes: int, bytes_per_load: int):
 
 
 def _get_kgather_kernel(row_bytes: int, bytes_per_load: int):
+    """Return a compiled kgather kernel, building (and caching) on first call.
+
+    Thread-safe: a coarse lock around the build serializes first-call
+    compilation across decode workers within a single process.
+    """
     key = (row_bytes, bytes_per_load)
     cached = _KGATHER_KERNEL_CACHE.get(key)
-    if cached is None:
-        cached = _build_kgather_kernel(row_bytes, bytes_per_load)
-        _KGATHER_KERNEL_CACHE[key] = cached
-    return cached
+    if cached is not None:
+        return cached
+    with _KGATHER_KERNEL_LOCK:
+        # Re-check after lock acquisition.
+        cached = _KGATHER_KERNEL_CACHE.get(key)
+        if cached is None:
+            cached = _build_kgather_kernel(row_bytes, bytes_per_load)
+            _KGATHER_KERNEL_CACHE[key] = cached
+        return cached
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +266,44 @@ _PACKED_W_BYTES = 576
 _PACKED_W_FULL_BYTES = 584
 
 
+def _check_kgather_supported(
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> Tuple[bool, str]:
+    """Soft capability check — no exceptions raised on the request path.
+
+    Returns ``(ok, reason)``. Callers should log_once on the rejection
+    reason and skip the exercise (the underlying TileLang math path is
+    unaffected).
+    """
+    if k_cache is None or indices is None:
+        return False, "k_cache or indices is None"
+    if k_cache.dtype.itemsize != 1:
+        return False, f"k_cache dtype {k_cache.dtype} is not 1-byte (FP8)"
+    if k_cache.ndim != 4:
+        return False, f"k_cache must be 4D, got shape={tuple(k_cache.shape)}"
+    nb, bs_kv, h_kv, packed_w_full = k_cache.shape
+    if h_kv != 1:
+        return False, f"H_KV={h_kv} unsupported (kgather assumes MQA layout)"
+    if packed_w_full != _PACKED_W_FULL_BYTES:
+        return False, (
+            f"K cache packed width {packed_w_full} != expected "
+            f"{_PACKED_W_FULL_BYTES} (PACKED_W={_PACKED_W_BYTES} + SCALE_W=8)"
+        )
+    if not k_cache.is_contiguous():
+        return False, "k_cache is non-contiguous (would require 200+ MB copy)"
+    if indices.ndim != 3:
+        return False, f"indices must be 3D, got shape={tuple(indices.shape)}"
+    bs, s_q, topk = indices.shape
+    if s_q != 1:
+        return False, f"decode expects S_Q=1, got S_Q={s_q}"
+    if indices.dtype != torch.int32:
+        return False, f"indices dtype must be int32, got {indices.dtype}"
+    if bs * topk == 0:
+        return False, f"empty workload (BS={bs}, TOPK={topk})"
+    return True, ""
+
+
 def _exercise_kgather_on_real(
     k_cache: torch.Tensor,
     indices: torch.Tensor,
@@ -261,48 +316,24 @@ def _exercise_kgather_on_real(
     pipeline functions under real server load (CUDA graph capture / replay,
     concurrent decode requests, real HBM pressure).
 
-    Layout assumptions are asserted up-front rather than silently skipped
-    so unexpected shapes surface immediately during integration testing.
+    Layout is assumed to have been validated via ``_check_kgather_supported``
+    before calling — this function will raise if it's wrong, which the
+    request-path wrapper catches.
     """
-    if k_cache is None or indices is None:
-        return
-    assert k_cache.dtype.itemsize == 1, (
-        f"expected 1-byte FP8 K cache, got dtype={k_cache.dtype}"
-    )
-    assert k_cache.ndim == 4, f"k_cache must be 4D, got shape={tuple(k_cache.shape)}"
-    nb, bs_kv, h_kv, packed_w_full = k_cache.shape
-    assert h_kv == 1, (
-        f"DSv4 K cache uses H_KV=1 (MQA); got H_KV={h_kv}. Multi-head KV "
-        f"layouts are not supported yet."
-    )
-    assert packed_w_full == _PACKED_W_FULL_BYTES, (
-        f"unexpected K cache packed width {packed_w_full}, expected "
-        f"{_PACKED_W_FULL_BYTES} (PACKED_W={_PACKED_W_BYTES} + SCALE_W=8)"
-    )
+    nb, bs_kv, _, packed_w_full = k_cache.shape
 
-    assert indices.ndim == 3, f"indices must be 3D, got shape={tuple(indices.shape)}"
-    bs, s_q, topk = indices.shape
-    assert s_q == 1, f"decode expects S_Q=1, got S_Q={s_q}"
-    assert indices.dtype == torch.int32, (
-        f"indices dtype must be int32, got {indices.dtype}"
-    )
-
-    # Per-row byte offsets: rows are (batch, k_idx) pairs. We only gather
-    # the packed region here; the scale region is a separate cooperative
-    # load in the full kernel (not needed for the exercise).
-    #
     # Layout note: the K cache is laid out as
     #   (NB, BS_KV, H_KV=1, packed_w_full=584)
     # where each token occupies *packed_w_full* contiguous bytes (576-byte
-    # packed FP8 + 8-byte scale region). So the in-block stride between
+    # packed FP8 + 8-byte scale region). The in-block stride between
     # adjacent tokens is `packed_w_full`, NOT _PACKED_W_BYTES — using the
     # latter would skip the 8-byte scale region of the previous token and
     # read shifted (incorrect) data for in_block > 0.
     idx_flat = indices.reshape(-1)
-    # Clip invalid indices to a safe in-range value — captured pickles have
-    # sentinel values (negative or >= NB*BS_KV) for padding slots. The math
-    # path masks these via `topk_length`, but our buffer load needs a valid
-    # offset to avoid OOB reads.
+    # Clip invalid indices to a safe in-range value — captured pickles
+    # have sentinel values (negative or >= NB*BS_KV) for padding slots.
+    # The math path masks these via `topk_length`, but our buffer load
+    # needs a valid offset to avoid OOB reads.
     max_token = nb * bs_kv - 1
     idx_clipped = torch.clamp(idx_flat, min=0, max=max_token)
     block_id = idx_clipped // bs_kv
@@ -313,26 +344,23 @@ def _exercise_kgather_on_real(
     ).to(torch.int32).contiguous()
 
     grid_x = row_byte_offsets.numel()
-
-    # Treat the K cache as a flat i8 byte buffer for the gather kernel. The
-    # cache is already contiguous in the standard server layout; if a callsite
-    # ever passes a non-contiguous view, .contiguous() here would copy ~200 MB
-    # per decode step — we detect that case and bail rather than copying.
-    if not k_cache.is_contiguous():
-        # Honest failure: do nothing, surface via debug log.
-        raise RuntimeError("k_cache is non-contiguous; refusing to copy 200+ MB")
     k_cache_i8 = k_cache.view(torch.int8).reshape(-1)
 
-    # Scratch buffer is throwaway — kernel writes here so dead-code-elim
-    # cannot remove the load. Allocate per-call (small relative to K cache).
-    packed_scratch = torch.empty(
-        grid_x * _PACKED_W_BYTES,
-        dtype=torch.int8,
-        device=k_cache.device,
-    )
+    # Scratch buffer cache by (device, grid_x, width) to avoid per-call
+    # allocation. The buffer is read-only after the kernel (we discard
+    # the output), so it's safe to reuse across calls.
+    scratch_key = (k_cache.device.index or 0, grid_x, _PACKED_W_BYTES)
+    scratch = _KGATHER_SCRATCH_CACHE.get(scratch_key)
+    if scratch is None:
+        scratch = torch.empty(
+            grid_x * _PACKED_W_BYTES,
+            dtype=torch.int8,
+            device=k_cache.device,
+        )
+        _KGATHER_SCRATCH_CACHE[scratch_key] = scratch
 
     launch = _get_kgather_kernel(_PACKED_W_BYTES, 16)
-    launch(k_cache_i8, row_byte_offsets, packed_scratch, grid_x)
+    launch(k_cache_i8, row_byte_offsets, scratch, grid_x)
 
     if do_sync:
         torch.cuda.synchronize()
@@ -341,6 +369,32 @@ def _exercise_kgather_on_real(
 # ---------------------------------------------------------------------------
 # Backend entry point
 # ---------------------------------------------------------------------------
+
+def _log_once(reason: str, *, debug: bool) -> None:
+    """One-shot stderr log per unique reason. No-op outside debug mode."""
+    if not debug:
+        return
+    if reason in _LOGGED_FEATURE_REJECTIONS:
+        return
+    _LOGGED_FEATURE_REJECTIONS.add(reason)
+    import sys
+
+    print(f"[flydsl_kgather_only] {reason}", file=sys.stderr, flush=True)
+
+
+@lru_cache(maxsize=1)
+def _env_flags() -> Tuple[bool, bool, bool]:
+    """Snapshot env flags once per process.
+
+    Returns ``(do_exercise, debug, do_sync)``. Cached so we don't pay
+    ``os.environ`` lookup on every layer's attention call.
+    """
+    return (
+        os.environ.get("SGLANG_FLYDSL_EXERCISE", "0") == "1",
+        os.environ.get("SGLANG_FLYDSL_DEBUG", "0") == "1",
+        os.environ.get("SGLANG_FLYDSL_DEBUG_SYNC", "0") == "1",
+    )
+
 
 def dpsk_v4_fp8_attention_fwd_flydsl_kgather_only(
     *,
@@ -363,42 +417,70 @@ def dpsk_v4_fp8_attention_fwd_flydsl_kgather_only(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """FlyDSL kgather-only backend.
 
-    Runs the FlyDSL weapon-1 K-gather kernel against the primary K cache
-    (and ``extra_k_cache`` if present) when ``SGLANG_FLYDSL_EXERCISE=1``,
-    then delegates the actual attention math to the production TileLang
-    backend. Returns the TileLang backend's ``(output, lse)`` tuple
-    unchanged.
+    When ``SGLANG_FLYDSL_EXERCISE=1`` and the cache layout / indices pass
+    ``_check_kgather_supported``, runs the FlyDSL weapon-1 K-gather kernel
+    against the primary K cache (and ``extra_k_cache`` if present) as a
+    smoke exercise, then **delegates all attention math to the production
+    TileLang backend**.
 
-    This entry point is intentionally NOT a full FlyDSL kernel — see the
-    module docstring for the missing pieces. It exists so that the FlyDSL
-    pipeline can be exercised under real server load in a production
-    build without changing the model's numerical behavior.
+    The model's numerical output is identical to running with
+    ``SGLANG_HACK_FLASHMLA_BACKEND=tilelang`` directly. This entry point
+    is intentionally not a full FlyDSL kernel — see the module docstring
+    for the missing pieces.
     """
-    do_exercise = os.environ.get("SGLANG_FLYDSL_EXERCISE", "0") == "1"
-    debug = os.environ.get("SGLANG_FLYDSL_DEBUG", "0") == "1"
-    do_sync = os.environ.get("SGLANG_FLYDSL_DEBUG_SYNC", "0") == "1"
+    do_exercise, debug, do_sync = _env_flags()
 
     if do_exercise:
-        try:
-            _exercise_kgather_on_real(k_cache, indices, do_sync=do_sync)
-            if extra_k_cache is not None and extra_indices_in_kvcache is not None:
-                _exercise_kgather_on_real(
-                    extra_k_cache, extra_indices_in_kvcache, do_sync=do_sync
-                )
-        except Exception as e:
-            # Don't crash the request path — log once, then fall through.
-            if debug and not _EXERCISE_LOGGED["once"]:
-                import traceback
+        ok, reason = _check_kgather_supported(k_cache, indices)
+        if ok:
+            try:
+                _exercise_kgather_on_real(k_cache, indices, do_sync=do_sync)
+            except Exception as e:  # pragma: no cover - defensive
+                if debug and not _LOGGED_EXERCISE_FAILURE["once"]:
+                    import sys
+                    import traceback
 
-                print(
-                    f"[flydsl_kgather_only] exercise failed: "
-                    f"{type(e).__name__}: {e}",
-                    flush=True,
-                )
-                traceback.print_exc()
-                _EXERCISE_LOGGED["once"] = True
+                    print(
+                        f"[flydsl_kgather_only] primary exercise failed: "
+                        f"{type(e).__name__}: {e}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    traceback.print_exc()
+                    _LOGGED_EXERCISE_FAILURE["once"] = True
+        else:
+            _log_once(f"primary kgather skipped: {reason}", debug=debug)
 
-    # Math delegates to TileLang (production-validated).
+        if extra_k_cache is not None and extra_indices_in_kvcache is not None:
+            ok2, reason2 = _check_kgather_supported(
+                extra_k_cache, extra_indices_in_kvcache
+            )
+            if ok2:
+                try:
+                    _exercise_kgather_on_real(
+                        extra_k_cache,
+                        extra_indices_in_kvcache,
+                        do_sync=do_sync,
+                    )
+                except Exception as e:  # pragma: no cover - defensive
+                    if debug and not _LOGGED_EXERCISE_FAILURE["once"]:
+                        import sys
+                        import traceback
+
+                        print(
+                            f"[flydsl_kgather_only] extra exercise failed: "
+                            f"{type(e).__name__}: {e}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        traceback.print_exc()
+                        _LOGGED_EXERCISE_FAILURE["once"] = True
+            else:
+                _log_once(f"extra kgather skipped: {reason2}", debug=debug)
+
+    # Math delegates to TileLang (production-validated). The kgather
+    # exercise above does not change the math; we always return TileLang's
+    # output unchanged.
     from sglang.srt.layers.attention.nsa.tilelang_kernel import (
         dpsk_v4_fp8_attention_fwd,
     )

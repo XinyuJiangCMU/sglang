@@ -1,57 +1,55 @@
-# FlyDSL DSv4 sparse MLA decode — benchmarks (AMD gfx950)
+# FlyDSL K-gather benchmark (AMD gfx950)
 
-WIP benchmarks for the FlyDSL backend of `dpsk_v4_fp8_attention_fwd`.
+Standalone microbenchmark for the FlyDSL weapon-1 K-gather kernel used by
+the production-integrated `flydsl_kgather_only` backend.
 
-**Scope:** these scripts measure the standalone FlyDSL kernels. They do
-**not** measure end-to-end server latency. The kernel that beats TileLang
-on the standalone benchmark is **not** yet wired into the production
-dispatch path — see [`docs/developer_guide/amd_flydsl_sparse_mla.md`](
-../../docs/developer_guide/amd_flydsl_sparse_mla.md) for what's
-production-integrated today vs. what's prototype-only.
+This directory contains a **single** benchmark script. It measures the
+kgather kernel only — the same code path that runs inside the production
+backend when `SGLANG_FLYDSL_EXERCISE=1`.
 
-| Script | What it measures |
+| Script | Measures |
 |---|---|
-| `bench_kgather.py` | FlyDSL weapon-1 K-gather kernel (standalone). Production-integrated as `flydsl_kgather_only` backend. |
-| `bench_subkernel_fp8.py` | Prototype full FP8 sparse attention sub-kernel (NOT yet integrated). Reports the "0.4 µs/batch" headline number — sub-kernel scope, not feature parity with TileLang. |
-| `bench_compare_baselines.py` | Times TileLang + Triton on the same captured pickle for side-by-side comparison. |
+| `bench_kgather.py` | Median + p90 per-call latency of the FlyDSL weapon-1 K-gather kernel; effective HBM bandwidth. |
 
-## Hardware requirements
+There are **no end-to-end FlyDSL attention numbers in this PR**. An
+earlier draft contained a prototype standalone full sub-kernel
+benchmark, but its V dequant path was structurally wrong for DSv4 (it
+read from a synthetic separate V cache with a hardcoded scale byte,
+whereas real DSv4 uses `V == K` with the same per-NOPE_TILE scale —
+see `tilelang_kernel.py:1849-1860`). That prototype was removed
+because its µs/batch number is not meaningful as a production comparison.
 
-- AMD MI355X / gfx950
-- `flydsl` Python package
-- `aiter` Python package (provides `tensor_shim.GTensor`)
+## Hardware
+
+- AMD MI355X / **gfx950**
 - ROCm 6.x
+- `flydsl` + `aiter` Python packages installed
 
-## Running
+## Run
 
 ```bash
-# Standalone kgather perf (cheap, no pickle needed)
 python3 benchmark/sparse_mla_decode_flydsl/bench_kgather.py
-
-# Prototype FP8 sub-kernel perf (no correctness vs TileLang — scope mismatch)
-python3 benchmark/sparse_mla_decode_flydsl/bench_subkernel_fp8.py
-
-# Side-by-side TileLang + Triton baselines on a captured pickle
-SGLANG_FLYDSL_TEST_PICKLE=/path/to/microbench_bs192.pkl \
-  python3 benchmark/sparse_mla_decode_flydsl/bench_compare_baselines.py
 ```
 
-## Honest scope
+CLI flags (all optional, see `--help`):
 
-The prototype sub-kernel does **not** include:
+- `--nb`, `--bs-kv`, `--packed-w-full`, `--packed-w` — K cache shape
+  (defaults match captured DSv4-Pro `bs=192` decode workload)
+- `--bs`, `--topk` — workload size
+- `--warmup` (default 20), `--iters` (default 200), `--samples`
+  (default 10) — timing methodology
 
-- `D_tail` (64 BF16 elements per K row; -14% compute)
-- `extra_k_cache` / `extra_indices_in_kvcache` (dual cache; ~2× more KV traffic on real workload)
-- Online softmax across multiple BI chunks (m_i / sumexp carry)
-- `attn_sink` folding (handled by TileLang's combine kernel)
-- Partial_O / Partial_LSE emission + combine kernel
+## What "perf" means here
 
-So a sub-kernel µs-per-batch number is not directly comparable to
-TileLang's full `dpsk_v4_fp8_attention_fwd` µs-per-batch number. Treat
-them as evidence the FlyDSL toolchain can hit competitive perf at the
-sub-kernel level, not as a production speedup claim.
+The kgather kernel does **not** change attention math. It only gathers
+sparse K-cache rows into a scratch buffer and is run in production by
+the `flydsl_kgather_only` backend as a smoke test that the FlyDSL
+toolchain functions under real server load (CUDA graph capture/replay,
+concurrent decode requests, real HBM pressure).
 
-The kernel that IS production-integrated today (`flydsl_kgather_only`
-backend) runs the kgather kernel as a smoke exercise and then **delegates
-all attention math to TileLang**. The model's numerical output is
-unchanged when this backend is selected.
+A "fast" kgather kernel does not imply a faster end-to-end decode
+kernel — the kgather output is discarded and the actual attention math
+is delegated to TileLang. See
+[`docs/developer_guide/amd_flydsl_sparse_mla.md`](
+../../docs/developer_guide/amd_flydsl_sparse_mla.md) for the full
+production-vs-prototype boundary and roadmap.

@@ -1,164 +1,215 @@
-# AMD FlyDSL backend for DSv4 sparse FP8 MLA decode
+# AMD FlyDSL kgather backend for DSv4 sparse FP8 MLA decode
 
-**Status: WIP / prototype. Production-safe by default.**
+**Status: opt-in diagnostic backend. Math behavior unchanged vs TileLang.**
 
-This document describes the FlyDSL backend for AMD MI355X (gfx950) sparse
-FP8 MLA decode attention in DeepSeek-V4-Pro. Two pieces exist today:
+This document describes a single, narrowly-scoped backend that exercises
+a FlyDSL [weapon-1](https://gpuopen.com/learn/) (HBM → LDS direct)
+K-cache gather kernel under real server load and then delegates all
+attention math to the production TileLang backend
+(`dpsk_v4_fp8_attention_fwd`). The model's numerical output is identical
+to running with `SGLANG_HACK_FLASHMLA_BACKEND=tilelang`.
 
-1. **Production-integrated `flydsl_kgather_only` backend**
-   ([`python/sglang/srt/layers/attention/nsa/flydsl_kernel.py`](
-   ../../python/sglang/srt/layers/attention/nsa/flydsl_kernel.py)) —
-   exercises a validated FlyDSL weapon-1 K-gather kernel against the
-   live K cache and then **delegates the actual attention math to the
-   production TileLang backend**. The model's numerical output is
-   unchanged.
+There is **no FlyDSL attention math** in this PR. An earlier draft
+contained a standalone prototype FlyDSL FP8 sparse attention kernel
+together with a "0.4 µs/batch" microbenchmark number. That prototype was
+removed from the PR because its V dequant path was structurally wrong
+for DSv4 (it loaded from a synthetic separate V cache with a hardcoded
+scale byte, while real DSv4 reuses the same dequant'd K for V with the
+same per-NOPE_TILE scale — see `tilelang_kernel.py:1849` `T.gemm(S_shared,
+KV_shared, acc_o, ...)`). The microbench number was therefore not
+meaningful as a production comparison.
 
-2. **Standalone prototype full attention sub-kernel**
-   ([`benchmark/sparse_mla_decode_flydsl/bench_subkernel_fp8.py`](
-   ../../benchmark/sparse_mla_decode_flydsl/bench_subkernel_fp8.py))
-   that runs end-to-end Q@K^T → softmax → S@V in FlyDSL but covers
-   only a sub-kernel slice (see "Scope" below). **Not** integrated
-   into the request path.
+## Why this backend exists
 
-## When to enable
+The DSv4 sparse MLA decode kernel is K-cache-bandwidth-bound on AMD
+gfx950. TileLang's HIP backend currently emits the K-cache load as
+two-step `global_load + ds_write` for N=8 / N=16 byte chunks (TileLang's
+`cp_async_gs<N>` specializes only N=4 for the LDS-direct path on AMD;
+see the upstream `tl_templates/hip/copy.h`). FlyDSL exposes
+`rocdl.buffer_load_to_lds` directly and can emit `buffer_load_dwordx4 v0,
+s[0:3], 0 offen lds` cleanly on gfx950.
 
-The production-integrated backend (#1) is off by default and adds latency
-on enable. Only enable for:
-
-- Smoke-testing FlyDSL on a real production workload
-- Profiling that the FlyDSL pipeline survives CUDA graph capture / replay
-  and concurrent decode requests on real K cache pressure
-
-It is **not** expected to improve perf in this form. See "Roadmap"
-below for what's needed before the full kernel can replace TileLang.
+This PR validates the *infrastructure* needed to call a FlyDSL kernel from
+inside the SGLang dispatch path. It does not yet validate that a full
+FlyDSL attention kernel beats TileLang end-to-end on real workloads —
+that requires writing a feature-complete FlyDSL kernel (see "Roadmap").
 
 ## Hardware / software requirements
 
 - AMD MI355X / **gfx950**
 - ROCm 6.x
 - `flydsl` Python package
-- `aiter` Python package (provides `tensor_shim.GTensor`)
+- `aiter` Python package (provides `aiter.ops.flydsl.kernels.tensor_shim.GTensor`)
 
-The capability check
+If any of these are missing, the capability check
 ([`is_flydsl_kgather_available`](../../python/sglang/srt/layers/attention/nsa/flydsl_kernel.py))
-returns `(False, reason)` cleanly on unsupported systems; the dispatch
-layer falls back to TileLang with a one-time warning.
+returns `(False, reason)` and the dispatch layer falls back to TileLang
+with a one-time `RuntimeWarning`. Production hosts without FlyDSL/aiter
+are safe.
 
-## Enabling the backend
+## Enabling
 
 ```bash
-# 1. Route the sparse FP8 MLA dispatch to the FlyDSL kgather-only backend.
+# 1. Route the dispatch to the FlyDSL kgather-only backend.
 export SGLANG_HACK_FLASHMLA_BACKEND=flydsl_kgather_only
 
-# 2. Tell that backend to actually run the kgather kernel (default off so
-#    selecting the backend has zero math impact even when the env flag
-#    accidentally leaks into a production deploy).
+# 2. Tell that backend to actually run the kgather kernel. The default
+#    (no env) means selecting the backend has zero math impact even when
+#    SGLANG_HACK_FLASHMLA_BACKEND accidentally leaks into a deploy.
 export SGLANG_FLYDSL_EXERCISE=1
 
 # Optional:
-export SGLANG_FLYDSL_DEBUG=1         # log the first kgather failure
-export SGLANG_FLYDSL_DEBUG_SYNC=1    # add torch.cuda.synchronize() after
-                                      # the kgather kernel (deterministic
-                                      # timing — only enable for profiling)
+export SGLANG_FLYDSL_DEBUG=1         # log first kgather failure / feature reject
+export SGLANG_FLYDSL_DEBUG_SYNC=1    # cuda.synchronize() after kgather — profiling only
 ```
 
-If `flydsl` or `aiter.ops.flydsl.kernels.tensor_shim` are not importable,
-or the GPU is not gfx95*, the backend logs a `RuntimeWarning` and falls
-back to TileLang automatically.
+The kgather kernel adds a per-layer-per-decode-step kernel launch
+(~14 µs on MI355X) when enabled. **Do not enable in production traffic
+until perf is measured end-to-end.**
 
-## Scope of the prototype sub-kernel
+### Interaction with the bs-aware dispatch override
 
-The standalone prototype kernel covers:
+`debug_flash_mla_adapter.py` contains a perf heuristic that overrides the
+selected backend to `tilelang` for `bs ∈ [40, 248]` (see the comment at
+the top of `flash_mla_with_kvcache_entrypoint`). The
+`flydsl_kgather_only` backend is exempt from this override — selecting
+it via `SGLANG_HACK_FLASHMLA_BACKEND=flydsl_kgather_only` takes effect
+across all bs ranges (because it's a debug/diagnostic backend the user
+opted into explicitly, not a perf-pickable production backend).
 
-| Piece | Status |
+## Capability + feature checks
+
+Before running the kgather kernel,
+[`_check_kgather_supported`](../../python/sglang/srt/layers/attention/nsa/flydsl_kernel.py)
+soft-checks the K cache and indices layout:
+
+| Reject reason | Source |
 |---|---|
-| Sparse K/V gather via `indices[b, n]` → block/in_block decomposition | implemented |
-| FP8 e4m3 inline dequant with real per-NOPE_TILE scale (K and V) | implemented |
-| `softmax_scale` multiply (DSv4 default 1/√(D+D_tail)) | implemented |
-| Q @ K^T via `mfma_f32_16x16x32_bf16` | implemented |
-| Row-wise softmax over BI=64 via LDS cross-lane reduction | implemented |
-| S @ V via `mfma_f32_16x16x16bf16_1k` | implemented |
-| Bit-identical correctness vs PyTorch reference | implemented |
+| `k_cache or indices is None` | nil inputs |
+| `k_cache dtype is not 1-byte (FP8)` | wrong dtype |
+| `k_cache must be 4D` | wrong rank |
+| `H_KV != 1` | non-MQA layout |
+| `K cache packed width != 584` | layout mismatch (real DSv4 = 576 packed FP8 + 8 scale) |
+| `k_cache is non-contiguous` | refuse a 200+ MB copy |
+| `indices must be 3D` | wrong rank |
+| `S_Q != 1` | not a decode shape |
+| `indices dtype must be int32` | wrong dtype |
+| `empty workload (BS=0 or TOPK=0)` | nothing to gather |
 
-The sub-kernel does **not** cover:
+Rejections are *soft*: the function returns `(False, reason)` instead of
+raising. The dispatch wrapper logs the reason once per unique reason and
+skips that kgather call, then proceeds to the TileLang delegate. No
+crashes, no math change.
 
-| Piece | Why it matters |
-|---|---|
-| `D_tail` (64 BF16 elements per K row) | TileLang has D+D_tail=512 worth of compute on QK and SV; sub-kernel has only D=448 (~14% less) |
-| `extra_k_cache` / `extra_indices_in_kvcache` (dual cache) | TileLang processes both caches; ~2× less KV traffic in sub-kernel on real workloads |
-| Online softmax across multiple BI chunks (m_i / sumexp carry) | TileLang carries running max/sum across many BI-sized chunks; sub-kernel is single-pass over one BI=64 chunk |
-| Real K cache row stride (584 bytes/row vs sub-kernel's synthetic 456) | ~22% less HBM per K row in the sub-kernel |
-| `attn_sink` folding | Handled by TileLang's combine kernel |
-| Partial_O / Partial_LSE emission + combine kernel | Sub-kernel writes directly to `O` |
+The `extra_k_cache` / `extra_indices_in_kvcache` (dual cache) path is
+checked independently with the same predicate, so a dual-cache request
+will exercise both kgather calls when both pass the check.
 
-A sub-kernel µs-per-batch number is therefore **not** directly comparable
-to TileLang's `dpsk_v4_fp8_attention_fwd` µs-per-batch number.
+## K cache layout (asserted, do not change without updating both
+ends)
 
-## Reproducing benchmarks
+Per-token row layout in the FP8 K cache:
+
+```
+bytes [  0, 576)   : packed FP8 data (D + 2 * tail_dim = 448 + 128 = 576)
+bytes [576, 584)   : per-NOPE_TILE scale bytes (8 bytes total; D / NOPE_TILE = 7
+                     scales + 1 pad byte)
+```
+
+In-block stride between adjacent tokens is the full **584 bytes**
+(`packed_w_full`), not the 576-byte packed region. An earlier iteration
+of this code used 576 as the in-block stride; that matched a torch
+reference that had the same bug (read shifted bytes for `in_block > 0`),
+so test "byte-exact" passes were against a wrong reference. The current
+code asserts the layout and matches TileLang.
+
+## Reproducing the kgather benchmark
 
 ```bash
-# K-gather kernel only (matches the production-integrated backend)
 python3 benchmark/sparse_mla_decode_flydsl/bench_kgather.py
-
-# Prototype sub-kernel (NOT integrated into dispatch)
-python3 benchmark/sparse_mla_decode_flydsl/bench_subkernel_fp8.py
-
-# TileLang + Triton baselines on a captured DSv4 pickle (apples-to-apples
-# comparison: side-by-side both run the full TileLang/Triton kernel).
-SGLANG_FLYDSL_TEST_PICKLE=/path/to/microbench_bs192.pkl \
-  python3 benchmark/sparse_mla_decode_flydsl/bench_compare_baselines.py
 ```
 
-## Reproducing correctness tests
+Default settings on MI355X: gather 20352 K rows of 576 bytes each
+(workload = BS=159 batches × topk=128 indices per batch, matching the
+captured DSv4-Pro `bs=192` decode workload).
+
+Expected output:
+
+```
+K cache: NB=2897, BS_KV=128, packed_w_full=584
+workload: BS=159, TOPK=128, grid_x=20352, per-call bytes=11,722,752
+latency: median=14.245 µs, p90=14.245 µs (over 10 samples × 200 iters)
+effective HBM BW: 823.0 GB/s
+```
+
+For context: the MI355X HBM peak is ~5.3 TB/s. The kernel hits ~15% of
+peak in this microbench, primarily because the workload is small
+(11.7 MB / call) and dispatch / launch overhead dominates. The kgather
+result is reported as a kernel-level standalone microbench number; it is
+**not** an end-to-end server speedup claim.
+
+## Reproducing the correctness tests
 
 ```bash
-# Synthetic K cache (no pickle needed)
+# Synthetic K cache (no captured data needed).
 pytest test/srt/test_flydsl_kgather.py -v
 
-# Against captured DSv4 sparse FP8 K cache
+# With a captured DSv4 sparse FP8 K cache from a real workload.
 SGLANG_FLYDSL_TEST_PICKLE=/path/to/microbench_bs192.pkl \
   pytest test/srt/test_flydsl_kgather.py -v
 ```
 
-The test gathers up to 1024 K rows via the FlyDSL kernel and compares
-byte-exactly against `torch.gather`. It skips cleanly on non-AMD hosts
-or when `flydsl`/`aiter` are missing.
+The test suite covers:
 
-## Roadmap (what needs to happen before production)
+- **Kernel layer** (`TestFlyDSLKGatherKernel`):
+  byte-exact gather vs `torch.gather` on synthetic shapes,
+  bs ∈ {1, 2, 4, 8, 16, 32, 64, 128, 192},
+  topk ∈ {1, 7, 16, 32, 48, 63, 64, 128},
+  repeated indices, all-negative-sentinel indices, out-of-range indices,
+  real captured K cache (when pickle env is set).
+- **Capability layer** (`TestFlyDSLCapabilityGuards`):
+  every documented reject reason fires a `(False, reason)` tuple
+  without raising — H_KV != 1, packed width mismatch, non-contiguous,
+  S_Q != 1, wrong index dtype, empty workload.
+- **Dispatch layer** (`TestFlyDSLDispatchEntryPoint`):
+  the FlyDSL backend returns TileLang's `(output, lse)` unchanged on
+  finite entries; unsupported feature combos (e.g., non-contiguous K
+  cache) do not raise inside the FlyDSL code path.
 
-1. Wire the standalone sub-kernel ([`bench_subkernel_fp8.py`](
-   ../../benchmark/sparse_mla_decode_flydsl/bench_subkernel_fp8.py))
-   into the dispatch path with a capability check that bails out to
-   TileLang for unsupported cases (currently essentially every case
-   the sub-kernel doesn't yet handle).
-2. Add `D_tail` accumulation (a second mfma path per K_v tile).
-3. Add dual cache (extra_k_cache loop, separate Partial_O/Partial_LSE write).
-4. Add online softmax across multiple BI chunks (m_i / sumexp carry).
-5. Emit `Partial_O` and `Partial_LSE` matching TileLang's combine
-   kernel's input contract, OR fuse combine.
-6. Add `attn_sink` folding.
-7. Server-side end-to-end decode benchmark vs TileLang at
-   bs ∈ {64, 128, 192, 256, 384, 512}.
-8. Correctness against real DSv4 pickle data (not just the bit-identical
-   torch reference at the same sub-kernel scope).
+All tests skip cleanly on non-AMD / no-flydsl hosts. Tests that require
+the captured pickle skip cleanly when `SGLANG_FLYDSL_TEST_PICKLE` is not
+set; they do not gate on private paths.
 
-## Internal contract (layout asserted by the kgather kernel)
+## What this PR explicitly does **not** do
 
-Asserted in
-[`flydsl_kernel._exercise_kgather_on_real`](
-../../python/sglang/srt/layers/attention/nsa/flydsl_kernel.py):
+- **No FlyDSL attention math.** The dispatch returns TileLang's output
+  for every selected backend in this PR.
+- **No end-to-end perf claim.** The kgather µs/call number is a
+  kernel-level microbench, not a server speedup.
+- **No dual-cache / attn_sink / D_tail / online-softmax-across-iter
+  implementation in FlyDSL.** TileLang handles all of these today and
+  will continue to handle them when this backend is selected.
+- **No vendoring of `aiter` internals.** The kernel imports
+  `aiter.ops.flydsl.kernels.tensor_shim.GTensor`; if `aiter` is missing
+  the capability check returns False and dispatch falls back.
 
-- `k_cache.dtype.itemsize == 1` (FP8)
-- `k_cache.shape == (NB, BS_KV, 1, 584)` — H_KV=1 (MQA), 576-byte FP8 +
-  8-byte per-NOPE_TILE scale region
-- `indices.shape == (BS, 1, TOPK)`, `dtype == int32`
-- `k_cache.is_contiguous()` — non-contiguous K cache surfaces as a
-  RuntimeError rather than silently triggering a multi-hundred-MB copy
-- In-block row stride is the full **584-byte** `packed_w_full`, **not**
-  the 576-byte packed region — every byte offset calculation must use
-  `packed_w_full` so the kernel sees the same bytes as TileLang would
+## Roadmap (out of scope for this PR)
 
-A prior iteration of this code used 576 as the in-block stride. That
-matched a torch reference that had the same bug (read shifted bytes),
-so test "byte-exact" passes were against a wrong reference. The current
-code asserts the layout and matches TileLang.
+Production-grade FlyDSL attention requires, in roughly increasing
+difficulty:
+
+1. **A correct standalone full attention kernel.** The prior prototype
+   was structurally wrong for DSv4 (separate V cache, fixed V scale).
+   The replacement must use `V == K` with the same per-NOPE_TILE scale
+   handling as TileLang.
+2. **`D_tail` (64 BF16 elements per K row → `acc_o_tail`).** Adds ~14%
+   compute on QK and SV vs the current sub-kernel scope.
+3. **Dual cache (`extra_k_cache` + `extra_indices_in_kvcache`).** Real
+   DSv4 workloads can have ~2× more KV traffic than a single chunk.
+4. **Online softmax across multiple BI chunks** (`m_i / sumexp` carry).
+5. **`Partial_O` / `Partial_LSE` emission matching the TileLang combine
+   kernel input contract**, OR a fused combine.
+6. **`attn_sink` folding** (currently handled by the combine kernel).
+7. **Server-side end-to-end decode benchmark vs TileLang** at
+   `bs ∈ {64, 128, 192, 256, 384, 512}` on real DSv4-Pro traffic. Only
+   after this does any speedup claim become meaningful.

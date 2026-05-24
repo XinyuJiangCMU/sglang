@@ -13,6 +13,12 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         import os
 
         env_backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "tilelang")
+        # The FlyDSL kgather backend is an opt-in debug/diagnostic backend.
+        # When the user explicitly selects it via the env, honor it
+        # unconditionally — the bs-aware dispatch below is a perf heuristic
+        # for the regular tilelang/triton choice, not a hard gate.
+        if env_backend == "flydsl_kgather_only":
+            backend = env_backend
         # [bs-aware dispatch] On gfx95 (MI350X) + DSv4-Pro decode, tilelang
         # attention is +19-47% faster than triton at bs ∈ [40, 248] (validated
         # via fine-grained sweep; bs=200/208/224 all show +30% over triton).
@@ -20,7 +26,7 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         # drops 5-8×) and remains -14% at bs=512, so [40, 248] is the admissible
         # window. Inside the window force tilelang; outside use env-default.
         # Escape hatch: SGLANG_DSV4_DISABLE_BS_DISPATCH=1 disables this routing.
-        if os.environ.get("SGLANG_DSV4_DISABLE_BS_DISPATCH") == "1":
+        elif os.environ.get("SGLANG_DSV4_DISABLE_BS_DISPATCH") == "1":
             backend = env_backend
         else:
             q = kwargs.get("q")
@@ -67,6 +73,12 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         # scope discussion and missing pieces (D_tail, dual cache,
         # online softmax across iter, attn_sink folding) that block
         # productionizing the standalone full kernel.
+        #
+        # TODO: when a proper FlyDSL attention backend exists that *does*
+        # change math, register it in the formal backend registry (e.g.,
+        # alongside the AITER / TileLang backends) and remove this branch
+        # from the debug adapter. Today the debug adapter is the only
+        # entry point that can route to FlyDSL.
         from sglang.srt.layers.attention.nsa.flydsl_kernel import (
             dpsk_v4_fp8_attention_fwd_flydsl_kgather_only,
             is_flydsl_kgather_available,
