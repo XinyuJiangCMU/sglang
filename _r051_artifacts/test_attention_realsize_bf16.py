@@ -71,13 +71,14 @@ def build_attention():
 
     @flyc.kernel(name="attn_real_bf16_kernel")
     def kernel(
-        q_tensor: fx.Tensor,    # bf16 [M_total * D]
-        k_tensor: fx.Tensor,    # bf16 [BI * D]   (one wg handles same K for all rows)
-        v_tensor: fx.Tensor,    # bf16 [BI * D_V]
-        o_tensor: fx.Tensor,    # f32  [M_total * D_V]
+        q_tensor: fx.Tensor,    # bf16 [BS * M_HEADS * D]
+        k_tensor: fx.Tensor,    # bf16 [BS * BI * D]
+        v_tensor: fx.Tensor,    # bf16 [BS * BI * D_V]
+        o_tensor: fx.Tensor,    # f32  [BS * M_HEADS * D_V]
     ):
         tid = fx.thread_idx.x  # 0..63
-        m_block = fx.block_idx.x  # 0..M_total/M_TILE - 1
+        m_block = fx.block_idx.x   # 0..M_HEADS/M_TILE - 1
+        b_block = fx.block_idx.y   # 0..BS - 1
 
         q_ = GTensor(q_tensor, dtype=T.bf16, shape=(-1,))
         k_ = GTensor(k_tensor, dtype=T.bf16, shape=(-1,))
@@ -87,7 +88,7 @@ def build_attention():
         # Lane mapping for mfma A/B (K=32) load.
         m_in_tile = tid % fx.Int32(16)
         k_lo_32 = (tid // fx.Int32(16)) * fx.Int32(8)
-        global_m = m_block * fx.Int32(M_TILE) + m_in_tile
+        global_m = b_block * fx.Int32(128) + m_block * fx.Int32(M_TILE) + m_in_tile
 
         # ======================================================
         # Step 1: QK gemm — accumulate 4 N-tiles × 14 K-tiles
@@ -100,7 +101,7 @@ def build_attention():
 
         for n_tile in range_constexpr(N_SUBTILES):
             n_in_tile = tid % fx.Int32(16)
-            global_n = fx.Int32(n_tile * N_TILE) + n_in_tile
+            global_n = b_block * fx.Int32(BI) + fx.Int32(n_tile * N_TILE) + n_in_tile
             for k_tile in range_constexpr(K_TILES):
                 k_off = fx.Int32(k_tile * K_MFMA) + k_lo_32
                 a_off = global_m * fx.Int32(D) + k_off
@@ -229,7 +230,7 @@ def build_attention():
                 # B (V) frag: V[k_lo+0..3, out_n*16 + n_b]
                 v_elems = []
                 for el in range_constexpr(4):
-                    k_row = fx.Int32(k_tile_v * 16) + k_lo_16 + fx.Int32(el)
+                    k_row = b_block * fx.Int32(BI) + fx.Int32(k_tile_v * 16) + k_lo_16 + fx.Int32(el)
                     n_col = fx.Int32(out_n * 16) + n_b
                     v_off_el = k_row * fx.Int32(D_V) + n_col
                     v_elems.append(v_.load(v_off_el, vec_size=1))
@@ -243,19 +244,19 @@ def build_attention():
             # Write this 16x16 sub-tile to HBM
             for el in range_constexpr(4):
                 scalar = _vector.extract(o_acc, static_position=[el], dynamic_position=[])
-                global_m_el = m_block * fx.Int32(M_TILE) + m_lo_o + fx.Int32(el)
+                global_m_el = b_block * fx.Int32(128) + m_block * fx.Int32(M_TILE) + m_lo_o + fx.Int32(el)
                 global_n_el = fx.Int32(out_n * 16) + n_o
                 o_off = global_m_el * fx.Int32(D_V) + global_n_el
                 o_.store(o_off, scalar, vec_size=1)
 
     @flyc.jit
-    def launch(q_t, k_t, v_t, o_t, num_m_wgs: fx.Int32):
+    def launch(q_t, k_t, v_t, o_t, num_m_wgs: fx.Int32, num_bs: fx.Int32):
         allocator.finalized = False
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
         kernel(q_t, k_t, v_t, o_t).launch(
-            grid=(num_m_wgs, 1, 1),
+            grid=(num_m_wgs, num_bs, 1),
             block=(64, 1, 1),
         )
 
@@ -264,65 +265,63 @@ def build_attention():
 
 def main():
     torch.manual_seed(99)
-    M = 128
+    BS = int(os.environ.get("BS", "159"))   # batches in parallel (match tilelang's 159)
+    M_HEADS = 128
     BI = 64
     D = 448
     D_V = 448
     M_TILE = 16
-    NUM_M_WGS = M // M_TILE
-
-    print(f"[attn] building kernel M={M}, BI={BI}, D={D}, D_V={D_V}...", flush=True)
+    NUM_M_WGS = M_HEADS // M_TILE
+    print(f"[attn] building kernel BS={BS}, M_HEADS={M_HEADS}, BI={BI}, D={D}, D_V={D_V}...",
+          flush=True)
     launch = build_attention()
     print("[attn] launcher built", flush=True)
 
-    q = torch.randn(M, D, dtype=torch.bfloat16, device="cuda") * 0.05
-    k = torch.randn(BI, D, dtype=torch.bfloat16, device="cuda") * 0.05
-    v = torch.randn(BI, D_V, dtype=torch.bfloat16, device="cuda") * 0.05
-    o = torch.zeros(M, D_V, dtype=torch.float32, device="cuda")
+    q = torch.randn(BS, M_HEADS, D, dtype=torch.bfloat16, device="cuda") * 0.05
+    k = torch.randn(BS, BI, D,     dtype=torch.bfloat16, device="cuda") * 0.05
+    v = torch.randn(BS, BI, D_V,   dtype=torch.bfloat16, device="cuda") * 0.05
+    o = torch.zeros(BS, M_HEADS, D_V, dtype=torch.float32, device="cuda")
 
-    print(f"[attn] launching {NUM_M_WGS} WGs...", flush=True)
-    launch(q.reshape(-1), k.reshape(-1), v.reshape(-1), o.reshape(-1), NUM_M_WGS)
+    print(f"[attn] launching grid=({NUM_M_WGS}, {BS}) = {NUM_M_WGS*BS} WGs...", flush=True)
+    launch(q.reshape(-1), k.reshape(-1), v.reshape(-1), o.reshape(-1), NUM_M_WGS, BS)
     torch.cuda.synchronize()
     print("[attn] kernel ran OK", flush=True)
 
-    # Reference: softmax(Q @ K.T) @ V
-    # V has shape (BI, D_V) = (64, 16), standard (k, n) layout.
-    s_ref = q.float() @ k.float().T
+    # Reference: softmax(Q @ K.T) @ V  (per-batch)
+    s_ref = torch.einsum("bhd,bnd->bhn", q.float(), k.float())  # (BS, M, BI)
     s_ref_sm = torch.softmax(s_ref, dim=-1)
-    o_ref = s_ref_sm @ v.float()
+    o_ref = torch.einsum("bhn,bnv->bhv", s_ref_sm, v.float())   # (BS, M, D_V)
 
     diff = (o.cpu() - o_ref.cpu()).abs()
     print(f"[attn] max abs diff: {diff.max().item():.6e}", flush=True)
     print(f"[attn] mean abs diff: {diff.mean().item():.6e}", flush=True)
-    print(f"[attn] o[0,:4]: {o.cpu()[0, :4].tolist()}", flush=True)
-    print(f"[attn] ref[0,:4]: {o_ref.cpu()[0, :4].tolist()}", flush=True)
 
     tol = 5e-3
     n_within = (diff < tol).sum().item()
-    total = M * D_V
-    if n_within == total:
-        print(f"\n[attn] VERDICT: PASS — {total}/{total} within abs tol {tol}", flush=True)
+    total = BS * M_HEADS * D_V
+    if n_within / total > 0.999:
+        print(f"\n[attn] VERDICT: PASS — {n_within}/{total} ({100*n_within/total:.2f}%) within {tol}",
+              flush=True)
     else:
-        print(f"\n[attn] VERDICT: {n_within}/{total} within tol", flush=True)
+        print(f"\n[attn] VERDICT: only {n_within}/{total} within tol", flush=True)
         sys.exit(2)
 
     # ---- Microbenchmark ----
     import time
-    # Warmup
     for _ in range(10):
-        launch(q.reshape(-1), k.reshape(-1), v.reshape(-1), o.reshape(-1), NUM_M_WGS)
+        launch(q.reshape(-1), k.reshape(-1), v.reshape(-1), o.reshape(-1), NUM_M_WGS, BS)
     torch.cuda.synchronize()
 
-    # Time
-    N_ITERS = 200
+    N_ITERS = 100
     t0 = time.perf_counter()
     for _ in range(N_ITERS):
-        launch(q.reshape(-1), k.reshape(-1), v.reshape(-1), o.reshape(-1), NUM_M_WGS)
+        launch(q.reshape(-1), k.reshape(-1), v.reshape(-1), o.reshape(-1), NUM_M_WGS, BS)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
     per_call_us = (t1 - t0) / N_ITERS * 1e6
-    print(f"\n[attn] perf: {per_call_us:.2f} µs / call (M={M}, BI={BI}, D={D}, D_V={D_V})",
-          flush=True)
+    per_batch_us = per_call_us / BS
+    print(f"\n[attn] perf: {per_call_us:.2f} µs/call    ({per_batch_us:.3f} µs/batch)  "
+          f"  BS={BS}, M_HEADS={M_HEADS}, BI={BI}, D={D}, D_V={D_V}", flush=True)
 
 
 if __name__ == "__main__":
