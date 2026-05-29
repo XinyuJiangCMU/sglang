@@ -15,14 +15,20 @@ Every claim cites its endpoint so it can be re-verified.
 |---|---|---|
 | `sgl-project/sglang` `main` | `ec075d8bc5ff847f43637e9f6dd0cd03f962b024` | `GET /repos/sgl-project/sglang/branches/main` |
 | `sgl-project/sglang` `amd/deepseek_v4` | `76209c2c3bb7e557ab502e64af789ca6f14bd292` (committed 2026-05-28T07:31:50Z) | `GET /repos/sgl-project/sglang/branches/amd/deepseek_v4` |
-| `XinyuJiangCMU/sglang` `dev/dsv4-pro-mtp-rocm-20260529` (PR head) | `683778d9f81c7482032aa520cef1a3b2b713b6a7` | `GET /repos/XinyuJiangCMU/sglang/branches/dev/dsv4-pro-mtp-rocm-20260529` |
+| `XinyuJiangCMU/sglang` functional-fix commit | `683778d9f81c7482032aa520cef1a3b2b713b6a7` | `GET /repos/XinyuJiangCMU/sglang/commits/683778d9f` |
 
-## 1. What this PR actually changes (vs its base = fork `main`)
+> The PR branch tip (`dev/dsv4-pro-mtp-rocm-20260529`) advances past
+> `683778d9f` as documentation commits — including this file — are pushed, so
+> the live branch HEAD and the live PR-level diff counts are larger than the
+> numbers below. All numbers in sections 1–2 are anchored to the immutable
+> functional-fix commit `683778d9f` (the commit that carries the source
+> change); for the live PR-level totals see PR `XinyuJiangCMU/sglang#14`.
 
-`GET /repos/XinyuJiangCMU/sglang/pulls/14` → `changed_files: 4`,
-`additions: 216`, `deletions: 21`, `commits: 5`.
+## 1. What this PR actually changes (functional-fix delta vs base = fork `main`)
 
-`GET /repos/XinyuJiangCMU/sglang/pulls/14/files`:
+Measured at the functional-fix commit `683778d9f`
+(`GET /repos/sgl-project/sglang/compare/ec075d8bc5ff847f43637e9f6dd0cd03f962b024...XinyuJiangCMU:683778d9f81c7482032aa520cef1a3b2b713b6a7`):
+4 files changed, +216 / -21.
 
 | status | +/- | file |
 |---|---|---|
@@ -33,6 +39,11 @@ Every claim cites its endpoint so it can be re-verified.
 
 The only source change is the HIP-gated decomposition inside
 `jit_kernel/dsv4/elementwise.py`; the rest is docs/tests/launch script.
+
+This comparison doc (`benchmark/deepseek_v4/COMPARISON_amd_v4_branch.md`) is
+committed on the same branch on top of `683778d9f`, so the live PR `#14`
+diff reports more files / additions than the table above — that extra delta
+is documentation only and adds no source change.
 
 ## 2. PR head vs `amd/deepseek_v4` (divergence)
 
