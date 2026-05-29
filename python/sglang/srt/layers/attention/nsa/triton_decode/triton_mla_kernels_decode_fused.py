@@ -19,6 +19,7 @@ OPTIMIZED VERSION: Reduced code duplication in dual-scope kernel by using
 a helper function for KV block processing.
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -1528,43 +1529,48 @@ def _fused_gather_attn_dsv4_dual_scope_splitk_kernel(
     stride_po_t_64 = tl.cast(stride_po_t, tl.int64)
     po_base = PartialOutput + pid_k * stride_po_s_64 + pid_t_64 * stride_po_t_64
 
-    # Store partial output as float32 for better precision in combine kernel
+    # Normalization done in fp32 above; cast to partial_output dtype (bf16)
+    # only at the store to halve the dominant combine-kernel HBM read.
     row_ptrs = po_base + offs_h[:, None] * stride_po_h
 
-    tl.store(row_ptrs + offs_tile[None, :] * stride_po_d, acc_0, mask=mask_h[:, None])
+    tl.store(
+        row_ptrs + offs_tile[None, :] * stride_po_d,
+        acc_0.to(PartialOutput.dtype.element_ty),
+        mask=mask_h[:, None],
+    )
     tl.store(
         row_ptrs + (TILE_SIZE + offs_tile[None, :]) * stride_po_d,
-        acc_1,
+        acc_1.to(PartialOutput.dtype.element_ty),
         mask=mask_h[:, None],
     )
     tl.store(
         row_ptrs + (2 * TILE_SIZE + offs_tile[None, :]) * stride_po_d,
-        acc_2,
+        acc_2.to(PartialOutput.dtype.element_ty),
         mask=mask_h[:, None],
     )
     tl.store(
         row_ptrs + (3 * TILE_SIZE + offs_tile[None, :]) * stride_po_d,
-        acc_3,
+        acc_3.to(PartialOutput.dtype.element_ty),
         mask=mask_h[:, None],
     )
     tl.store(
         row_ptrs + (4 * TILE_SIZE + offs_tile[None, :]) * stride_po_d,
-        acc_4,
+        acc_4.to(PartialOutput.dtype.element_ty),
         mask=mask_h[:, None],
     )
     tl.store(
         row_ptrs + (5 * TILE_SIZE + offs_tile[None, :]) * stride_po_d,
-        acc_5,
+        acc_5.to(PartialOutput.dtype.element_ty),
         mask=mask_h[:, None],
     )
     tl.store(
         row_ptrs + (6 * TILE_SIZE + offs_tile[None, :]) * stride_po_d,
-        acc_6,
+        acc_6.to(PartialOutput.dtype.element_ty),
         mask=mask_h[:, None],
     )
     tl.store(
         row_ptrs + (7 * TILE_SIZE + offs_tile[None, :]) * stride_po_d,
-        acc_7,
+        acc_7.to(PartialOutput.dtype.element_ty),
         mask=mask_h[:, None],
     )
 
@@ -1706,10 +1712,23 @@ def fused_gather_attn_decode_dsv4_dual_scope(
             split_k = 2
         else:
             split_k = _select_split_k(total_topk, h_q, total_tokens)
+
+        # Allow overriding split_k for benchmarking (must be 2/4/8/16/...).
+        _splitk_env = os.environ.get("SGLANG_DSV4_DECODE_SPLITK")
+        if _splitk_env is not None:
+            split_k = int(_splitk_env)
+        elif h_q <= 64 and total_topk >= 1024 and total_tokens <= 4:
+            # bf16 partials make sk=16 cheap to combine; gives more parallelism
+            # for h_q=64 + large topk + very small bs.
+            split_k = 16
+
         topk_per_split = (total_topk + split_k - 1) // split_k
 
+        # Store split-k partials as bf16 (each is already softmax-normalized,
+        # O(1) values). This halves the dominant combine-kernel HBM read.
+        # partial_lse stays fp32 (LSE-weight math must stay fp32).
         partial_output = torch.empty(
-            split_k, total_tokens, h_q, d_v, dtype=torch.float32, device=device
+            split_k, total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device
         )
         partial_lse = torch.empty(
             split_k, total_tokens, h_q, dtype=torch.float32, device=device
@@ -1813,17 +1832,15 @@ def fused_gather_attn_decode_dsv4_dual_scope(
                 lse.stride(1),
                 HAS_ATTN_SINK=attn_sink is not None,
             )
-        else:
+        elif split_k == 2 or split_k == 4:
             BLOCK_H_COMBINE = 16
             BLOCK_D_COMBINE = 128
             grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
 
             if split_k == 2:
                 combine_kernel = _combine_splitk_kernel_2
-            elif split_k == 4:
-                combine_kernel = _combine_splitk_kernel
             else:
-                raise ValueError(f"Unsupported split_k: {split_k}")
+                combine_kernel = _combine_splitk_kernel
 
             combine_kernel[grid_combine](
                 partial_output,
@@ -1851,6 +1868,40 @@ def fused_gather_attn_decode_dsv4_dual_scope(
                 BLOCK_H=BLOCK_H_COMBINE,
                 BLOCK_D=BLOCK_D_COMBINE,
                 num_warps=4,
+                num_stages=1,
+            )
+        else:
+            # General combine kernel for sk=16 (and any other split_k).
+            BLOCK_H_COMBINE = 16
+            BLOCK_D_COMBINE = 512
+            grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
+            _combine_splitk_kernel_general[grid_combine](
+                partial_output,
+                partial_lse,
+                attn_sink_tensor,
+                output,
+                lse,
+                total_tokens,
+                _bucket_total_tokens(total_tokens),
+                h_q,
+                d_v,
+                partial_output.stride(0),
+                partial_output.stride(1),
+                partial_output.stride(2),
+                partial_output.stride(3),
+                partial_lse.stride(0),
+                partial_lse.stride(1),
+                partial_lse.stride(2),
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                lse.stride(0),
+                lse.stride(1),
+                HAS_ATTN_SINK=attn_sink is not None,
+                SPLIT_K=split_k,
+                BLOCK_H=BLOCK_H_COMBINE,
+                BLOCK_D=BLOCK_D_COMBINE,
+                num_warps=8,
                 num_stages=1,
             )
 
@@ -2361,18 +2412,19 @@ def _combine_splitk_kernel(
 
     for d_idx in range(4):
         d_offs = d_idx * BLOCK_D + offs_d[None, :]
+        # partial_output is bf16; upcast to fp32 before the weighted sum.
         po_0 = tl.load(
             po_base_0 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0
-        )
+        ).to(tl.float32)
         po_1 = tl.load(
             po_base_1 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0
-        )
+        ).to(tl.float32)
         po_2 = tl.load(
             po_base_2 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0
-        )
+        ).to(tl.float32)
         po_3 = tl.load(
             po_base_3 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0
-        )
+        ).to(tl.float32)
         combined = (
             scale_0[:, None] * po_0
             + scale_1[:, None] * po_1
@@ -2561,14 +2613,15 @@ def _combine_splitk_kernel_8_optimized(
         mask_d = d_offs < d_v
         mask_hd = mask_h[:, None] & mask_d
 
-        po_0 = tl.load(po_base_0 + d_offs * stride_po_d, mask=mask_hd, other=0.0)
-        po_1 = tl.load(po_base_1 + d_offs * stride_po_d, mask=mask_hd, other=0.0)
-        po_2 = tl.load(po_base_2 + d_offs * stride_po_d, mask=mask_hd, other=0.0)
-        po_3 = tl.load(po_base_3 + d_offs * stride_po_d, mask=mask_hd, other=0.0)
-        po_4 = tl.load(po_base_4 + d_offs * stride_po_d, mask=mask_hd, other=0.0)
-        po_5 = tl.load(po_base_5 + d_offs * stride_po_d, mask=mask_hd, other=0.0)
-        po_6 = tl.load(po_base_6 + d_offs * stride_po_d, mask=mask_hd, other=0.0)
-        po_7 = tl.load(po_base_7 + d_offs * stride_po_d, mask=mask_hd, other=0.0)
+        # partial_output is bf16; upcast to fp32 before the weighted sum.
+        po_0 = tl.load(po_base_0 + d_offs * stride_po_d, mask=mask_hd, other=0.0).to(tl.float32)
+        po_1 = tl.load(po_base_1 + d_offs * stride_po_d, mask=mask_hd, other=0.0).to(tl.float32)
+        po_2 = tl.load(po_base_2 + d_offs * stride_po_d, mask=mask_hd, other=0.0).to(tl.float32)
+        po_3 = tl.load(po_base_3 + d_offs * stride_po_d, mask=mask_hd, other=0.0).to(tl.float32)
+        po_4 = tl.load(po_base_4 + d_offs * stride_po_d, mask=mask_hd, other=0.0).to(tl.float32)
+        po_5 = tl.load(po_base_5 + d_offs * stride_po_d, mask=mask_hd, other=0.0).to(tl.float32)
+        po_6 = tl.load(po_base_6 + d_offs * stride_po_d, mask=mask_hd, other=0.0).to(tl.float32)
+        po_7 = tl.load(po_base_7 + d_offs * stride_po_d, mask=mask_hd, other=0.0).to(tl.float32)
 
         combined = (
             scale_0[:, None] * po_0
@@ -2580,6 +2633,137 @@ def _combine_splitk_kernel_8_optimized(
             + scale_6[:, None] * po_6
             + scale_7[:, None] * po_7
         )
+        tl.store(o_base + d_offs * stride_o_d, combined.to(tl.bfloat16), mask=mask_hd)
+
+    stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
+    lse_ptrs = LSE + pid_t_64 * stride_lse_t_64 + offs_h * stride_lse_h
+    tl.store(lse_ptrs, combined_lse, mask=mask_h)
+
+
+@triton.jit
+def _combine_splitk_kernel_general(
+    PartialOutput,
+    PartialLSE,
+    AttnSink,
+    Output,
+    LSE,
+    total_tokens,
+    total_tokens_bucket,
+    h_q,
+    d_v,
+    stride_po_s,
+    stride_po_t,
+    stride_po_h,
+    stride_po_d,
+    stride_plse_s,
+    stride_plse_t,
+    stride_plse_h,
+    stride_o_t,
+    stride_o_h,
+    stride_o_d,
+    stride_lse_t,
+    stride_lse_h,
+    HAS_ATTN_SINK: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """General combine kernel for arbitrary SPLIT_K (loops over splits).
+
+    Numerically identical to the hand-unrolled sk2/sk4/sk8 kernels:
+      - LSE rescale / weight math stays in fp32
+      - partial_output loaded (bf16) and upcast to fp32 before weighted sum
+    """
+    LOG2E: tl.constexpr = 1.4426950408889634
+    NEG_INF = float("-inf")
+    POS_INF = float("+inf")
+    INF_THRESHOLD = 1e30
+
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_t_64 = pid_t.to(tl.int64)
+
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = offs_h < h_q
+    offs_d = tl.arange(0, BLOCK_D)
+
+    stride_plse_s_64 = tl.cast(stride_plse_s, tl.int64)
+    stride_plse_t_64 = tl.cast(stride_plse_t, tl.int64)
+    lse_base = PartialLSE + pid_t_64 * stride_plse_t_64 + offs_h * stride_plse_h
+
+    # Pass 1: load all LSE, find max over valid splits.
+    max_lse = tl.full([BLOCK_H], NEG_INF, tl.float32)
+    for i in tl.static_range(SPLIT_K):
+        lse_i = tl.load(
+            lse_base + i * stride_plse_s_64, mask=mask_h, other=POS_INF
+        )
+        valid_i = tl.abs(lse_i) < INF_THRESHOLD
+        lse_i_safe = tl.where(valid_i, lse_i, NEG_INF)
+        max_lse = tl.maximum(max_lse, lse_i_safe)
+
+    # Pass 2: sum of exps.
+    sum_exp = tl.zeros([BLOCK_H], tl.float32)
+    for i in tl.static_range(SPLIT_K):
+        lse_i = tl.load(
+            lse_base + i * stride_plse_s_64, mask=mask_h, other=POS_INF
+        )
+        valid_i = tl.abs(lse_i) < INF_THRESHOLD
+        lse_i_safe = tl.where(valid_i, lse_i, NEG_INF)
+        exp_i = tl.where(
+            valid_i, tl.math.exp2((lse_i_safe - max_lse) * LOG2E), 0.0
+        )
+        sum_exp += exp_i
+
+    all_invalid = sum_exp == 0.0
+    sum_exp_safe = tl.where(all_invalid, 1.0, sum_exp)
+
+    combined_lse = max_lse + tl.math.log2(sum_exp_safe) / LOG2E
+    combined_lse = tl.where(all_invalid, POS_INF, combined_lse)
+
+    if HAS_ATTN_SINK:
+        attn_sink_vals = tl.load(AttnSink + offs_h, mask=mask_h, other=0.0)
+        is_lonely = combined_lse > INF_THRESHOLD
+        lse_safe_for_sink = tl.where(is_lonely, 0.0, combined_lse)
+        diff = attn_sink_vals - lse_safe_for_sink
+        diff_clamped = tl.minimum(tl.maximum(diff, -100.0), 100.0)
+        exp_diff = tl.math.exp2(diff_clamped * LOG2E)
+        exp_diff = tl.where(is_lonely, 0.0, exp_diff)
+        denominator = 1.0 + exp_diff
+        sink_scale = 1.0 / denominator
+        sink_scale = tl.where(is_lonely, 1.0, sink_scale)
+    else:
+        sink_scale = tl.full([BLOCK_H], 1.0, tl.float32)
+
+    stride_po_s_64 = tl.cast(stride_po_s, tl.int64)
+    stride_po_t_64 = tl.cast(stride_po_t, tl.int64)
+    po_base = PartialOutput + pid_t_64 * stride_po_t_64 + offs_h[:, None] * stride_po_h
+
+    stride_o_t_64 = tl.cast(stride_o_t, tl.int64)
+    o_base = Output + pid_t_64 * stride_o_t_64 + offs_h[:, None] * stride_o_h
+
+    num_d_iters: tl.constexpr = (512 + BLOCK_D - 1) // BLOCK_D
+    for d_idx in tl.static_range(num_d_iters):
+        d_offs = d_idx * BLOCK_D + offs_d[None, :]
+        mask_d = d_offs < d_v
+        mask_hd = mask_h[:, None] & mask_d
+        combined = tl.zeros([BLOCK_H, BLOCK_D], tl.float32)
+        for i in tl.static_range(SPLIT_K):
+            lse_i = tl.load(
+                lse_base + i * stride_plse_s_64, mask=mask_h, other=POS_INF
+            )
+            valid_i = tl.abs(lse_i) < INF_THRESHOLD
+            lse_i_safe = tl.where(valid_i, lse_i, NEG_INF)
+            exp_i = tl.where(
+                valid_i, tl.math.exp2((lse_i_safe - max_lse) * LOG2E), 0.0
+            )
+            scale_i = (exp_i / sum_exp_safe) * sink_scale
+            scale_i = tl.where(all_invalid, 0.0, scale_i)
+            po_i = tl.load(
+                po_base + i * stride_po_s_64 + d_offs * stride_po_d,
+                mask=mask_hd,
+                other=0.0,
+            ).to(tl.float32)
+            combined += scale_i[:, None] * po_i
         tl.store(o_base + d_offs * stride_o_d, combined.to(tl.bfloat16), mask=mask_hd)
 
     stride_lse_t_64 = tl.cast(stride_lse_t, tl.int64)
@@ -2708,12 +2892,13 @@ def _combine_splitk_kernel_2(
 
     for d_idx in range(4):
         d_offs = d_idx * BLOCK_D + offs_d[None, :]
+        # partial_output is bf16; upcast to fp32 before the weighted sum.
         po_0 = tl.load(
             po_base_0 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0
-        )
+        ).to(tl.float32)
         po_1 = tl.load(
             po_base_1 + d_offs * stride_po_d, mask=mask_h[:, None], other=0.0
-        )
+        ).to(tl.float32)
         combined = scale_0[:, None] * po_0 + scale_1[:, None] * po_1
         tl.store(
             o_base + d_offs * stride_o_d, combined.to(tl.bfloat16), mask=mask_h[:, None]
@@ -2765,8 +2950,12 @@ class SplitKBufferPool:
 
         if key not in cls._buffers or cls._device != device:
             cls._device = device
+            # Store split-k partials as bf16 (each is softmax-normalized, O(1)
+            # values). This halves the dominant combine-kernel HBM read. The
+            # shared partial kernel casts to this dtype at store; all combine
+            # kernels upcast loads to fp32. partial_lse stays fp32 (LSE math).
             partial_output = torch.empty(
-                split_k, total_tokens, h_q, d_v, dtype=torch.float32, device=device
+                split_k, total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device
             )
             partial_lse = torch.empty(
                 split_k, total_tokens, h_q, dtype=torch.float32, device=device
@@ -2897,6 +3086,15 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
         split_k = 2
     else:
         split_k = _select_split_k(total_topk, h_q, total_tokens)
+
+    # Allow overriding split_k for benchmarking (must be 2/4/8/16/...).
+    _splitk_env = os.environ.get("SGLANG_DSV4_DECODE_SPLITK")
+    if _splitk_env is not None:
+        split_k = int(_splitk_env)
+    elif h_q <= 64 and total_topk >= 1024 and total_tokens <= 4:
+        # bf16 partials make sk=16 cheap to combine; gives more parallelism
+        # for h_q=64 + large topk + very small bs.
+        split_k = 16
 
     topk_per_split = (total_topk + split_k - 1) // split_k
 
@@ -3056,17 +3254,15 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
             stride_lse[1],
             HAS_ATTN_SINK=attn_sink is not None,
         )
-    else:
+    elif split_k == 2 or split_k == 4:
         BLOCK_H_COMBINE = 16
         BLOCK_D_COMBINE = 128
         grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
 
         if split_k == 2:
             combine_kernel = _combine_splitk_kernel_2
-        elif split_k == 4:
-            combine_kernel = _combine_splitk_kernel
         else:
-            raise ValueError(f"Unsupported split_k: {split_k}")
+            combine_kernel = _combine_splitk_kernel
 
         combine_kernel[grid_combine](
             partial_output,
@@ -3094,6 +3290,40 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
             BLOCK_H=BLOCK_H_COMBINE,
             BLOCK_D=BLOCK_D_COMBINE,
             num_warps=4,
+            num_stages=1,
+        )
+    else:
+        # General combine kernel for sk=16 (and any other split_k).
+        BLOCK_H_COMBINE = 16
+        BLOCK_D_COMBINE = 512
+        grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
+        _combine_splitk_kernel_general[grid_combine](
+            partial_output,
+            partial_lse,
+            attn_sink_tensor,
+            output,
+            lse,
+            total_tokens,
+            _bucket_total_tokens(total_tokens),
+            h_q,
+            d_v,
+            stride_po[0],
+            stride_po[1],
+            stride_po[2],
+            stride_po[3],
+            stride_plse[0],
+            stride_plse[1],
+            stride_plse[2],
+            stride_o[0],
+            stride_o[1],
+            stride_o[2],
+            stride_lse[0],
+            stride_lse[1],
+            HAS_ATTN_SINK=attn_sink is not None,
+            SPLIT_K=split_k,
+            BLOCK_H=BLOCK_H_COMBINE,
+            BLOCK_D=BLOCK_D_COMBINE,
+            num_warps=8,
             num_stages=1,
         )
 
