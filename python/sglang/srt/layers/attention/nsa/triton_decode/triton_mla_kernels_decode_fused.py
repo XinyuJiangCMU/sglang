@@ -19,14 +19,20 @@ OPTIMIZED VERSION: Reduced code duplication in dual-scope kernel by using
 a helper function for KV block processing.
 """
 
-import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx95_supported
+
 from .triton_mla_kernels_decode_common import _bucket_total_tokens
+
+# bf16 split-k partials and the sk16 auto-select heuristic are only enabled on
+# gfx950 (MI350X). On gfx942 (MI300X) the decode path stays byte-identical to
+# the original fp32 implementation. See revisions (1)/(2) for details.
+_is_gfx95 = is_gfx95_supported()
 
 # ============================================================================
 # Constants for DSV4 layout
@@ -1688,47 +1694,23 @@ def fused_gather_attn_decode_dsv4_dual_scope(
         or use_splitk_for_large_topk
         or use_splitk_for_large_hq
     ):
-        # Select split_k based on workload and total_topk.
-        # CUDA graph replay benchmarks show optimal split_k depends on both:
-        #   - High topk (>=512, c4 layers): more splits needed to parallelize
-        #   - Low topk (<512, c128 layers): fewer splits, less combine overhead
-        if total_tokens <= 8:
-            if total_topk >= 512 and total_tokens <= 4:
-                # High topk + very small bs: split_k=8 is 8-33% faster than sk=4
-                split_k = 8
-            else:
-                # split_k=4 gives 2x more blocks than split_k=2
-                split_k = 4
-        elif use_splitk_for_large_hq:
-            # For h_q > 64 with bs > 8:
-            if total_topk >= 512:
-                # High topk: split_k=4 for all medium/large bs
-                split_k = 4
-            else:
-                # Low topk: split_k=2 is sufficient
-                split_k = 2
-        elif use_splitk_for_h64_large_topk:
-            # For h_q=64 + large topk + medium bs, split_k=2 is optimal
-            split_k = 2
-        else:
-            split_k = _select_split_k(total_topk, h_q, total_tokens)
-
-        # Allow overriding split_k for benchmarking (must be 2/4/8/16/...).
-        _splitk_env = os.environ.get("SGLANG_DSV4_DECODE_SPLITK")
-        if _splitk_env is not None:
-            split_k = int(_splitk_env)
-        elif h_q <= 64 and total_topk >= 1024 and total_tokens <= 4:
-            # bf16 partials make sk=16 cheap to combine; gives more parallelism
-            # for h_q=64 + large topk + very small bs.
-            split_k = 16
+        split_k = _select_dual_scope_split_k(
+            total_topk,
+            h_q,
+            total_tokens,
+            use_splitk_for_large_hq,
+            use_splitk_for_h64_large_topk,
+        )
 
         topk_per_split = (total_topk + split_k - 1) // split_k
 
-        # Store split-k partials as bf16 (each is already softmax-normalized,
-        # O(1) values). This halves the dominant combine-kernel HBM read.
-        # partial_lse stays fp32 (LSE-weight math must stay fp32).
+        # Store split-k partials as bf16 on gfx950 (each is already
+        # softmax-normalized, O(1) values). This halves the dominant
+        # combine-kernel HBM read. On gfx942 partials stay fp32 (byte-identical
+        # to the original path). partial_lse always stays fp32 (LSE math).
+        _partial_dtype = torch.bfloat16 if _is_gfx95 else torch.float32
         partial_output = torch.empty(
-            split_k, total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device
+            split_k, total_tokens, h_q, d_v, dtype=_partial_dtype, device=device
         )
         partial_lse = torch.empty(
             split_k, total_tokens, h_q, dtype=torch.float32, device=device
@@ -1872,10 +1854,12 @@ def fused_gather_attn_decode_dsv4_dual_scope(
             )
         else:
             # General combine kernel for sk=16 (and any other split_k).
+            # The any-sk combine kernel hardcodes d_v==512 in its tiling.
+            assert d_v == 512, f"_combine_splitk_kernel_any_sk requires d_v==512, got {d_v}"
             BLOCK_H_COMBINE = 16
             BLOCK_D_COMBINE = 512
             grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
-            _combine_splitk_kernel_general[grid_combine](
+            _combine_splitk_kernel_any_sk[grid_combine](
                 partial_output,
                 partial_lse,
                 attn_sink_tensor,
@@ -2641,7 +2625,7 @@ def _combine_splitk_kernel_8_optimized(
 
 
 @triton.jit
-def _combine_splitk_kernel_general(
+def _combine_splitk_kernel_any_sk(
     PartialOutput,
     PartialLSE,
     AttnSink,
@@ -2668,11 +2652,18 @@ def _combine_splitk_kernel_general(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """General combine kernel for arbitrary SPLIT_K (loops over splits).
+    """Combine kernel general over split_k only (NOT over shapes).
 
-    Numerically identical to the hand-unrolled sk2/sk4/sk8 kernels:
-      - LSE rescale / weight math stays in fp32
-      - partial_output loaded (bf16) and upcast to fp32 before weighted sum
+    Loops over SPLIT_K splits, so it works for sk16 and any other split_k,
+    unlike the hand-unrolled sk2/sk4/sk8 kernels. It is, however, specialized
+    to the DSV4 decode output shape and assumes:
+      - d_v == 512 (the tiling uses num_d_iters = (512 + BLOCK_D - 1)//BLOCK_D)
+      - output dtype is bf16
+      - partials are bf16 (loaded and upcast to fp32 before the weighted sum)
+      - partial LSE is fp32 (LSE rescale / weight math stays in fp32)
+      - |lse| >= 1e30 marks an invalid/empty split (sentinel)
+
+    Numerically identical to the hand-unrolled sk2/sk4/sk8 kernels.
     """
     LOG2E: tl.constexpr = 1.4426950408889634
     NEG_INF = float("-inf")
@@ -2927,6 +2918,56 @@ def _select_split_k(topk: int, h_q: int, total_tokens: int = 64) -> int:
         return 2
 
 
+def _select_dual_scope_split_k(
+    total_topk: int,
+    h_q: int,
+    total_tokens: int,
+    use_splitk_for_large_hq: bool,
+    use_splitk_for_h64_large_topk: bool,
+) -> int:
+    """Shared split_k selection for both dual-scope decode entry points.
+
+    This is the (env-var-free) selection logic factored out of
+    ``fused_gather_attn_decode_dsv4_dual_scope`` and
+    ``fused_gather_attn_decode_dsv4_dual_scope_low_overhead``, which were
+    byte-identical. The sk16 fast-path is gated on ``_is_gfx95`` (gfx950 only):
+    bf16 partials make the sk16 combine cheap, so more splits help for
+    h_q<=64 + large topk + very small bs. On gfx942 this returns only 2/4/8
+    exactly as the original fp32 path did.
+
+    CUDA graph replay benchmarks show optimal split_k depends on both:
+      - High topk (>=512, c4 layers): more splits needed to parallelize
+      - Low topk (<512, c128 layers): fewer splits, less combine overhead
+    """
+    if total_tokens <= 8:
+        if total_topk >= 512 and total_tokens <= 4:
+            # High topk + very small bs: split_k=8 is 8-33% faster than sk=4
+            split_k = 8
+        else:
+            # split_k=4 gives 2x more blocks than split_k=2
+            split_k = 4
+    elif use_splitk_for_large_hq:
+        # For h_q > 64 with bs > 8:
+        if total_topk >= 512:
+            # High topk: split_k=4 for all medium/large bs
+            split_k = 4
+        else:
+            # Low topk: split_k=2 is sufficient
+            split_k = 2
+    elif use_splitk_for_h64_large_topk:
+        # For h_q=64 + large topk + medium bs, split_k=2 is optimal
+        split_k = 2
+    else:
+        split_k = _select_split_k(total_topk, h_q, total_tokens)
+
+    # bf16 partials make sk=16 cheap to combine; gives more parallelism for
+    # h_q=64 + large topk + very small bs. gfx950-only (bf16 partials path).
+    if _is_gfx95 and h_q <= 64 and total_topk >= 1024 and total_tokens <= 4:
+        split_k = 16
+
+    return split_k
+
+
 # ============================================================================
 # Low-overhead buffer pool for splitk operations
 # ============================================================================
@@ -2946,16 +2987,21 @@ class SplitKBufferPool:
         cls, split_k: int, total_tokens: int, h_q: int, d_v: int, device: torch.device
     ):
         """Get or create intermediate buffers for the given configuration."""
-        key = (split_k, total_tokens, h_q, d_v, device)
+        # partial_output is bf16 on gfx950, fp32 on gfx942; include the dtype
+        # in the cache key so the two never collide.
+        partial_dtype = torch.bfloat16 if _is_gfx95 else torch.float32
+        key = (split_k, total_tokens, h_q, d_v, partial_dtype, device)
 
         if key not in cls._buffers or cls._device != device:
             cls._device = device
-            # Store split-k partials as bf16 (each is softmax-normalized, O(1)
-            # values). This halves the dominant combine-kernel HBM read. The
-            # shared partial kernel casts to this dtype at store; all combine
-            # kernels upcast loads to fp32. partial_lse stays fp32 (LSE math).
+            # Store split-k partials as bf16 on gfx950 (each is
+            # softmax-normalized, O(1) values). This halves the dominant
+            # combine-kernel HBM read. On gfx942 partials stay fp32
+            # (byte-identical to the original path). The shared partial kernel
+            # casts to this dtype at store; all combine kernels upcast loads to
+            # fp32. partial_lse stays fp32 (LSE math).
             partial_output = torch.empty(
-                split_k, total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device
+                split_k, total_tokens, h_q, d_v, dtype=partial_dtype, device=device
             )
             partial_lse = torch.empty(
                 split_k, total_tokens, h_q, dtype=torch.float32, device=device
@@ -3063,38 +3109,13 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
             s_q,
         )
 
-    # Select split_k based on workload and total_topk.
-    # CUDA graph replay benchmarks show optimal split_k depends on both:
-    #   - High topk (>=512, c4 layers): more splits needed to parallelize
-    #   - Low topk (<512, c128 layers): fewer splits, less combine overhead
-    if total_tokens <= 8:
-        if total_topk >= 512 and total_tokens <= 4:
-            # High topk + very small bs: split_k=8 is 8-33% faster than sk=4
-            split_k = 8
-        else:
-            # split_k=4 gives 2x more blocks than split_k=2
-            split_k = 4
-    elif use_splitk_for_large_hq:
-        # For h_q > 64 with bs > 8:
-        if total_topk >= 512:
-            # High topk: split_k=4 for all medium/large bs
-            split_k = 4
-        else:
-            # Low topk: split_k=2 is sufficient
-            split_k = 2
-    elif use_splitk_for_h64_large_topk:
-        split_k = 2
-    else:
-        split_k = _select_split_k(total_topk, h_q, total_tokens)
-
-    # Allow overriding split_k for benchmarking (must be 2/4/8/16/...).
-    _splitk_env = os.environ.get("SGLANG_DSV4_DECODE_SPLITK")
-    if _splitk_env is not None:
-        split_k = int(_splitk_env)
-    elif h_q <= 64 and total_topk >= 1024 and total_tokens <= 4:
-        # bf16 partials make sk=16 cheap to combine; gives more parallelism
-        # for h_q=64 + large topk + very small bs.
-        split_k = 16
+    split_k = _select_dual_scope_split_k(
+        total_topk,
+        h_q,
+        total_tokens,
+        use_splitk_for_large_hq,
+        use_splitk_for_h64_large_topk,
+    )
 
     topk_per_split = (total_topk + split_k - 1) // split_k
 
@@ -3294,10 +3315,12 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
         )
     else:
         # General combine kernel for sk=16 (and any other split_k).
+        # The any-sk combine kernel hardcodes d_v==512 in its tiling.
+        assert d_v == 512, f"_combine_splitk_kernel_any_sk requires d_v==512, got {d_v}"
         BLOCK_H_COMBINE = 16
         BLOCK_D_COMBINE = 512
         grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
-        _combine_splitk_kernel_general[grid_combine](
+        _combine_splitk_kernel_any_sk[grid_combine](
             partial_output,
             partial_lse,
             attn_sink_tensor,
