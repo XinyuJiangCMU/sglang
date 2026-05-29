@@ -127,22 +127,47 @@ def fused_q_indexer_rope_hadamard_quant(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if _is_hip:
+        # HIP fallback: the fused CUDA kernel
+        # (torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant) is not
+        # available in the ROCm sgl_kernel build, so decompose it into existing
+        # triton/hadamard building blocks. Mirrors
+        # FusedQIndexerRopeHadamardQuantKernel in
+        # csrc/deepseek_v4/main_norm_rope.cuh:
+        #   part1/2: RoPE on the first rope_dim dims (interleaved real/imag),
+        #   part3: 128-point Hadamard over the full head dim, scale 1/sqrt(d),
+        #   part4: per-(token, head) fp8 act-quant.
+        from fast_hadamard_transform import hadamard_transform
+
+        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+
+        head_dim = q_input.shape[-1]
+        rope_dim = freqs_cis.shape[-1] * 2  # complex -> real pairs
+
+        q = q_input if q_input.dtype == torch.bfloat16 else q_input.to(torch.bfloat16)
+        q = q.contiguous()
+        # RoPE in-place on the first rope_dim dims (same convention as CUDA).
+        apply_rotary_emb_triton(q[..., :rope_dim], freqs_cis, positions=positions)
+        # 128-point Hadamard over the full head dim, scaled by 1/sqrt(head_dim).
+        h = hadamard_transform(q.reshape(-1, head_dim), scale=head_dim**-0.5).reshape(
+            q.shape
+        )
+        # per-(token, head) fp8 act-quant.
+        h = h.to(torch.float32)
+        abs_max = h.abs().amax(dim=-1, keepdim=True)
+        scale = torch.clamp(abs_max, min=1e-4) / 448.0  # FP8_E4M3_MAX
+        q_fp8 = (h / scale).to(torch.float8_e4m3fn)
+        weights_out = (
+            weight.to(torch.float32) * float(weight_scale) * scale.squeeze(-1)
+        ).reshape(*q_input.shape[:-1], 1)
+        return q_fp8, weights_out
+
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
-    if _is_hip:
-        torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant(
-            q_input,
-            q_fp8,
-            weight,
-            weights_out,
-            float(weight_scale),
-            freqs_real,
-            positions,
-        )
-    else:
+    if True:
         module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
         module.forward(
             q_input,
