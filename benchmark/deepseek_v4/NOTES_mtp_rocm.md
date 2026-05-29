@@ -56,3 +56,7 @@ Recommended recipe: num-steps 3 / topk 1 / draft-tokens 4. (Further: sweep num-s
 | 3 | 0.71 | 80.2  <- optimum |
 | 5 | 0.38 | 74.4 (over-drafts; deep drafts rejected) |
 => num-steps 3 is the sweet spot.
+
+## Accuracy (lossless verification)
+gsm8k (num-steps 3, 120 Q): **Accuracy 0.967, Invalid 0.000** — at/above the ~0.92-0.94 baseline.
+=> MTP speedup is lossless (EAGLE verifies against target distribution; confirmed empirically).
