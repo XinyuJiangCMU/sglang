@@ -48,3 +48,11 @@ Switching to `--speculative-num-steps 3 --speculative-eagle-topk 1 --speculative
 
 => Multi-step wins at BOTH low and high concurrency (single-step regressed at conc>=8; multi-step does not).
 Recommended recipe: num-steps 3 / topk 1 / draft-tokens 4. (Further: sweep num-steps for the optimum.)
+
+## num-steps sweep (conc 1, accept_rate per-step)
+| num-steps | accept_rate | tok/s |
+|---|---|---|
+| 1 | 0.71 | 55.6 |
+| 3 | 0.71 | 80.2  <- optimum |
+| 5 | 0.38 | 74.4 (over-drafts; deep drafts rejected) |
+=> num-steps 3 is the sweet spot.
