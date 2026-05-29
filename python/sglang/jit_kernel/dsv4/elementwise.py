@@ -144,8 +144,11 @@ def fused_q_indexer_rope_hadamard_quant(
         head_dim = q_input.shape[-1]
         rope_dim = freqs_cis.shape[-1] * 2  # complex -> real pairs
 
-        q = q_input if q_input.dtype == torch.bfloat16 else q_input.to(torch.bfloat16)
-        q = q.contiguous()
+        # Always copy: apply_rotary_emb_triton mutates q[..., :rope_dim]
+        # in-place, so we must own the buffer and never alias the caller's
+        # q_input. Tensor.to(dtype) defaults to copy=False and returns self
+        # when the dtype already matches, so pass copy=True for a fresh buffer.
+        q = q_input.to(torch.bfloat16, copy=True).contiguous()
         # RoPE in-place on the first rope_dim dims (same convention as CUDA).
         apply_rotary_emb_triton(q[..., :rope_dim], freqs_cis, positions=positions)
         # 128-point Hadamard over the full head dim, scaled by 1/sqrt(head_dim).
@@ -167,17 +170,16 @@ def fused_q_indexer_rope_hadamard_quant(
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
-    if True:
-        module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
-        module.forward(
-            q_input,
-            q_fp8,
-            weight,
-            weights_out,
-            float(weight_scale),
-            freqs_real,
-            positions,
-        )
+    module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
+    module.forward(
+        q_input,
+        q_fp8,
+        weight,
+        weights_out,
+        float(weight_scale),
+        freqs_real,
+        positions,
+    )
     return q_fp8, weights_out
 
 
