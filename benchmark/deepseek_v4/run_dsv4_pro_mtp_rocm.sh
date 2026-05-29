@@ -27,4 +27,4 @@ export AITER_BF16_FP8_MOE_BOUND=1
 export SGLANG_OPT_FP8_WO_A_GEMM=0 SGLANG_ENABLE_SPEC_V2=1 SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1
 export SGLANG_OPT_USE_TOPK_V2=0
 MODEL=/workspace/workspace/models/DeepSeek-V4-Pro
-python3 -m sglang.launch_server --model-path $MODEL --trust-remote-code --tp 8 --attention-backend compressed --page-size 256 --chunked-prefill-size 4096 --mem-fraction-static 0.80 --speculative-algorithm EAGLE --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 --max-running-requests 8 --port 8000 --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4
+python3 -m sglang.launch_server --model-path $MODEL --trust-remote-code --tp 8 --attention-backend compressed --page-size 256 --chunked-prefill-size 4096 --mem-fraction-static 0.80 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --max-running-requests 8 --port 8000 --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4

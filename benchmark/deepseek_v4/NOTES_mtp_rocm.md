@@ -36,3 +36,15 @@ Flags: `--attention-backend compressed` (normalizes to dsv4) `--tp 8 --page-size
 ## Optimization opportunities (next)
 - High-batch crossover: MTP draft overhead makes tput worse at conc>=~4-8. Dynamic enable (only spec at low batch), or cheaper draft.
 - The HIP indexer-Q fallback is decomposed (3 ops) vs CUDA's 1 fused kernel -> a fused HIP/triton kernel would cut launch overhead.
+
+## UPDATE: multi-step MTP is strictly better (and fixes the high-batch crossover)
+Switching to `--speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`
+(main's DeepseekV4MultiStepBackend; same ROCm fixes apply) — measured random 256/256, accept_rate ~0.71, output correct ("capital of France is Paris"):
+
+| concurrency | no-spec | single-step (steps1) | **multi-step (steps3)** |
+|---|---|---|---|
+| 1 | 31.5 tok/s, 31.1ms | 55.6 tok/s, 16.9ms | **80.2 tok/s, 11.2ms (2.55x / 2.78x ITL)** |
+| 8 | 196 tok/s, 35.7ms | 133 tok/s (regressed) | **299.6 tok/s, 15.9ms (1.53x)** |
+
+=> Multi-step wins at BOTH low and high concurrency (single-step regressed at conc>=8; multi-step does not).
+Recommended recipe: num-steps 3 / topk 1 / draft-tokens 4. (Further: sweep num-steps for the optimum.)
