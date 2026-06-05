@@ -96,6 +96,22 @@ def _get_workload_size_category(total_tokens: int, topk: int) -> int:
         triton.Config(
             {"BLOCK_H": 128, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
         ),
+        # R2-a candidate: high-concurrency (GPU/bandwidth-bound) variants for autotune to
+        # evaluate -- num_stages=2 (software pipeline / prefetch to hide HBM latency) and
+        # larger BLOCK_N=512 (fewer topk iterations). autotune keeps the best per bucket;
+        # if none win, these are inert (no regression).
+        triton.Config(
+            {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
+        ),
+        triton.Config(
+            {"BLOCK_H": 128, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
+        ),
+        triton.Config(
+            {"BLOCK_H": 64, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 128, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
     ],
     key=["total_tokens_bucket", "h_q", "total_topk", "d_qk"],
 )
