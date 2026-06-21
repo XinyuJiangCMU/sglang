@@ -3673,11 +3673,10 @@ def mxfp_supported():
     """
     Returns whether the current platform supports MX types.
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
+    if not torch.version.hip or not torch.cuda.is_available():
         return False
+    gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+    return any(gfx in gcn_arch for gfx in ["gfx95"])
 
 
 @lru_cache(maxsize=1)
@@ -3685,11 +3684,10 @@ def is_gfx95_supported():
     """
     Returns whether the current platform supports MX types.
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
+    if not torch.version.hip or not torch.cuda.is_available():
         return False
+    gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+    return any(gfx in gcn_arch for gfx in ["gfx95"])
 
 
 @lru_cache(maxsize=1)
@@ -3697,11 +3695,10 @@ def is_gfx942_supported():
     """
     Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx942"])
-    else:
+    if not torch.version.hip or not torch.cuda.is_available():
         return False
+    gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+    return any(gfx in gcn_arch for gfx in ["gfx942"])
 
 
 def get_hip_version():
