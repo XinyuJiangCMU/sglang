@@ -61,6 +61,9 @@ def fp8_paged_mqa_logits_torch(
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
 
+    # The caller unsqueezes seq_lens to 2D for the deep_gemm path; this torch fn wants 1D (batch_size,).
+    seq_lens = seq_lens.squeeze(-1) if seq_lens.dim() == 2 else seq_lens
+
     assert head_dim == 128
     assert block_size == 64
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
@@ -580,7 +583,7 @@ class C4IndexerBackendMixin:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
-        elif core_metadata.c4_sparse_raw_indices is not None:
+        elif getattr(core_metadata, "c4_sparse_raw_indices", None) is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
         if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
