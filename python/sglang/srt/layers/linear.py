@@ -1571,7 +1571,9 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            if should_use_tp_invariant_row_linear(input_parallel.shape[-1]):
+            if not isinstance(input_parallel, tuple) and should_use_tp_invariant_row_linear(
+                input_parallel.shape[-1]
+            ):
                 output_parallel = torch.ops.tp_inv_ops.matmul_tp_inv(
                     input_parallel, self.weight.t(), bias_
                 )
