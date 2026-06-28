@@ -1571,7 +1571,13 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            if not isinstance(input_parallel, tuple) and should_use_tp_invariant_row_linear(
+            # matmul_tp_inv supports only bf16/fp16/fp32, never fp8; an fp8 row-linear (whose
+            # input on the ROCm aiter fused_clamp fast path may be a pre-quantized (x_fp8, x_scale)
+            # tuple) must go through quant_method.apply, which handles both the tuple and plain
+            # tensors. So gate on the layer NOT being fp8, short-circuiting before the .shape read.
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod  # local import: avoid circular import
+
+            if not isinstance(self.quant_method, Fp8LinearMethod) and should_use_tp_invariant_row_linear(
                 input_parallel.shape[-1]
             ):
                 output_parallel = torch.ops.tp_inv_ops.matmul_tp_inv(
