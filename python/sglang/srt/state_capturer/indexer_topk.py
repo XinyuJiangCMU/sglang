@@ -5,7 +5,6 @@ import numpy as np
 import pybase64
 import torch
 
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 logger = logging.getLogger(__name__)
@@ -25,11 +24,11 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         self.num_indexer_layers = num_indexer_layers
         self.index_topk = index_topk
 
-        attn_tp_size = get_attention_tp_size()
-        assert attn_tp_size == 1, "IndexerTopkCapturer now only supports DP attention"
-
-        # DP-attention capture is per-rank-local: each rank writes [:local_batch, ...]
-        # to its own device_cache, so the buffer only needs to fit one rank's batch.
+        # Indexer topk is per-query KV selection (head-independent), so it is
+        # replicated (not sharded) across attn-TP ranks: under TP attention each
+        # rank computes the identical full-batch topk on replicated hidden_states;
+        # under DP attention each rank computes its own local batch. Either way
+        # capture is per-rank-local (buffer fits one rank's full-or-local batch).
         server_args = get_global_server_args()
         max_batch_size = max(server_args.chunked_prefill_size, max_running_requests)
 
