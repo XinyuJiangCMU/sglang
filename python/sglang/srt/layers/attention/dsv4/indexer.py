@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-if is_hip():
+if is_fp8_fnuz():  # E27: KV cache is e4m3fn (gfx950 is_fp8_fnuz=False); the old is_hip() gate misread it as fnuz = x0.5 -> on-policy abs_diff 0.32
     FP8_DTYPE = torch.float8_e4m3fnuz
     FP8_MAX = torch.finfo(FP8_DTYPE).max
 else:
