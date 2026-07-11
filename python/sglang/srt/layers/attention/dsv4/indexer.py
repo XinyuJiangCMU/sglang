@@ -62,9 +62,6 @@ def fp8_paged_mqa_logits_torch(
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
 
-    # The caller unsqueezes seq_lens to 2D for the deep_gemm path; this torch fn wants 1D (batch_size,).
-    seq_lens = seq_lens.squeeze(-1) if seq_lens.dim() == 2 else seq_lens
-
     assert head_dim == 128
     assert block_size == 64
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
@@ -126,125 +123,32 @@ def _aiter_fp8_paged_mqa_logits(
     max_seq_len: int,
     clean_logits: bool = False,
 ) -> torch.Tensor:
-    """FP8 paged MQA logits via aiter's non-gluon (block==1) triton kernel.
-
-    The high-level ``deepgemm_fp8_paged_mqa_logits`` wrapper cannot be used here:
-    on triton 3.4 (no gluon JIT, no AOT) it falls into the JIT path that asserts
-    ``KVBlockSize == 1`` and ``not Preshuffle``, while DSv4 uses page_size=64.
-    The kernel's KVBlockSize==1 layout also expects per-token interleaved
-    ``[K | scale]`` rows, but our KV cache is per-page grouped
-    ``[all-K | all-scale]`` (uint8, page_size*(head_dim+4) bytes/page).
-
-    So we drive the low-level ``_deepgemm_fp8_paged_mqa_logits`` kernel directly:
-      * gather the referenced pages (page_table already resolves indirection),
-      * split into contiguous K (fp8, stride head_dim) and scale (fp32) tensors,
-      * build a per-token expanded kv_indices into the gathered token space,
-      * cast weights to fp32 (kernel signature is ``*fp32``; SGLang hands bf16),
-      * view q as e4m3fn (``dtypes.fp8``), matching how K is stored on gfx950.
-    """
-    import triton
-
-    from aiter import dtypes
-    from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
-        _deepgemm_fp8_paged_mqa_logits,
+    """Wrapper adapting aiter's deepgemm_fp8_paged_mqa_logits to SGLang's interface."""
+    from aiter.ops.triton.attention.pa_mqa_logits import (
+        deepgemm_fp8_paged_mqa_logits,
     )
-    from aiter.jit.utils.chip_info import get_gfx
 
-    # q_fp8: (B, next_n, H, D); kvcache_fp8: (num_pages, page_size, 1, D+4) uint8
-    batch_size, next_n, num_heads, head_dim = q_fp8.shape
-    page_size = kvcache_fp8.shape[1]
-    index_dim = kvcache_fp8.shape[3]
-    assert index_dim == head_dim + 4, (
-        f"expected packed [K|scale] last dim head_dim+4={head_dim + 4}, "
-        f"got {index_dim}"
-    )
+    batch_size = q_fp8.shape[0]
+    next_n = q_fp8.shape[1]
     total_tokens = batch_size * next_n
-    device = q_fp8.device
-
     _sl = seq_lens.squeeze(-1) if seq_lens.dim() == 2 else seq_lens
-    _sl = _sl.to(torch.int32)
-    max_pages = page_table.shape[1]
-    max_blk = max_pages * page_size
-    scale_offset = page_size * head_dim  # bytes: end of K region within a page
-
-    # Gather referenced pages: (B, max_pages, page_size*(D+4)) uint8.
-    buf = kvcache_fp8.reshape(-1, page_size * index_dim)
-    pages = page_table.clamp(min=0).long()
-    gathered = buf[pages]
-
-    # Split grouped [all-K | all-scale] into contiguous per-token K and scale.
-    # K: (B*max_pages*page_size, head_dim) fp8, row-stride == head_dim.
-    k_buf = (
-        gathered[..., :scale_offset]
-        .contiguous()
-        .view(dtypes.fp8)
-        .view(batch_size * max_pages * page_size, head_dim)
-    )
-    # scale: (B*max_pages*page_size,) fp32, one per token.
-    s_buf = (
-        gathered[..., scale_offset:]
-        .contiguous()
-        .view(torch.float32)
-        .view(batch_size * max_pages * page_size)
-    )
-
-    # Per-token kv_indices into the gathered token space. Physical page
-    # indirection is already resolved by the gather, so the mapping is the
-    # trivial row index: kv_indices[b, pos] = b * max_blk + pos.
-    base = (torch.arange(batch_size, device=device, dtype=torch.int32) * max_blk)[
-        :, None
-    ]
-    kv_indices = (
-        base
-        + torch.arange(max_blk, device=device, dtype=torch.int32)[None, :]
-    ).contiguous()
-
-    # Kernel wants q as fp8 (e4m3fn on gfx950) and weights as fp32.
-    q_fp8 = q_fp8.view(dtypes.fp8)
-    weights = weight.float().contiguous()
-
+    kv_block_size = kvcache_fp8.shape[1]
     logits = torch.empty(
         total_tokens,
         max_seq_len,
         dtype=torch.float32,
-        device=device,
+        device=q_fp8.device,
     )
-
-    # grid / SplitKV follow the high-level wrapper's formula.
-    ChunkQ = num_heads
-    ChunkK = 256
-    HiddenDim = head_dim
-    WavePerEU = 2
-    TotalCuCount = 80 if get_gfx() == "gfx942" else 256
-    tile_q_count = batch_size * next_n
-    SplitKV = (max(1, TotalCuCount // tile_q_count) + 4) // 5 * 5 * WavePerEU
-    grid = (batch_size * next_n * triton.cdiv(num_heads, ChunkQ) * SplitKV,)
-
-    _deepgemm_fp8_paged_mqa_logits[grid](
-        batch_size,
-        next_n,
-        num_heads,
+    deepgemm_fp8_paged_mqa_logits(
         q_fp8,
-        q_fp8.stride(0),
-        q_fp8.stride(1),
-        q_fp8.stride(2),
-        k_buf,
-        k_buf.stride(0),
-        s_buf,
-        s_buf.stride(0),
-        _sl,
-        kv_indices,
-        weights,
-        weights.stride(0),
+        kvcache_fp8,
+        weight,
         logits,
-        logits.stride(0),
+        _sl.to(torch.int32),
+        page_table.to(torch.int32),
         max_seq_len,
-        max_blk,
-        waves_per_eu=WavePerEU,
-        ChunkQ=ChunkQ,
-        ChunkK=ChunkK,
-        SplitKV=SplitKV,
-        HiddenDim=HiddenDim,
+        KVBlockSize=kv_block_size,
+        Preshuffle=True,
     )
     return logits
 
@@ -677,7 +581,7 @@ class C4IndexerBackendMixin:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
-        elif getattr(core_metadata, "c4_sparse_raw_indices", None) is not None:
+        elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
         if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():

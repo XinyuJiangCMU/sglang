@@ -484,12 +484,12 @@ def _c128_decode_kernel(
             other=NEG_BIG,
         )
         kv_input_tile = tl.load(
-            kv_in_ptr + in_base + (slot_offs * 0)[:, None] + d_offs[None, :],
+            kv_in_ptr + in_base + d_offs[None, :],
             mask=valid[:, None] & is_input[:, None] & d_mask[None, :],
             other=0.0,
         ).to(tl.float32)
         score_input_tile = tl.load(
-            kv_in_ptr + in_base + HEAD_DIM + (slot_offs * 0)[:, None] + d_offs[None, :],
+            kv_in_ptr + in_base + HEAD_DIM + d_offs[None, :],
             mask=valid[:, None] & is_input[:, None] & d_mask[None, :],
             other=NEG_BIG,
         ).to(tl.float32)
