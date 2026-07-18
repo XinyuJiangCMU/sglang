@@ -53,7 +53,10 @@ class KVAndScore:
         return KVAndScore(self.kv_score[index])
 
     def __setitem__(self, index, value: KVAndScore):
-        self.kv_score[index] = value.kv_score
+        # EAGLE/MTP spec-decode produces kv_score in bf16 (compressor.py) while
+        # this buffer is float32 (SGLANG_DSV4_COMPRESS_STATE_DTYPE default). Up-cast
+        # to the destination dtype so the index-put doesn't crash (Float dst / BF16 src).
+        self.kv_score[index] = value.kv_score.to(self.kv_score.dtype)
 
     def clear(self):
         self.kv.zero_()
