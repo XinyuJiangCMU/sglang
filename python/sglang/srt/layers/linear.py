@@ -1571,12 +1571,22 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-
-            is_fp8 = isinstance(self.quant_method, Fp8LinearMethod)
-            if not is_fp8 and should_use_tp_invariant_row_linear(
-                input_parallel.shape[-1]
-            ):
+            # k-size must be tuple-aware: quantized inputs (e.g. ROCm FP8) arrive as
+            # (x_quant, x_scale) tuples, so a bare input_parallel.shape[-1] crashes.
+            # This arg is always evaluated (regardless of deterministic mode), so the
+            # crash is a general FP8-ROCm bug, not specific to the tp-invariant path.
+            k_size = (
+                input_parallel[0].shape[-1]
+                if isinstance(input_parallel, tuple)
+                else input_parallel.shape[-1]
+            )
+            if should_use_tp_invariant_row_linear(k_size):
+                if isinstance(input_parallel, tuple):
+                    # matmul_tp_inv is dense-only; raise rather than silently fall
+                    # back to quant_method.apply() (which drops tp-invariance).
+                    raise NotImplementedError(
+                        "FP8 tp-invariant row-linear not yet supported"
+                    )
                 output_parallel = torch.ops.tp_inv_ops.matmul_tp_inv(
                     input_parallel, self.weight.t(), bias_
                 )
