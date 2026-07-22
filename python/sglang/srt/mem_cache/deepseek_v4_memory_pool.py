@@ -619,10 +619,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_compressed_layer_mapping()
 
-        if _is_hip:
-            self._init_paged_compress_states(False)
-        else:
-            self._init_paged_compress_states(enable_memory_saver)
+        self._init_paged_compress_states(enable_memory_saver)
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
