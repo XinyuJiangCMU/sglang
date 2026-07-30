@@ -241,7 +241,7 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
         dtype_quant=torch.float8_e4m3fn,
         res1=None,
         output_unquantized_inp1=True,
-        transpose_scale=_use_aiter_bpreshuffle_gfx95,
+        transpose_scale=False,
     )
     return x_quant, x_bf16
 
