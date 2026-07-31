@@ -25,6 +25,15 @@ def _default_hip() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def _default_not_hip() -> bool:
+    """Inverse of :func:`_default_hip`, for defaults that are ROCm-specific.
+
+    Same laziness contract: resolved on first ``EnvField.get()`` that uses it.
+    """
+    return not _default_hip()
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -1182,7 +1191,12 @@ class Envs:
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
-    SGLANG_OPT_USE_JIT_NORM = EnvBool(True)
+    # The JIT norm+rope+store fusion is the fast path, but on ROCm the fused
+    # kernel and the Triton fallback in DSv4's compressor are not numerically
+    # equivalent, and only the fallback keeps parity with the pre-V2 compressor
+    # (see the `precision parity with V1` note on that branch). Default to the
+    # parity path on ROCm; set this to true to opt back into the fused kernel.
+    SGLANG_OPT_USE_JIT_NORM = EnvBool(_default_not_hip)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # CUDA graph
