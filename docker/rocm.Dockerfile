@@ -103,7 +103,7 @@ ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="01d1eb2a7ec37fd5e20a88573e9b4956e7846e9a"
+ARG MOONCAKE_COMMIT="6041a609a8c3af35e778f70db344f145c2914980"
 
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
 ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
@@ -271,7 +271,10 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      mkdir -p build && \
      cd build && \
      cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON -DENABLE_MULTI_PROTOCOL=ON -DWITH_STORE=ON -DBUILD_UNIT_TESTS=OFF && \
-     make -j "$(nproc)" && make install; \
+     make -j "$(nproc)" && make install && \
+     SP="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" && \
+     cp ../mooncake-wheel/mooncake/*.py "$SP/mooncake/" && \
+     python3 -c "from mooncake.engine import TransferEngine; from mooncake.store import MooncakeDistributedStore; from mooncake.structured_object_store import FieldSchema, MooncakeBundleTransfer, export_ref, import_ref"; \
     fi
 
 # -----------------------
