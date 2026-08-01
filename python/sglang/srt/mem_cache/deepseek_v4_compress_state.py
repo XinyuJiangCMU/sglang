@@ -8,9 +8,10 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 
