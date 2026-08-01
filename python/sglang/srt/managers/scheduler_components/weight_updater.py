@@ -468,12 +468,25 @@ def _export_static_state(model):
     return dict(
         buffers=[
             (name, buffer.detach().clone()) for name, buffer in model.named_buffers()
-        ]
+        ],
+        skipped_params=[
+            # Stash on host: the whole point of the pause is to free this region, so a
+            # device-resident copy would defeat it. These are small (attention kv scales),
+            # but the other producer marks whole indexer projections.
+            (name, param.detach().to("cpu", copy=True))
+            for name, param in model.named_parameters()
+            if getattr(param, "_skip_weight_check", False)
+        ],
     )
 
 
 def _import_static_state(model, static_params):
     with torch.inference_mode():
-        self_named_buffers = dict(model.named_buffers())
-        for name, tensor in static_params["buffers"]:
-            self_named_buffers[name][...] = tensor
+        for key, live in (
+            ("buffers", dict(model.named_buffers())),
+            ("skipped_params", dict(model.named_parameters())),
+        ):
+            for name, tensor in static_params.get(key, []):
+                target = live.get(name)
+                if target is not None:
+                    target.copy_(tensor)
