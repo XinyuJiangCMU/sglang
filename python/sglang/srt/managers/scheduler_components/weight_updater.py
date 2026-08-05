@@ -462,37 +462,19 @@ class SchedulerWeightUpdaterManager:
         )
 
 
-def _d4probe(model, when):
-    """D4 复现探针:pause / resume 两侧各打一次 _skip_weight_check 参数(k_scale/v_scale)的值。"""
-    try:
-        hits = [
-            (n, p)
-            for n, p in model.named_parameters()
-            if getattr(p, "_skip_weight_check", False)
-        ]
-        logger.info(f"[D4PROBE] {when}: {len(hits)} skipped params")
-        for n, p in hits[:3]:
-            f = p.detach().float().flatten()
-            logger.info(
-                f"[D4PROBE] {when}: {n} shape={tuple(p.shape)} "
-                f"min={f.min().item():.6g} max={f.max().item():.6g} mean={f.mean().item():.6g}"
-            )
-    except Exception as e:  # 探针绝不能拖垮 run
-        logger.info(f"[D4PROBE] {when}: failed {e!r}")
-
-
 def _export_static_state(model):
-    _d4probe(model, "PAUSE-正确值")
     return dict(
         buffers=[
             (name, buffer.detach().clone()) for name, buffer in model.named_buffers()
         ],
-        # D4 复现:整块注释掉,回到上游行为 —— k_scale 不再被 stash
-        # skipped_params=[
-        #     (name, param.detach().to("cpu", copy=True))
-        #     for name, param in model.named_parameters()
-        #     if getattr(param, "_skip_weight_check", False)
-        # ],
+        skipped_params=[
+            # Stash on host: the whole point of the pause is to free this region, so a
+            # device-resident copy would defeat it. These are small (attention kv scales),
+            # but the other producer marks whole indexer projections.
+            (name, param.detach().to("cpu", copy=True))
+            for name, param in model.named_parameters()
+            if getattr(param, "_skip_weight_check", False)
+        ],
     )
 
 
@@ -506,4 +488,3 @@ def _import_static_state(model, static_params):
                 target = live.get(name)
                 if target is not None:
                     target.copy_(tensor)
-    _d4probe(model, "RESUME-还原后")
