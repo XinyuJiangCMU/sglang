@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import struct  # KV_SCALE_PROBE only -- remove with the probe
 import time
 import traceback
 from contextlib import contextmanager
@@ -51,6 +52,109 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils.weight_checker import overall_checksum
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# KV_SCALE_PROBE -- temporary instrumentation, remove before merge.
+#
+# Observes layer.k_scale / layer.v_scale around the weights pause/resume cycle.
+# Read-only: it never writes to the model and never raises into the caller.
+# ---------------------------------------------------------------------------
+
+# Incremented on both cycle entry points. A cycle can begin either with a weights
+# pause (the colocate offload path) or straight at begin_weight_update (when
+# --offload-rollout-level omits `weight`), so keying off the pause alone would
+# attribute a whole cycle's phases to the previous cycle's number.
+_kv_scale_cycle = 0
+
+
+def _f32_bits(value: float) -> str:
+    """Raw bit pattern. Structured residue (page tables, handles) is obvious in hex
+    and invisible in decimal -- the shared-page signature was only found this way."""
+    return f"0x{struct.unpack('<I', struct.pack('<f', value))[0]:08X}"
+
+
+def _verdict(k: float, v: float) -> str:
+    """Which of kv_cache.py's three branches this pair takes.
+
+    NOTE the asymmetry in the third branch: `assert layer.k_scale > 0.0` only fires
+    when k <= 0. A (k > 0, v <= 0) pair passes the assert and then duplicates
+    max(k, v) = k into BOTH scales -- silent corruption, not a crash. Treating every
+    mixed-sign pair as a crash overstates crashes and halves the silent-corruption
+    count, which is the more dangerous outcome.
+    """
+    if k > 0.0 and v > 0.0:
+        return "ok_1.0" if k == 1.0 else "silent_corrupt"
+    if k <= 0.0 and v <= 0.0:
+        return "default_1.0"
+    if k > 0.0:
+        return "silent_corrupt_dup"
+    return "assert_crash"
+
+
+def _log_kv_scale_probe(model, phase: str, role: str, cycle: int, rank: int) -> None:
+    entries = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if name.endswith(("k_scale", "v_scale"))
+    ]
+    if not entries:
+        logger.warning(
+            "[KV_SCALE_PROBE] cycle=%d phase=%s role=%s rank=%d count=0",
+            cycle, phase, role, rank,
+        )
+        return
+
+    values = torch.stack([p.detach().reshape(()) for _, p in entries]).float().cpu()
+
+    # Pair k with v per attention module: the three branches are decided by the pair,
+    # not by either scale alone.
+    by_module: Dict[str, Dict[str, float]] = {}
+    for (name, _), value in zip(entries, values.tolist()):
+        module_name, _, which = name.rpartition(".")
+        by_module.setdefault(module_name, {})[which] = value
+
+    verdicts: Dict[str, int] = {}
+    dirty = []
+    for module_name in sorted(by_module):
+        pair = by_module[module_name]
+        k, v = pair.get("k_scale"), pair.get("v_scale")
+        if k is None or v is None:
+            continue
+        outcome = _verdict(k, v)
+        verdicts[outcome] = verdicts.get(outcome, 0) + 1
+        if outcome != "ok_1.0" and len(dirty) < 6:
+            dirty.append(
+                f"{module_name} k={k:.6g}[{_f32_bits(k)}] v={v:.6g}[{_f32_bits(v)}]"
+            )
+
+    # The host-side floats written by process_weights_after_loading (kv_cache.py:84-85).
+    # They live in host memory, so pause/resume cannot touch them -- yet several
+    # attention backends read *these* rather than the device tensor. When they and the
+    # device tensor disagree, KV entries are stored scaled by one and read back by the
+    # other. `vars()` because the attribute only exists once pwal has run.
+    # `k_scale` is an nn.Parameter, so it lives in module._parameters, NOT in
+    # vars(module); `k_scale_float` is a plain float and does land in vars(module).
+    mirror = [
+        (name, vars(module).get("k_scale_float"), vars(module).get("v_scale_float"))
+        for name, module in model.named_modules()
+        if "k_scale" in module._parameters
+    ][:3]
+
+    finite = torch.isfinite(values)
+    finite_values = values[finite]
+    logger.warning(
+        "[KV_SCALE_PROBE] cycle=%d phase=%s role=%s rank=%d count=%d finite=%d "
+        "eq1.0=%d zero=%d negative=%d min=%s max=%s verdict=%r mirror=%r dirty=[%s]",
+        cycle, phase, role, rank, len(entries),
+        int(finite.sum().item()),
+        int((values == 1.0).sum().item()),
+        int((values == 0).sum().item()),
+        int((values < 0).sum().item()),
+        f"{float(finite_values.min().item()):.6g}" if finite_values.numel() else "n/a",
+        f"{float(finite_values.max().item()):.6g}" if finite_values.numel() else "n/a",
+        verdicts, mirror, " | ".join(dirty),
+    )
 
 
 def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
@@ -294,6 +398,30 @@ class SchedulerWeightUpdaterManager:
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter=parameter)
 
+    def _log_kv_scales(self, phase: str) -> None:
+        """KV_SCALE_PROBE -- temporary, remove before merge."""
+        global _kv_scale_cycle
+        if phase in ("before_weights_pause", "before_begin_weight_update"):
+            _kv_scale_cycle += 1
+        try:
+            rank = torch.distributed.get_rank(group=self.tp_cpu_group)
+        except Exception:
+            rank = -1
+        # Deliberately NOT filtered to rank 0. Within a single engine, TP0 has been
+        # observed holding -2.05e38 while TP1-3 read 0 at the same instant, so a
+        # rank-0-only probe cannot tell "driver zeroed the page" from "the page holds
+        # someone else's data" -- which is the whole question.
+        try:
+            for role, runner in self.get_model_runners("all"):
+                _log_kv_scale_probe(
+                    runner.model, phase, role or "target", _kv_scale_cycle, rank
+                )
+        except Exception as exc:
+            logger.warning(
+                "[KV_SCALE_PROBE] cycle=%d phase=%s rank=%d unavailable=%r",
+                _kv_scale_cycle, phase, rank, exc,
+            )
+
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Begin a weight-update session: restore in-place-packed weights to a
         loadable state on the selected runners (target and/or draft), so the draft
@@ -302,6 +430,7 @@ class SchedulerWeightUpdaterManager:
         assert (
             not self._weight_update_in_progress
         ), "begin_weight_update called while a weight-update session is already open"
+        self._log_kv_scales("before_begin_weight_update")
         self._weight_update_selector = recv_req.selector
         for _, runner in self.get_model_runners(recv_req.selector):
             runner.begin_weight_update()
@@ -317,9 +446,13 @@ class SchedulerWeightUpdaterManager:
         assert (
             self._weight_update_in_progress
         ), "end_weight_update called without begin_weight_update"
+        self._log_kv_scales("before_end_weight_update")
         run_post_load = not self._weight_update_loaded
         for _, runner in self.get_model_runners(self._weight_update_selector):
             runner.end_weight_update(run_post_load=run_post_load)
+        # process_weights_after_loading runs inside end_weight_update: this is the pair
+        # that shows what the three-branch logic actually did with the dirty values.
+        self._log_kv_scales("after_end_weight_update")
         self._weight_update_in_progress = False
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=True, message="Success")
@@ -356,6 +489,8 @@ class SchedulerWeightUpdaterManager:
             self.flush_cache()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            # Ground truth for the cycle: everything downstream is compared against this.
+            self._log_kv_scales("before_weights_pause")
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
@@ -384,10 +519,16 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
+            # First look at the fresh physical pages, before anything writes to them.
+            self._log_kv_scales("after_weights_resume_before_static_import")
             _import_static_state(
                 self.tp_worker.model_runner.model,
                 self.stashed_model_static_state,
             )
+            # _export_static_state collects named_buffers() only, and these scales are
+            # nn.Parameter -- so this pair should read identically. Logged to prove it
+            # rather than argue it.
+            self._log_kv_scales("after_static_import")
             del self.stashed_model_static_state
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
