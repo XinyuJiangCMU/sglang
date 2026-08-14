@@ -32,6 +32,7 @@
 
 import concurrent.futures
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -39,6 +40,7 @@ from torch import nn
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
@@ -544,7 +546,16 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             "model.mtp.layers.0.transformer_layer.mlp.up_proj.weight_scale_inv": "layers.0.mlp.up_proj.weight_scale_inv",
             "model.mtp.norm.weight": "layers.0.final_layernorm.weight",
         }
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        # Bound workers: unbounded H2D expert copies deadlock the HIP runtime at high TP (see deepseek_v4).
+        _env_workers = os.environ.get("SGLANG_WEIGHT_LOAD_MAX_WORKERS")
+        if _env_workers is not None:
+            _max_workers = int(_env_workers)
+        else:
+            _tp = max(1, get_tensor_model_parallel_world_size())
+            _max_workers = max(1, min(32, 96 // _tp))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=_max_workers
+        ) as executor:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []

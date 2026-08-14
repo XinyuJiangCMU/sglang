@@ -32,6 +32,7 @@
 
 import concurrent.futures
 import logging
+import os
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -981,7 +982,16 @@ class LongcatFlashForCausalLM(nn.Module):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        # Bound workers: unbounded H2D expert copies deadlock the HIP runtime at high TP (see deepseek_v4).
+        _env_workers = os.environ.get("SGLANG_WEIGHT_LOAD_MAX_WORKERS")
+        if _env_workers is not None:
+            _max_workers = int(_env_workers)
+        else:
+            _tp = max(1, getattr(self, "tp_size", 1))
+            _max_workers = max(1, min(32, 96 // _tp))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=_max_workers
+        ) as executor:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []

@@ -2993,7 +2993,28 @@ class DeepseekV4ForCausalLM(nn.Module):
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        # NOTE: Bound the number of weight-loading worker threads. Each worker
+        # issues a CPU->GPU (H2D) copy in _load_w13/_load_w2; on ROCm/HIP, many
+        # concurrent hipMemcpy calls contend on an internal HIP runtime mutex and
+        # can deadlock at high concurrency. The relevant limit is NODE-WIDE: every
+        # TP rank is a separate process, so the node sees tp_size * workers
+        # concurrent H2D copies. With the default ThreadPoolExecutor (32 workers),
+        # TP=8 -> 8 procs x 32 = 256 concurrent copies hangs on the HIP runtime
+        # mutex (TP=4 -> 128 is fine). Scale the per-proc worker count so the
+        # node-wide concurrency stays within a safe band, while still maximizing
+        # parallelism at low TP. Overridable via SGLANG_WEIGHT_LOAD_MAX_WORKERS.
+        import os as _os
+
+        _SAFE_BAND = 96  # target node-wide concurrent H2D copies (between 128-ok and 256-hang)
+        _env_workers = _os.environ.get("SGLANG_WEIGHT_LOAD_MAX_WORKERS")
+        if _env_workers is not None:
+            _max_workers = int(_env_workers)
+        else:
+            _tp = max(1, getattr(self, "tp_size", 1))
+            _max_workers = max(1, min(32, _SAFE_BAND // _tp))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, _max_workers)
+        ) as executor:
             futures = []
             weight_names = []
             for name, loaded_weight in weights:
